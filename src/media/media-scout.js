@@ -310,10 +310,16 @@ function buildVisualContract(scene, scriptContext = {}, opts = {}) {
         visualIntent,
         scene?.webQuery,
         scene?.stockQuery,
-        scene?.text,
         ...(Array.isArray(agentPlan?.fallbackQueries) ? agentPlan.fallbackQueries : []),
         ...(strictRaw ? mustShow : []),
         ...(allowRelevantPeople ? entities : []),
+        // Raw narration goes LAST and story-stripped. It is the one entry here
+        // that describes what is being SAID rather than what should be SEEN, so
+        // its words reward titles that echo the script while showing nothing —
+        // and a full sentence is long enough to crowd the intent-derived terms
+        // out of the 24-term / 30-token budget above it. Kept (a scene's subject
+        // noun often only appears in the narration) but demoted to a tiebreaker.
+        stripStoryWords(scene?.text || ''),
     ], 24);
 
     return {
@@ -439,15 +445,33 @@ function scoreCandidate(result, contract, opts = {}) {
         reasons.push('-portrait orientation (landscape build prefers landscape cut)');
     }
 
+    // Whole-word matching. A bare substring test hands out the biggest bonus in
+    // this function (+7) for accidents: "sea" scores inside "di-sea-se", "ice"
+    // inside "pol-ice", "art" inside "he-art". The mis-hit is invisible in the
+    // log because the reason line prints the TERM, not the word that matched it,
+    // so a wrong clip looks like a confident match. textMentionsTerm is the
+    // boundary-aware matcher already used for the identity gate above — same
+    // rule, applied consistently.
     for (const term of contract.mustShow || []) {
         const termLower = norm(term);
         if (!termLower || termLower.length < 3) continue;
-        if (lower.includes(termLower)) {
+        if (textMentionsTerm(text, term)) {
             const hardEntityHit = (contract.mandatoryVisible || contract.hardVisibleEntities || [])
                 .some(entity => norm(entity) === termLower);
             score += hardEntityHit ? 7 : 4;
             reasons.push(`+${term}`);
         }
+    }
+
+    // Cross-lane agreement (see footage-manager's lane loop). A result that came
+    // back under two differently-worded searches got an independent second vote
+    // on its relevance, which is worth more than any single title keyword. Small
+    // and additive: it breaks ties, it cannot carry a bad candidate on its own.
+    // Absent for single-lane providers, so this is a no-op there.
+    const laneHits = Number(result?._laneHits || 0);
+    if (laneHits > 1) {
+        score += 2;
+        reasons.push(`+found by ${laneHits} searches`);
     }
 
     const textTokens = new Set(tokens(text));
@@ -555,9 +579,17 @@ function scoutMediaResults(results, contract, opts = {}) {
         assessment: scoreCandidate(result, contract, opts),
     }));
 
+    // Soft rejects (packaged, weak-match, wrong-event...) are deliberately kept
+    // as last-resort material, but until now they were sorted by raw score
+    // alongside clean keepers — so a candidate this function had just declared
+    // wrong could still be raced FIRST if its title happened to score well.
+    // Rank them strictly below every clean keeper. The published
+    // `_mediaScoutScore` is untouched, so nothing downstream re-reads a
+    // different number; only the order changes.
+    const sortScore = (item) => item.assessment.score - (item.assessment.keep ? 0 : 100);
     const kept = assessed
         .filter(item => item.assessment.keep || !structuralRejectCategories.has(item.assessment.category || ''))
-        .sort((a, b) => (b.assessment.score - a.assessment.score) || (a.index - b.index));
+        .sort((a, b) => (sortScore(b) - sortScore(a)) || (a.index - b.index));
     const rejected = assessed.filter(item =>
         !item.assessment.keep
         && structuralRejectCategories.has(item.assessment.category || '')

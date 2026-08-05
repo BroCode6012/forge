@@ -45,6 +45,65 @@ assert.deepStrictEqual(
     migrated.mgScenes.map((scene) => scene.clipId),
     'visual clip IDs must be idempotent'
 );
+assert.deepStrictEqual(
+    migratedAgain.continuityHolds,
+    migrated.continuityHolds,
+    'continuity holds must be deterministic and idempotent'
+);
+
+const continuityPlan = timeline.normalizePlan({
+    fps: 30,
+    totalDuration: 12,
+    scenes: [
+        {
+            index: 0,
+            clipId: 'continuity-a',
+            startTime: 1,
+            endTime: 4,
+            mediaOffset: 2,
+            trackId: 'video-track-1',
+        },
+        {
+            index: 1,
+            clipId: 'continuity-b',
+            startTime: 6,
+            endTime: 9,
+            mediaOffset: 4,
+            trackId: 'video-track-1',
+        },
+        {
+            index: 2,
+            clipId: 'upper-overlay',
+            startTime: 4,
+            endTime: 8,
+            trackId: 'video-track-2',
+        },
+    ],
+});
+assert.deepStrictEqual(
+    continuityPlan.continuityHolds.map((hold) => [hold.startTime, hold.endTime, hold.sourceClipId, hold.holdMode]),
+    [
+        [0, 1, 'continuity-a', 'head'],
+        [4, 6, 'continuity-a', 'tail'],
+        [9, 12, 'continuity-b', 'tail'],
+    ],
+    'base-track continuity must cover leading, interior, and trailing holes without treating upper tracks as footage'
+);
+assert.strictEqual(continuityPlan.continuityHolds[0].freezeTime, 2);
+assert.ok(
+    Math.abs(continuityPlan.continuityHolds[1].freezeTime - (2 + 3 - 1 / 30)) < 0.001,
+    'tail continuity must freeze at the end of the source scene'
+);
+assert.strictEqual(
+    continuityPlan.continuityHolds.reduce((sum, hold) => sum + hold.duration, 0),
+    6,
+    'continuity hold durations must exactly cover the real base-track gaps'
+);
+assert.deepStrictEqual(
+    timeline.normalizePlan(continuityPlan).continuityHolds,
+    continuityPlan.continuityHolds,
+    'normalizing a plan with derived holds must not duplicate or drift them'
+);
 
 const inferredLegacyFrames = timeline.normalizeScenes([
     { index: 0, startTime: 0, duration: 60 },
@@ -141,7 +200,13 @@ const sourcePlan = {
             endTime: 20,
         },
     ],
-    mgScenes: [],
+    mgScenes: [{
+        id: 'range-end-card',
+        clipId: 'range-end-card',
+        type: 'statCard',
+        startTime: 11,
+        endTime: 15,
+    }],
     templateScenes: [{
         id: 'template-a',
         clipId: 'template-a',
@@ -180,6 +245,34 @@ assert.strictEqual(clippedPlan.templateScenes[0].startTime, 0);
 assert.strictEqual(clippedPlan.templateScenes[0].endTime, 3);
 assert.strictEqual(clippedPlan.templateScenes[0].templateContentStartTime, 0);
 assert.strictEqual(clippedPlan.templateScenes[0].templateContentEndTime, 2);
+assert.deepStrictEqual(
+    clippedPlan.templateScenes[0]._renderRangeClip,
+    {
+        sourceStartTime: 3,
+        sourceEndTime: 7,
+        sourceDuration: 4,
+        sourceOffset: 1,
+        visibleDuration: 3,
+        clippedAtStart: true,
+        clippedAtEnd: false,
+    },
+    'a visual crossing the In marker must retain its original animation offset'
+);
+assert.strictEqual(clippedPlan.mgScenes[0].startTime, 7);
+assert.strictEqual(clippedPlan.mgScenes[0].endTime, 8);
+assert.deepStrictEqual(
+    clippedPlan.mgScenes[0]._renderRangeClip,
+    {
+        sourceStartTime: 11,
+        sourceEndTime: 15,
+        sourceDuration: 4,
+        sourceOffset: 0,
+        visibleDuration: 1,
+        clippedAtStart: false,
+        clippedAtEnd: true,
+    },
+    'a visual crossing the Out marker must retain its original duration'
+);
 assert.strictEqual(clippedPlan.sfxClips[0].startTime, 0);
 assert.strictEqual(clippedPlan.sfxClips[0].duration, 2);
 assert.strictEqual(clippedPlan.sfxClips[0].sourceOffset, 1);
@@ -206,6 +299,8 @@ assert.ok(
 );
 assert.ok(appSource.includes('Math.floor(inSec * safeFps'));
 assert.ok(appSource.includes('Math.ceil(outSec * safeFps'));
+assert.ok(appSource.includes('timelineContract.buildContinuityHolds'));
+assert.ok(appSource.includes('clip-continuity-hold'));
 
 const compositorSource = read('ui/js/compositor/Compositor.js');
 assert.ok(compositorSource.includes('scene.clipId'));
@@ -223,6 +318,11 @@ const hyperframesSource = read('src/render/hyperframes-bridge.js');
 assert.ok(hyperframesSource.includes('scene.clipId ??'));
 assert.ok(hyperframesSource.includes('scene.sourceSceneIndex ?? scene.index'));
 assert.ok(!hyperframesSource.includes('return explicit > 90 ? explicit / 30 : explicit'));
+assert.ok(hyperframesSource.includes('plan.continuityHolds'));
+assert.ok(hyperframesSource.includes('data-hf-continuity-hold="1"'));
+assert.ok(hyperframesSource.includes('Applied ${holdGapAnims.length} planned timeline continuity hold(s)'));
+const sceneGraphSource = read('ui/js/compositor/SceneGraph.js');
+assert.ok(sceneGraphSource.includes('normalizedPlan.continuityHolds'));
 const mainSource = read('main.js');
 assert.ok(mainSource.includes("require('./src/project/plan-range')"));
 assert.ok(mainSource.includes('Partial render preparation failed'));

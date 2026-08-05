@@ -140,10 +140,16 @@ function _obviousWinnerVerdict(best, runner, opts = {}) {
  * runs processOne() on each in parallel, picks the highest-scoring accepted
  * candidate, cleans up loser files. Returns the winner or null.
  *
- * processOne(candidate, attempt) MUST return either:
+ * processOne(candidate, attempt, { signal }) MUST return either:
  *   { accepted: true,  score: number, path: string, ...extra }   → considered for winner
  *   { accepted: false, path?: string, reason?: string }          → loser, file cleaned up
  *   null / undefined / thrown error                              → loser, swallowed
+ *
+ * `signal` aborts when this candidate's own timeout fires. Its result will be
+ * ignored from that moment on, so processOne should check `signal.aborted`
+ * before each expensive step (download, AI judgement, deep analysis) and clean
+ * up its own temp file if it bails — the orchestrator can only unlink files it
+ * is handed back, and an abandoned soldier hands nothing back.
  *
  * @param {Object} opts
  * @param {Array}  opts.candidates    — already-ranked candidate list (best first)
@@ -187,20 +193,37 @@ async function runCandidateRace(opts = {}) {
     log(`  🏁 [Candidate Race] starting: ${candidates.length} candidate(s), ${concurrency} in parallel per batch, max ${maxBatches} batches, per-candidate cap ${perCandidateTimeoutMs > 0 ? `${Math.round(perCandidateTimeoutMs / 1000)}s` : 'none'}`);
 
     // Wrap a processOne call with a timeout. Slow stragglers don't drag the
-    // batch wall-clock — they get killed and counted as losers. Their files
-    // (if any) are cleaned up by the orchestrator's normal loser cleanup.
+    // batch wall-clock — they get killed and counted as losers.
+    //
+    // "Killed" used to be a lie. The timer resolved the OUTER promise and walked
+    // away; the soldier itself kept running — still downloading, still queueing
+    // vision calls, still holding a temp file nobody would ever unlink (the
+    // orchestrator's loser cleanup needs a `path`, and an abandoned soldier
+    // never returns one). A build with a 20s cap and 6-minute stragglers ended
+    // up with a dozen ghosts competing with the live batch for the same GPU,
+    // which made the live batch slower, which made more soldiers time out. Every
+    // "done in 20.0s" in that log was followed minutes later by the ghost's own
+    // completion line.
+    //
+    // Now each soldier gets its own abort signal. On timeout we abort FIRST and
+    // resolve second, so the soldier learns it was abandoned at its next
+    // checkpoint, stops before paying for anything else, and cleans up after
+    // itself.
     const withTimeout = (candidate, attemptIdx) => new Promise((resolve) => {
         let settled = false;
         let timer = null;
+        const ctl = new AbortController();
         if (perCandidateTimeoutMs > 0) {
             timer = setTimeout(() => {
                 if (settled) return;
                 settled = true;
-                resolve({ accepted: false, reason: `per-candidate timeout (${Math.round(perCandidateTimeoutMs / 1000)}s)`, timedOut: true });
+                const reason = `per-candidate timeout (${Math.round(perCandidateTimeoutMs / 1000)}s)`;
+                try { ctl.abort(new Error(reason)); } catch (_) {}
+                resolve({ accepted: false, reason, timedOut: true });
             }, perCandidateTimeoutMs);
         }
         Promise.resolve()
-            .then(() => processOne(candidate, attemptIdx))
+            .then(() => processOne(candidate, attemptIdx, { signal: ctl.signal }))
             .then((value) => {
                 if (settled) return;
                 settled = true;
@@ -261,10 +284,14 @@ async function runCandidateRace(opts = {}) {
 
         const timedOutCount = losers.filter(l => l.value?.timedOut).length;
         const visionApiFailCount = losers.filter(l => l.value?._visionApiFailed).length;
+        // Reported for visibility only — an unreadable scorecard means the vision
+        // service ANSWERED, so it must never feed the abort rule below.
+        const visionUnparsedCount = losers.filter(l => l.value?._visionUnparsed).length;
         const storyblocksAuthDeadCount = losers.filter(l => l.value?._storyblocksAuthDead).length;
         const tagBits = [];
         if (timedOutCount) tagBits.push(`${timedOutCount} timed out`);
         if (visionApiFailCount) tagBits.push(`${visionApiFailCount} vision API failed`);
+        if (visionUnparsedCount) tagBits.push(`${visionUnparsedCount} score unreadable`);
         if (storyblocksAuthDeadCount) tagBits.push(`${storyblocksAuthDeadCount} storyblocks auth dead`);
         log(`  🏁 [Candidate Race] batch ${batchNo} done in ${elapsed}s: ${accepted.length} accepted, ${losers.length} rejected/errored${tagBits.length ? ` (${tagBits.join(', ')})` : ''}`);
 
@@ -303,7 +330,17 @@ async function runCandidateRace(opts = {}) {
         // bail fast to the scene's fallback/continuity instead of burning 6-13 min
         // on ~20 doomed candidates. The OUTCOME is unchanged (continuity either
         // way); this only stops the wasted time. (Global.)
-        if (maxCollectMs > 0 && acceptedPool.length === 0
+        //
+        // `accepted.length === 0` is load-bearing: this batch's winners are not
+        // pushed into acceptedPool until below, so testing the pool alone reads
+        // "empty" for a batch that just accepted 5 clips — and the cleanup on the
+        // next line then DELETES them. Measured on a real 64-scene build: 55 bails,
+        // 34 of them one line after a batch reported 1-5 accepted, 84 already-scored
+        // candidates destroyed (including 7/10 exact matches). Whichever clip a scene
+        // ended up with was decided by vision latency, not by footage quality.
+        // With this guard the batch falls through to `collectBudgetSpent` below,
+        // which already says "budget spent → commit the best held candidate (even 1)".
+        if (maxCollectMs > 0 && acceptedPool.length === 0 && accepted.length === 0
             && (Date.now() - raceStartedAt) >= maxCollectMs && cursor < candidates.length) {
             cleanupPaths(accepted);
             for (const loser of losers) {

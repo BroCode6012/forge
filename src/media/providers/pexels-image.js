@@ -1,6 +1,7 @@
 const axios = require('axios');
 const config = require('../../settings/config');
 const BaseProvider = require('./base-provider');
+const { firstThumbUrl } = require('./preview-thumb');
 
 class PexelsImageProvider extends BaseProvider {
     constructor() {
@@ -31,6 +32,9 @@ class PexelsImageProvider extends BaseProvider {
             height: Number(photo.height || 0),
             title: photo.alt || photo.url || `Pexels image ${photo.id}`,
             _provider: 'pexels',
+            // Always a smaller rendition than the `large2x/large/original` the
+            // candidate itself points at, so screening never pre-pays for it.
+            _thumbUrl: firstThumbUrl(photo.src?.medium, photo.src?.small, photo.src?.tiny),
         })).filter(item => item.url);
     }
 }

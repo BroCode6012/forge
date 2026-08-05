@@ -5,10 +5,19 @@ const {
     normalizeTextColor,
 } = require('../../../render/text-style-ranges');
 const {
+    ICON_EDITABLE_PROPERTIES,
     ICON_POSITIONS,
     applySceneIconEdit,
     inspectSceneIcons,
 } = require('../workers/scene-icon-editor');
+const {
+    array,
+    boolean: booleanField,
+    number,
+    object,
+    string,
+    tool,
+} = require('./capability-contract');
 
 const POSITION_ALIASES = [
     ['top-left', /\btop[\s-]+left\b/i],
@@ -18,6 +27,54 @@ const POSITION_ALIASES = [
     ['center-left', /\b(?:center|middle)[\s-]+left\b/i],
     ['center-right', /\b(?:center|middle)[\s-]+right\b/i],
 ];
+
+const ICON_PROPERTY_SCHEMAS = {
+    color: string({ format: 'color' }),
+    position: string({ enum: ICON_POSITIONS }),
+    scale: number({ min: 0.25, max: 3 }),
+    scaleMultiplier: number({ min: 0.25, max: 3 }),
+};
+for (const property of ICON_EDITABLE_PROPERTIES) {
+    if (!ICON_PROPERTY_SCHEMAS[property]) {
+        throw new Error(`Scene Icon Editor property "${property}" has no capability schema`);
+    }
+}
+
+const ICON_EDIT_ARGS = object({
+    all: booleanField(),
+    targetIds: array(string({ minLength: 1, maxLength: 500 }), { maxItems: 120, uniqueItems: true }),
+    ...Object.fromEntries(ICON_EDITABLE_PROPERTIES.map((property) => [
+        property,
+        ICON_PROPERTY_SCHEMAS[property],
+    ])),
+    fill: string({ format: 'color' }),
+    iconColor: string({ format: 'color' }),
+}, {
+    anyOfRequired: [['color'], ['fill'], ['iconColor'], ['position'], ['scale'], ['scaleMultiplier']],
+});
+
+const ICON_REMOVE_ARGS = object({
+    all: booleanField(),
+    targetIds: array(string({ minLength: 1, maxLength: 500 }), { maxItems: 120, uniqueItems: true }),
+    remove: booleanField(),
+});
+
+function tools() {
+    return [
+        tool('edit-icon-properties', 'Edit existing scene-icon color, position, or size.', ICON_EDIT_ARGS, {
+            visualTargets: ['icon'],
+            visualRepair: true,
+        }),
+        tool('set-icon-properties', 'Edit existing scene-icon properties.', ICON_EDIT_ARGS, { canonicalAction: 'edit-icon-properties' }),
+        tool('set-icon-color', 'Set an existing scene icon color.', ICON_EDIT_ARGS, { canonicalAction: 'edit-icon-properties' }),
+        tool('set-icon-position', 'Move an existing scene icon to a supported safe zone.', ICON_EDIT_ARGS, { canonicalAction: 'edit-icon-properties' }),
+        tool('set-icon-size', 'Set or scale an existing scene icon size.', ICON_EDIT_ARGS, { canonicalAction: 'edit-icon-properties' }),
+        tool('remove-icons', 'Remove existing scene icons from the exact active scope.', ICON_REMOVE_ARGS, {
+            visualTargets: ['icon'],
+            visualRepair: true,
+        }),
+    ];
+}
 
 function _mentionsIcon(text) {
     return /\b(?:(?:scene|explainer)\s+)?icons?\b/i.test(String(text || ''));
@@ -192,6 +249,7 @@ function normalizeInvocation(invocation, context) {
 
 function manifest() {
     return {
+        contractVersion: 2,
         id: 'icons',
         specialist: 'Scene Icon Editor',
         domain: 'scene-composition',
@@ -208,6 +266,7 @@ function manifest() {
         ],
         directiveKeys: ['icons'],
         vocabulary: {
+            properties: ICON_EDITABLE_PROPERTIES,
             positions: ICON_POSITIONS,
             colors: Object.keys(COLOR_ALIASES),
             sizeRange: { min: 0.25, max: 3, default: 1 },
@@ -231,4 +290,5 @@ module.exports = {
     manifest,
     normalizeInvocation,
     planFast,
+    tools,
 };

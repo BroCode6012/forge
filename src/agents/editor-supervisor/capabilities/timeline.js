@@ -2,10 +2,37 @@
 
 const path = require('path');
 const { overlaps, resolveSceneTargets, windowOf } = require('../scope-utils');
+const {
+    boolean: booleanField,
+    number,
+    object,
+    string,
+    tool,
+} = require('./capability-contract');
 
 const TRACKS = new Set(['video-track-1', 'video-track-2', 'video-track-3']);
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
 const VIDEO_EXTS = new Set(['.mp4', '.mov', '.m4v', '.webm']);
+
+function tools() {
+    return [
+        tool('set-ken-burns', 'Enable, disable, or retime still-image Ken Burns motion.', object({
+            enabled: booleanField(),
+            speed: number({ min: 0.25, max: 2 }),
+        }, {
+            anyOfRequired: [['enabled'], ['speed']],
+        }), { visualRepair: true }),
+        tool('set-source-offset', 'Choose the source-media start offset for selected video clips.', object({
+            offset: number({ min: 0 }),
+        }, { required: ['offset'] }), { risk: 'moderate', visualImpact: true }),
+        tool('move-track', 'Move selected clips to a renderer-backed video track.', object({
+            trackId: string({ enum: [...TRACKS] }),
+        }, { required: ['trackId'] }), { risk: 'moderate', visualImpact: true }),
+        tool('set-visibility', 'Show or safely hide selected clips.', object({
+            visible: booleanField(),
+        }, { required: ['visible'] }), { risk: 'moderate', visualImpact: true }),
+    ];
+}
 
 function _operation(action, args, request, description, risk = 'low') {
     return {
@@ -156,6 +183,7 @@ function normalizeInvocation(invocation, context) {
 
 function manifest() {
     return {
+        contractVersion: 2,
         id: 'timeline',
         specialist: 'Timeline Editor',
         domain: 'timeline',
@@ -276,4 +304,4 @@ function inspect(plan, scope) {
     };
 }
 
-module.exports = { execute, inspect, manifest, normalizeInvocation, planFast };
+module.exports = { execute, inspect, manifest, normalizeInvocation, planFast, tools };

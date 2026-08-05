@@ -2,6 +2,28 @@
 
 const { applyPacingEdit } = require('../workers/pacing-editor');
 const { resolveSceneTargets, scopeRange, windowOf } = require('../scope-utils');
+const {
+    object,
+    string,
+    tool,
+} = require('./capability-contract');
+
+const PACING_INTENSITIES = ['slight', 'normal', 'strong'];
+const PACING_SPEEDS = ['fast', 'slow'];
+
+function tools() {
+    const aliasArgs = object({
+        intensity: string({ enum: PACING_INTENSITIES }),
+    });
+    return [
+        tool('faster', 'Increase structural cut density while preserving narration.', aliasArgs, { canonicalAction: 'restructure' }),
+        tool('slower', 'Reduce structural cut density while preserving narration.', aliasArgs, { canonicalAction: 'restructure' }),
+        tool('restructure', 'Rebuild the selected visual rhythm at a requested speed and intensity.', object({
+            speed: string({ enum: PACING_SPEEDS }),
+            intensity: string({ enum: PACING_INTENSITIES }),
+        }, { required: ['speed'] }), { visualImpact: true }),
+    ];
+}
 
 function _operation(speed, intensity, request) {
     return {
@@ -57,6 +79,7 @@ function normalizeInvocation(invocation, context) {
 
 function manifest() {
     return {
+        contractVersion: 2,
         id: 'pacing',
         specialist: 'Pacing Editor',
         domain: 'timeline-structure',
@@ -65,7 +88,7 @@ function manifest() {
         risk: 'structural',
         actions: ['faster', 'slower', 'restructure'],
         directiveKeys: ['pacing'],
-        vocabulary: { speeds: ['fast', 'slow'], intensities: ['slight', 'normal', 'strong'] },
+        vocabulary: { speeds: PACING_SPEEDS, intensities: PACING_INTENSITIES },
     };
 }
 
@@ -102,4 +125,4 @@ function inspect(plan, scope) {
     };
 }
 
-module.exports = { execute, inspect, manifest, normalizeInvocation, planFast };
+module.exports = { execute, inspect, manifest, normalizeInvocation, planFast, tools };

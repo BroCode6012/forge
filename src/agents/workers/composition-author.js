@@ -23,7 +23,11 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { authorCompositions } = require('../../render/hf-template-author');
+const {
+    authorCompositions,
+    normalizeAuthoredTimeline,
+    validateComposition,
+} = require('../../render/hf-template-author');
 const {
     clearAuthoredComposition,
     prefersFixedRenderer,
@@ -63,6 +67,29 @@ function overlaysDisabled() {
 function toSec(v, dflt = 0) {
     const n = Number(v);
     return Number.isFinite(n) ? n : dflt;
+}
+
+function visualDurationSeconds(mg, fallback = 5) {
+    const rangeSourceDuration = Number(mg?._renderRangeClip?.sourceDuration);
+    if (Number.isFinite(rangeSourceDuration) && rangeSourceDuration > 0) {
+        return Math.max(1.2, Math.min(20, rangeSourceDuration));
+    }
+    const start = toSec(mg?.startTime, toSec(mg?.start, 0));
+    const end = toSec(mg?.endTime, toSec(mg?.end, NaN));
+    if (Number.isFinite(end) && end > start) {
+        return Math.max(1.2, Math.min(20, end - start));
+    }
+    const duration = [
+        mg?._hfTiming?.duration,
+        mg?.durationSeconds,
+        mg?.displayDuration,
+        mg?.templateDuration,
+        mg?.visualDuration,
+        mg?.duration,
+    ]
+        .map(value => Number(value))
+        .find(value => Number.isFinite(value) && value > 0 && value <= 20);
+    return Math.max(1.2, Math.min(20, duration || fallback));
 }
 
 function normType(mg) {
@@ -213,8 +240,6 @@ function itemsOf(mg) {
 
 function buildBrief(plan, mg, index, kind) {
     const sc = plan.scriptContext || {};
-    const start = toSec(mg.startTime);
-    const end = toSec(mg.endTime, start + 5);
     const type = normType(mg);
     // ns is CONTENT-derived, not index-derived: post-build plan mutations
     // (orchestrator merges/disables) shift array indexes, which made every
@@ -228,7 +253,7 @@ function buildBrief(plan, mg, index, kind) {
         // TRUE duration — the old Math.max(2,…) floor lied to the agent: it
         // choreographed exits for 2.0s inside a 1.6s window, so every
         // micro-scene hard-cut mid-animation instead of exiting.
-        duration: Math.max(1.2, Math.min(20, end - start)),
+        duration: visualDurationSeconds(mg),
         kind,
         type,
         text: String(mg.templateText || mg.text || '').slice(0, 220),
@@ -260,11 +285,12 @@ async function authorPlanCompositions(plan, opts = {}) {
     const forceRefresh = /^(1|true|on|yes)$/i.test(String(process.env.HF_AUTHOR_REFRESH || '').trim());
     const openMode = Boolean(opts.openMode) && !forceRefresh;
     const fastTest = opts.fastTest === true;
+    const graphicsOnly = opts.graphicsOnly === true;
 
     // Effects director rides along with the author pass (same call sites:
     // build Step 7.6 + render-prep). One batch reasoning call; recipes
     // persist into video-plan.json so reruns cost nothing.
-    if (!openMode && directSceneEffects) {
+    if (!openMode && !graphicsOnly && directSceneEffects) {
         try { await directSceneEffects(plan, { log, projectDir: opts.projectDir }); }
         catch (e) { log(`  ⚠️ [FX Director] skipped: ${String(e.message || e).slice(0, 100)}`); }
     }
@@ -272,14 +298,14 @@ async function authorPlanCompositions(plan, opts = {}) {
     // Transition director rides along the same way: one batch reasoning call
     // that assigns motivated transitions per footage boundary, overriding the
     // algorithmic 70/30 pass (which remains the fallback floor).
-    if (!openMode && directTransitions) {
+    if (!openMode && !graphicsOnly && directTransitions) {
         try { await directTransitions(plan, { log, projectDir: opts.projectDir }); }
         catch (e) { log(`  ⚠️ [Transition Director] skipped: ${String(e.message || e).slice(0, 100)}`); }
     }
 
     // Explainer icon moments over footage (photo cutouts / authored SVGs),
     // word-synced, sparse. Same pattern: 1 batch call, disk cache.
-    if (!openMode && directIcons && !fastTest) {
+    if (!openMode && !graphicsOnly && directIcons && !fastTest) {
         try { await directIcons(plan, { log, projectDir: opts.projectDir }); }
         catch (e) { log(`  ⚠️ [Icon Director] skipped: ${String(e.message || e).slice(0, 100)}`); }
     }
@@ -290,7 +316,7 @@ async function authorPlanCompositions(plan, opts = {}) {
 
     // Keyword-glow word-emphasis overlays (OPENMONTAGE-BORROW-PLAN #18). Deterministic,
     // OPT-IN (HF_KEYWORD_GLOW=1). On open, the saved plan already carries _keywordGlow.
-    if (!openMode && directKeywordGlow) {
+    if (!openMode && !graphicsOnly && directKeywordGlow) {
         try { await directKeywordGlow(plan, { log, projectDir: opts.projectDir }); }
         catch (e) { log(`  ⚠️ [Keyword Glow] skipped: ${String(e.message || e).slice(0, 100)}`); }
     }
@@ -299,7 +325,7 @@ async function authorPlanCompositions(plan, opts = {}) {
     // (HF_CHARACTER_MG=1). Runs BEFORE the mgScenes authoring loop below so the
     // pushed character comps are already validated + attached. On open, the saved
     // plan already carries them (skipped here).
-    if (!openMode && authorCharacterScenes) {
+    if (!openMode && !graphicsOnly && authorCharacterScenes) {
         try { authorCharacterScenes(plan, { log }); }
         catch (e) { log(`  ⚠️ [Character MG] skipped: ${String(e.message || e).slice(0, 100)}`); }
     }
@@ -309,7 +335,34 @@ async function authorPlanCompositions(plan, opts = {}) {
     // prompt/theme/version changes since the save. Pipeline upgrades apply
     // on the next BUILD (fresh plan, no comps yet), or set
     // HF_AUTHOR_REFRESH=1 to force a re-author on open.
-    const hasSavedComp = (mg) => Boolean(mg && mg._authoredComposition && mg._authoredComposition.html && mg._authoredComposition.timeline);
+    let invalidSaved = 0;
+    const hasSavedComp = (mg) => {
+        if (!mg || !mg._authoredComposition?.html || !mg._authoredComposition?.timeline) return false;
+        const duration = visualDurationSeconds(mg);
+        const ns = String(mg._authoredNs || mg._authoredComposition.ns || '').trim();
+        if (!ns) {
+            clearAuthoredComposition(mg);
+            invalidSaved++;
+            return false;
+        }
+        const validation = validateComposition(
+            mg._authoredComposition,
+            ns,
+            duration,
+            mg._authoredAssets || [],
+            null
+        );
+        if (!validation.ok) {
+            clearAuthoredComposition(mg);
+            invalidSaved++;
+            return false;
+        }
+        mg._authoredComposition.timeline = normalizeAuthoredTimeline(
+            validation.timeline,
+            duration
+        );
+        return true;
+    };
     let reused = 0;
     let fixedOverrides = 0;
     const skipForExplicitOverride = (mg) => {
@@ -349,10 +402,19 @@ async function authorPlanCompositions(plan, opts = {}) {
     }
 
     if (reused > 0) log(`  ♻️ [Composition Author] ${reused} composition(s) reused from the saved project (opens are read-only; rebuild or HF_AUTHOR_REFRESH=1 to re-author)`);
+    if (invalidSaved > 0) {
+        log(`  🛡️ [Composition Author] rejected ${invalidSaved} stale/unsafe saved composition(s); safe fallback or re-authoring will be used`);
+    }
     if (fixedOverrides > 0) {
         log(`  [Composition Author] ${fixedOverrides} explicit graphic override(s) kept on the deterministic renderer`);
     }
-    if (candidates.length === 0) return { authored: 0, eligible: 0, reused, fixedOverrides };
+    if (candidates.length === 0) return {
+        authored: 0,
+        eligible: 0,
+        reused,
+        fixedOverrides,
+        invalidSaved,
+    };
     log(`  🎨 [Composition Author] ${candidates.length} eligible scene(s) (templates + fullscreen MGs + overlays; maps excluded)`);
 
     const briefs = candidates.map(c => buildBrief(plan, c.mg, c.index, c.kind));
@@ -381,7 +443,7 @@ async function authorPlanCompositions(plan, opts = {}) {
             }
         }
     }
-    if (!fastTest && !openMode) {
+    if (!fastTest && !openMode && !graphicsOnly) {
         try { await enrichBriefsWithSubjectImages(briefs, plan, opts); }
     catch (e) { log(`  ⚠️ [Subject Image] enrichment skipped: ${String(e.message || e).slice(0, 100)}`); }
     }
@@ -398,7 +460,14 @@ async function authorPlanCompositions(plan, opts = {}) {
         }
     });
     log(`  ✅ [Composition Author] attached ${authored}/${candidates.length} authored compositions`);
-    return { authored, eligible: candidates.length, fixedOverrides };
+    return { authored, eligible: candidates.length, fixedOverrides, invalidSaved };
 }
 
-module.exports = { authorPlanCompositions, buildBrief, enrichBriefsWithSubjectImages, EXCLUDED_TYPES, OVERLAY_EXCLUDED_TYPES };
+module.exports = {
+    authorPlanCompositions,
+    buildBrief,
+    enrichBriefsWithSubjectImages,
+    visualDurationSeconds,
+    EXCLUDED_TYPES,
+    OVERLAY_EXCLUDED_TYPES,
+};

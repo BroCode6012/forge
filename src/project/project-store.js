@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const timelineContract = require('./timeline-contract');
 
 const PROJECT_FILE_VERSION = 2;
 const PROJECT_MARKER_FILE = '.yta-project.json';
@@ -616,6 +617,25 @@ function loadProjectState({
         });
     }
 
+    // A mirror holding the same plan as the .fvp came FROM that .fvp, so it must
+    // not outrank it. It otherwise always does: the .fvp candidate is timestamped
+    // by when its plan was stamped (planSavedAt), while the mirrors carry the
+    // mtime of a file the same save wrote — and fsynced — a few milliseconds
+    // later. Raw timestamps therefore make every fresh save look like the copies
+    // are newer than the original, and the priority tie-break below could never
+    // fire in the one case it exists for. Matching content is the exact signal
+    // for "same save", so use it instead of a time window: a mirror that a later
+    // build genuinely rewrote holds a DIFFERENT plan, keeps its own mtime, and
+    // still wins on recency.
+    const fvpCandidate = candidates.find(c => c.priority === 3);
+    if (fvpCandidate) {
+        const fvpHash = _planHash(fvpCandidate.plan);
+        for (const candidate of candidates) {
+            if (candidate === fvpCandidate) continue;
+            if (_planHash(candidate.plan) === fvpHash) candidate.timestamp = fvpCandidate.timestamp;
+        }
+    }
+
     candidates.sort((a, b) => b.timestamp - a.timestamp || b.priority - a.priority);
     const selected = candidates[0] || null;
     if (!selected) {
@@ -675,6 +695,7 @@ function saveProjectState({
     if (!videoPlan || typeof videoPlan !== 'object' || Array.isArray(videoPlan)) {
         throw new Error('Project save requires a video plan object');
     }
+    const normalizedPlan = timelineContract.withContinuityHolds(videoPlan);
 
     const fvpPath = resolveProjectFilePath({ projectDir, preferredFvpPath });
     if (expectedRevision !== undefined && expectedRevision !== null) {
@@ -690,8 +711,8 @@ function saveProjectState({
     // Commit mirrors first. The envelope timestamp is captured afterwards so a
     // freshly saved .fvp remains authoritative without trusting its filesystem
     // mtime (which can be changed by copying or touching a stale file).
-    _atomicWriteJson(path.join(publicDir, 'video-plan.json'), videoPlan);
-    _atomicWriteJson(path.join(tempDir, 'video-plan.json'), videoPlan);
+    _atomicWriteJson(path.join(publicDir, 'video-plan.json'), normalizedPlan);
+    _atomicWriteJson(path.join(tempDir, 'video-plan.json'), normalizedPlan);
 
     const now = new Date().toISOString();
     const envelope = {
@@ -700,8 +721,8 @@ function saveProjectState({
         planSavedAt: now,
         revision: Math.max(0, Number(revision) || 0) + 1,
         settings: settings && typeof settings === 'object' ? settings : {},
-        videoPlan,
-        planHash: _planHash(videoPlan),
+        videoPlan: normalizedPlan,
+        planHash: _planHash(normalizedPlan),
     };
 
     // The .fvp envelope is the final commit.

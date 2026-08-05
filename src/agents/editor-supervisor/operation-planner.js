@@ -43,12 +43,51 @@ function _signature(operation) {
     });
 }
 
+function _scopeTargetSignature(scope = {}) {
+    return JSON.stringify({
+        kind: String(scope.kind || ''),
+        clipIds: (scope.clipRefs || [])
+            .map((ref) => String(ref?.clipId || ''))
+            .filter(Boolean)
+            .sort(),
+        visualIds: (scope.visualRefs || [])
+            .map((ref) => String(ref?.id || ''))
+            .filter(Boolean)
+            .sort(),
+        iconIds: (scope.iconRefs || [])
+            .map((ref) => String(ref?.id || ''))
+            .filter(Boolean)
+            .sort(),
+        fromSec: Number(scope.fromSec) || 0,
+        toSec: Number(scope.toSec) || 0,
+    });
+}
+
+function _semanticSignature(operation) {
+    const capabilityId = String(operation?.capabilityId || '');
+    const action = String(operation?.action || '');
+    if (
+        capabilityId !== 'graphics'
+        || !['add', 'regenerate', 'reduce'].includes(action)
+    ) return '';
+    return JSON.stringify({
+        capabilityId,
+        action,
+        requestedType: String(operation?.args?.requestedType || ''),
+        scope: _scopeTargetSignature(operation?.scope),
+    });
+}
+
 function _dedupeOperations(operations) {
     const seen = new Set();
+    const semanticSeen = new Set();
     return (operations || []).filter((operation) => {
         const signature = _signature(operation);
         if (seen.has(signature)) return false;
+        const semanticSignature = _semanticSignature(operation);
+        if (semanticSignature && semanticSeen.has(semanticSignature)) return false;
         seen.add(signature);
+        if (semanticSignature) semanticSeen.add(semanticSignature);
         return true;
     });
 }
@@ -161,6 +200,50 @@ function _filterSmartForNamedTargets(smart, request, existingOperations = [], op
     };
 }
 
+function _filterSmartForExclusiveOwners(smart, existingOperations = [], options = {}) {
+    if (!Array.isArray(smart?.operations) || !smart.operations.length) return smart;
+    const exclusiveCapabilities = new Set(
+        existingOperations
+            .filter((operation) => operation?.exclusiveCapability === true)
+            .map((operation) => String(operation.capabilityId || ''))
+            .filter(Boolean)
+    );
+    if (!exclusiveCapabilities.size) return smart;
+
+    const operations = smart.operations.filter((operation) => (
+        !exclusiveCapabilities.has(String(operation?.capabilityId || ''))
+    ));
+    if (operations.length === smart.operations.length) return smart;
+
+    const removed = smart.operations
+        .filter((operation) => !operations.includes(operation))
+        .map((operation) => String(operation?.capabilityId || ''))
+        .filter(Boolean);
+    options.log?.(
+        `Ignored duplicate smart specialist work already owned by: ${[...new Set(removed)].join(', ')}`
+    );
+    return {
+        ...smart,
+        summary: operations.length ? smart.summary : '',
+        operations,
+        supported: operations.map((operation) => (
+            `${operation.specialist}: ${operation.description}`
+        )),
+        claimedDirectiveKeys: [...new Set(operations.flatMap((operation) => (
+            getCapability(operation.capabilityId)?.manifest?.directiveKeys || []
+        )))],
+    };
+}
+
+function _operationSummary(operations) {
+    if (!Array.isArray(operations) || operations.length !== 1) return '';
+    const operation = operations[0];
+    if (operation?.authoritativeSummary !== true) return '';
+    const description = String(operation.description || '').trim();
+    if (!description) return '';
+    return `${description.charAt(0).toUpperCase()}${description.slice(1)}.`;
+}
+
 async function planStagedOperations(directives, request, plan, options = {}) {
     const remaining = _clone(directives);
     const deterministic = _filterDeterministicForGrounding(planDeterministic({
@@ -186,16 +269,34 @@ async function planStagedOperations(directives, request, plan, options = {}) {
             log: options.log,
         });
         if (normalized.operation) {
-            grounded.operations.push({
-                ...normalized.operation,
-                exclusiveCapability: false,
-                visualGrounded: true,
-            });
-            grounded.supported.push(
-                `Visual Grounder: ${normalized.operation.description}`
-            );
-            const manifest = getCapability(normalized.operation.capabilityId)?.manifest;
-            grounded.claimedDirectiveKeys.push(...(manifest?.directiveKeys || []));
+            const exclusiveOwner = deterministic.operations.find((operation) => (
+                operation?.exclusiveCapability === true
+                && String(operation.capabilityId || '') === String(normalized.operation.capabilityId || '')
+            ));
+            if (exclusiveOwner) {
+                const groundedTargetIds = normalized.operation?.args?.targetIds;
+                if (
+                    Array.isArray(groundedTargetIds)
+                    && groundedTargetIds.length
+                    && !exclusiveOwner?.args?.targetIds?.length
+                ) {
+                    exclusiveOwner.args.targetIds = [...groundedTargetIds];
+                }
+                options.log?.(
+                    `Visual grounding confirmed the target; ${exclusiveOwner.specialist} already owns the edit`
+                );
+            } else {
+                grounded.operations.push({
+                    ...normalized.operation,
+                    exclusiveCapability: false,
+                    visualGrounded: true,
+                });
+                grounded.supported.push(
+                    `Visual Grounder: ${normalized.operation.description}`
+                );
+                const manifest = getCapability(normalized.operation.capabilityId)?.manifest;
+                grounded.claimedDirectiveKeys.push(...(manifest?.directiveKeys || []));
+            }
         } else {
             grounded.unsupported.push(
                 'The visible object was identified, but its proposed edit did not match a safe live capability.'
@@ -223,6 +324,14 @@ async function planStagedOperations(directives, request, plan, options = {}) {
             ],
             log: options.log,
         });
+        smart = _filterSmartForExclusiveOwners(
+            smart,
+            [
+                ...deterministic.operations,
+                ...grounded.operations,
+            ],
+            options
+        );
         smart = _filterSmartForNamedTargets(
             smart,
             request,
@@ -287,7 +396,8 @@ async function planStagedOperations(directives, request, plan, options = {}) {
         estimatedWork,
         capabilityIds,
         specialists,
-        summary: _usablePendingSummary(smart.summary, operations)
+        summary: _operationSummary(operations)
+            || _usablePendingSummary(smart.summary, operations)
             || _usablePendingSummary(options.visualGrounding?.summary, operations)
             || _usablePendingSummary(directives?.summary, operations)
             || request.text,

@@ -1,6 +1,14 @@
 'use strict';
 
 const { normalizeTextColor } = require('../../../render/text-style-ranges');
+const {
+    boolean: booleanField,
+    integer,
+    number,
+    object,
+    string,
+    tool,
+} = require('./capability-contract');
 
 const POSITIONS = new Set(['top', 'center', 'bottom']);
 const BACKGROUNDS = new Set(['box', 'pill', 'none']);
@@ -9,6 +17,47 @@ const SIZE_PRESETS = Object.freeze({
     medium: 46,
     large: 58,
 });
+
+const CAPTION_ARGS = object({
+    enabled: booleanField({ description: 'Whether captions are rendered.' }),
+    position: string({ enum: [...POSITIONS] }),
+    background: string({ enum: [...BACKGROUNDS] }),
+    fontSize: number({ min: 24, max: 84 }),
+    wordsPerCue: integer({ min: 2, max: 12 }),
+    maxDuration: number({ min: 0.8, max: 5 }),
+    karaoke: booleanField(),
+    color: string({ format: 'color' }),
+    backgroundColor: string({ format: 'color' }),
+    activeColor: string({ format: 'color' }),
+}, {
+    anyOfRequired: [
+        ['enabled'],
+        ['position'],
+        ['background'],
+        ['fontSize'],
+        ['wordsPerCue'],
+        ['maxDuration'],
+        ['karaoke'],
+        ['color'],
+        ['backgroundColor'],
+        ['activeColor'],
+    ],
+});
+
+function tools() {
+    return [
+        tool('edit-captions', 'Edit any supported caption presentation or timing property.', CAPTION_ARGS, {
+            visualRepair: true,
+        }),
+        tool('set-caption-style', 'Edit caption colors and presentation.', CAPTION_ARGS, { canonicalAction: 'edit-captions' }),
+        tool('set-caption-position', 'Move captions to a supported screen position.', CAPTION_ARGS, { canonicalAction: 'edit-captions' }),
+        tool('set-caption-size', 'Set caption font size.', CAPTION_ARGS, { canonicalAction: 'edit-captions' }),
+        tool('set-caption-background', 'Set caption background style or color.', CAPTION_ARGS, { canonicalAction: 'edit-captions' }),
+        tool('set-karaoke', 'Enable or disable karaoke highlighting.', CAPTION_ARGS, { canonicalAction: 'edit-captions' }),
+        tool('set-caption-density', 'Set words per cue or maximum cue duration.', CAPTION_ARGS, { canonicalAction: 'edit-captions' }),
+        tool('set-enabled', 'Enable or disable captions.', CAPTION_ARGS, { canonicalAction: 'edit-captions' }),
+    ];
+}
 
 function _projectScope(plan) {
     return {
@@ -172,6 +221,7 @@ function normalizeInvocation(invocation, context) {
 
 function manifest() {
     return {
+        contractVersion: 2,
         id: 'captions',
         specialist: 'Caption Editor',
         domain: 'captions',
@@ -261,4 +311,4 @@ function inspect(plan) {
     };
 }
 
-module.exports = { execute, inspect, manifest, normalizeInvocation, planFast };
+module.exports = { execute, inspect, manifest, normalizeInvocation, planFast, tools };

@@ -2,6 +2,48 @@
 
 const { applyFramingPreset, VALID_FRAMINGS } = require('../../../directives/framing-preset');
 const { resolveSceneTargets } = require('../scope-utils');
+const {
+    boolean: booleanField,
+    number,
+    object,
+    string,
+    tool,
+} = require('./capability-contract');
+
+const FRAMING_PRESET_ARGS = object({
+    framing: string({ enum: [...VALID_FRAMINGS] }),
+}, { required: ['framing'] });
+
+const FRAMING_ADJUST_ARGS = object({
+    scale: number({ min: 0.1, max: 4 }),
+    scaleDelta: number({ min: -3.9, max: 3.9 }),
+    posX: number({ min: -100, max: 100 }),
+    posY: number({ min: -100, max: 100 }),
+    posXDelta: number({ min: -100, max: 100 }),
+    posYDelta: number({ min: -100, max: 100 }),
+    cropTop: number({ min: 0, max: 45 }),
+    cropRight: number({ min: 0, max: 45 }),
+    cropBottom: number({ min: 0, max: 45 }),
+    cropLeft: number({ min: 0, max: 45 }),
+    fitMode: string({ enum: ['cover', 'contain'] }),
+    background: string({ enum: ['none', 'blur'] }),
+    resetCrop: booleanField(),
+}, { minProperties: 1 });
+
+function tools() {
+    return [
+        tool('set-framing', 'Apply a complete renderer-backed framing preset.', FRAMING_PRESET_ARGS, {
+            visualRepair: true,
+        }),
+        tool('reframe', 'Apply a complete renderer-backed framing preset.', FRAMING_PRESET_ARGS, { canonicalAction: 'set-framing' }),
+        tool('adjust-framing', 'Adjust only explicitly requested crop, fit, scale, position, or background controls.', FRAMING_ADJUST_ARGS, {
+            visualRepair: true,
+        }),
+        tool('set-transform', 'Set precise scale or position controls.', FRAMING_ADJUST_ARGS, { canonicalAction: 'adjust-framing' }),
+        tool('set-fit', 'Set cover or contain fitting.', FRAMING_ADJUST_ARGS, { canonicalAction: 'adjust-framing' }),
+        tool('set-crop', 'Set or clear edge crop controls.', FRAMING_ADJUST_ARGS, { canonicalAction: 'adjust-framing' }),
+    ];
+}
 
 function _operation(framing, request) {
     return {
@@ -142,6 +184,7 @@ function normalizeInvocation(invocation, context) {
 
 function manifest() {
     return {
+        contractVersion: 2,
         id: 'framing',
         specialist: 'Framing Editor',
         domain: 'composition',
@@ -233,4 +276,4 @@ function inspect(plan, scope) {
     };
 }
 
-module.exports = { execute, inspect, manifest, normalizeInvocation, planFast };
+module.exports = { execute, inspect, manifest, normalizeInvocation, planFast, tools };

@@ -14,6 +14,7 @@ const {
     analyzePngFrame,
     representativeProofTimes,
     runVisualObserver,
+    shouldRunVisualQa,
 } = require('../../src/agents/editor-supervisor/visual-observer');
 
 function clone(value) {
@@ -102,6 +103,40 @@ async function run() {
         const proof = representativeProofTimes(beforePlan, editedPlan, scope, [], 4);
         assert.ok(proof.length >= 1);
         assert.ok(proof.every((entry) => entry.time >= 0 && entry.time <= 4));
+        const previousVisualQaEnv = process.env.AGENT_VISUAL_QA;
+        delete process.env.AGENT_VISUAL_QA;
+        try {
+            assert.strictEqual(
+                shouldRunVisualQa({
+                    effort: 'fast',
+                    operations: [{
+                        capabilityId: 'framing',
+                        action: 'set-framing',
+                        scope,
+                    }],
+                }),
+                false,
+                'ordinary fast edits should keep the fast-mode visual-QA behavior'
+            );
+            assert.strictEqual(
+                shouldRunVisualQa({
+                    effort: 'fast',
+                    operations: [{
+                        capabilityId: 'graphics',
+                        action: 'regenerate',
+                        scope: {
+                            kind: 'visual',
+                            visualRefs: [{ id: 'selected-stat-card' }],
+                        },
+                    }],
+                }),
+                true,
+                'destructive exact-visual regeneration must render proof frames even in fast mode'
+            );
+        } finally {
+            if (previousVisualQaEnv === undefined) delete process.env.AGENT_VISUAL_QA;
+            else process.env.AGENT_VISUAL_QA = previousVisualQaEnv;
+        }
 
         const opaquePath = path.join(projectDir, 'opaque.png');
         const transparentPath = path.join(projectDir, 'transparent.png');
@@ -179,6 +214,53 @@ async function run() {
                 }
             ),
             []
+        );
+        const scopedProofBefore = clone(graphicBefore);
+        scopedProofBefore.motionGraphics.push({
+            id: 'unrelated-proof',
+            clipId: 'unrelated-proof',
+            type: 'callout',
+            text: 'Unrelated visual',
+            startTime: 5,
+            duration: 2,
+        });
+        const scopedProofAfter = clone(graphicAfter);
+        scopedProofAfter.motionGraphics.push({
+            id: 'unrelated-proof',
+            clipId: 'unrelated-proof',
+            type: 'callout',
+            text: 'Unrelated normalized visual',
+            startTime: 5,
+            duration: 2,
+        });
+        const exactVisualScope = {
+            kind: 'visual',
+            label: 'Selected headline',
+            fromSec: 1,
+            toSec: 3,
+            currentTime: 2,
+            totalDuration: 8,
+            visualRefs: [{
+                id: 'headline-proof',
+                type: 'headline',
+                collection: 'motionGraphics',
+                startTime: 1,
+                endTime: 3,
+            }],
+            clipRefs: [],
+            iconRefs: [],
+        };
+        const scopedProof = representativeProofTimes(
+            scopedProofBefore,
+            scopedProofAfter,
+            exactVisualScope,
+            graphicOperations,
+            4
+        );
+        assert.ok(scopedProof.length >= 1);
+        assert.ok(
+            scopedProof.every((entry) => entry.time >= 1 && entry.time <= 3),
+            'exact-visual proof sampling leaked into an unrelated normalized graphic'
         );
 
         let reviewCalls = 0;
@@ -303,6 +385,34 @@ async function run() {
         });
         assert.strictEqual(second.status, 'pass');
         assert.strictEqual(reviewCalls, 2);
+        const emptyRepairVerdict = await runVisualObserver({
+            beforePlan,
+            plan: editedPlan,
+            request,
+            operations: approvedOperations,
+            transactionId: 'visual-observer-empty-repair',
+            pass: 1,
+            options: {
+                projectDir,
+                appRoot: ROOT,
+                visualQaDeps: {
+                    ...dependencies,
+                    reviewFrames: async () => ({
+                        available: true,
+                        verdict: 'repair',
+                        summary: 'The approved visible edit is present.',
+                        findings: [],
+                        invocations: [],
+                    }),
+                },
+                log: () => { },
+            },
+        });
+        assert.strictEqual(
+            emptyRepairVerdict.status,
+            'pass',
+            'an empty repair verdict with no findings must not surface as a warning'
+        );
 
         const blocked = await runVisualObserver({
             beforePlan: graphicBefore,
@@ -366,6 +476,162 @@ async function run() {
         });
         assert.strictEqual(blocked.status, 'block');
         assert.ok(blocked.findings.some((finding) => finding.code === 'render-contract-mismatch'));
+
+        const boundedGraphicRepair = await runVisualObserver({
+            beforePlan: graphicBefore,
+            plan: graphicAfter,
+            request: {
+                text: 'Restyle this headline',
+                originalText: 'Restyle this headline',
+                effort: 'smart',
+                scope: exactVisualScope,
+            },
+            operations: graphicOperations,
+            transactionId: 'visual-observer-bounded-graphics-repair',
+            pass: 1,
+            options: {
+                projectDir,
+                appRoot: ROOT,
+                visualQaDeps: {
+                    generateProject: async ({ outputRoot }) => {
+                        const generatedDir = path.join(outputRoot, 'yta-hf-bounded-repair');
+                        fs.mkdirSync(generatedDir, { recursive: true });
+                        const manifestPath = path.join(generatedDir, 'hyperframes-motion-manifest.json');
+                        fs.writeFileSync(manifestPath, JSON.stringify({
+                            duration: 8,
+                            scenes: [],
+                            graphics: [{
+                                sourceClipId: 'headline-proof',
+                                authored: false,
+                                fixedRendererOverride: true,
+                                animation: 'typewriter',
+                                transparentBackground: true,
+                                textColor: '#ffffff',
+                            }],
+                        }));
+                        return {
+                            success: true,
+                            projectDir: generatedDir,
+                            motionManifestPath: manifestPath,
+                        };
+                    },
+                    captureSnapshots: async ({ projectDir: generatedDir, proof: requested }) => {
+                        const file = path.join(generatedDir, 'frame-01.png');
+                        writeFrame(file, [42, 78, 128, 255]);
+                        return {
+                            proof: requested,
+                            files: [{ ...requested[0], file }],
+                            result: { ok: true },
+                        };
+                    },
+                    reviewFrames: async () => ({
+                        available: true,
+                        verdict: 'repair',
+                        summary: 'Increase only text separation from the background.',
+                        findings: [],
+                        invocations: [{
+                            capabilityId: 'graphics',
+                            action: 'edit-properties',
+                            args: {
+                                targetType: 'headline',
+                                targetIds: ['headline-proof'],
+                                style: 'bold',
+                                variant: 'punch',
+                                shadowStrength: 0.8,
+                            },
+                            description: 'strengthen text separation without redesigning the graphic',
+                        }],
+                    }),
+                },
+                log: () => { },
+            },
+        });
+        assert.strictEqual(boundedGraphicRepair.status, 'repair');
+        assert.strictEqual(boundedGraphicRepair.repairOperations.length, 1);
+        assert.strictEqual(
+            boundedGraphicRepair.repairOperations[0].args.shadowStrength,
+            0.8
+        );
+        assert.strictEqual(
+            boundedGraphicRepair.repairOperations[0].args.style,
+            undefined,
+            'Visual Observer repairs must not silently redesign the approved graphic style'
+        );
+        assert.strictEqual(
+            boundedGraphicRepair.repairOperations[0].args.variant,
+            undefined,
+            'Visual Observer repairs must not switch to an unrelated graphic variant'
+        );
+        const rejectedRedesignOnly = await runVisualObserver({
+            beforePlan: graphicBefore,
+            plan: graphicAfter,
+            request: {
+                text: 'Restyle this headline',
+                originalText: 'Restyle this headline',
+                effort: 'smart',
+                scope: exactVisualScope,
+            },
+            operations: graphicOperations,
+            transactionId: 'visual-observer-rejected-redesign-only',
+            pass: 1,
+            options: {
+                projectDir,
+                appRoot: ROOT,
+                visualQaDeps: {
+                    generateProject: async ({ outputRoot }) => {
+                        const generatedDir = path.join(outputRoot, 'yta-hf-rejected-redesign');
+                        fs.mkdirSync(generatedDir, { recursive: true });
+                        const manifestPath = path.join(generatedDir, 'hyperframes-motion-manifest.json');
+                        fs.writeFileSync(manifestPath, JSON.stringify({
+                            duration: 8,
+                            scenes: [],
+                            graphics: [{
+                                sourceClipId: 'headline-proof',
+                                authored: false,
+                                fixedRendererOverride: true,
+                                animation: 'typewriter',
+                                transparentBackground: true,
+                                textColor: '#ffffff',
+                            }],
+                        }));
+                        return {
+                            success: true,
+                            projectDir: generatedDir,
+                            motionManifestPath: manifestPath,
+                        };
+                    },
+                    captureSnapshots: async ({ projectDir: generatedDir, proof: requested }) => {
+                        const file = path.join(generatedDir, 'frame-01.png');
+                        writeFrame(file, [42, 78, 128, 255]);
+                        return {
+                            proof: requested,
+                            files: [{ ...requested[0], file }],
+                            result: { ok: true },
+                        };
+                    },
+                    reviewFrames: async () => ({
+                        available: true,
+                        verdict: 'repair',
+                        summary: 'The approved visible edit is already present.',
+                        findings: [],
+                        invocations: [{
+                            capabilityId: 'graphics',
+                            action: 'edit-properties',
+                            args: {
+                                targetType: 'headline',
+                                targetIds: ['headline-proof'],
+                                style: 'bold',
+                                variant: 'punch',
+                            },
+                            description: 'unnecessary redesign',
+                        }],
+                    }),
+                },
+                log: () => { },
+            },
+        });
+        assert.strictEqual(rejectedRedesignOnly.status, 'pass');
+        assert.strictEqual(rejectedRedesignOnly.repairOperations.length, 0);
 
         if (/^(1|true|on)$/i.test(String(process.env.VISUAL_OBSERVER_REAL || '').trim())) {
             const realProjectDir = path.join(projectDir, 'real-project');

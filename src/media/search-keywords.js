@@ -16,6 +16,13 @@ const SEARCH_NOISE_WORDS = new Set([
     'video', 'clip', 'footage', 'image', 'photo', 'showing', 'visual',
 ]);
 
+// Phrase atomicity. Every cut below asks this module "is this one thing?" so a
+// compound noun is never sheared in half ("root cellar" -> "root"). It learns
+// each video's own vocabulary from the planner's fields and from what already
+// won footage in this run — no niche branches, no compound-noun word list.
+const phraseAtoms = require('./phrase-atoms');
+const { detectRequestedPackaging } = require('./packaging-intent');
+
 let _MG_REGISTRY = {};
 let _CLASS_TREATMENTS = {};
 try {
@@ -743,9 +750,29 @@ function _pushPhrase(parts, phrase, maxWords) {
     }
 }
 
-function _tokensByVisualWeight(value, maxWords) {
-    const raw = words(value);
-    const scored = raw.map((word, index) => {
+/**
+ * Cut an over-budget query down to `maxWords`.
+ *
+ * TWO BUGS USED TO LIVE HERE, and both showed up in the "300$ Test" build:
+ *
+ *   1. It cut per WORD, so a compound noun lost its head:
+ *        "thermometer inside dark earthen root cellar" -> "... earthen root"
+ *      Units are now whole (see phrase-atoms.js); an atom that does not fit is
+ *      dropped entirely rather than sheared.
+ *
+ *   2. It emitted in SCORE order and never re-sorted by position, so even a
+ *      correct selection came back scrambled. Its twin `_coreTokenVariant` has
+ *      always ended with `.sort((a, b) => a.index - b.index)`; this one did not.
+ *
+ * The +20 boost for maritime/industrial nouns is left exactly as it was — it is
+ * scoring, not a cut, and rewriting it is a different (behaviour-changing) job.
+ * Atom cohesion is what generalises across niches: a unit scores as its best
+ * word, so a learned two-word subject beats an unrelated single word without
+ * anyone naming the subject in code.
+ */
+function _tokensByVisualWeight(value, maxWords, atoms = []) {
+    const units = phraseAtoms.splitUnits(clean(value), atoms);
+    const scoreWord = (word, index) => {
         const key = word.toLowerCase().replace(/[^\p{L}\p{N}-]/gu, '');
         if (/^\d+(?:[-.,:]\d+)?%?$/.test(key)) return null;
         if (!key || STOP_WORDS.has(key)) return null;
@@ -753,27 +780,125 @@ function _tokensByVisualWeight(value, maxWords) {
         if (/\b(ship|ships|tanker|tankers|cargo|container|port|aerial|drone|warship|naval|factory|warehouse|refinery|pipeline|protest|crowd|street|official|briefing)\b/i.test(key)) score += 20;
         if (/^[A-Z][a-z]+/.test(word)) score += 3;
         score += Math.max(0, 6 - index) * 0.2;
-        return { word, key, score, index };
-    }).filter(Boolean);
+        return { key, score };
+    };
+
+    const scored = [];
+    for (const unit of units) {
+        const parts = unit.words
+            .map((word, k) => scoreWord(word, unit.index + k))
+            .filter(Boolean);
+        // A unit survives if ANY of its words is real content — a stop word
+        // inside a name ("Gulf of Aden") must not delete the name.
+        if (parts.length === 0) continue;
+        scored.push({
+            words: unit.words,
+            index: unit.index,
+            key: parts.map(p => p.key).join(' '),
+            // Cohesion bonus: a multi-word name is more specific than any one of
+            // its words, so it outranks a loose word of equal weight.
+            score: Math.max(...parts.map(p => p.score)) + (unit.isAtom ? 1 : 0),
+        });
+    }
+
     scored.sort((a, b) => (b.score - a.score) || (a.index - b.index));
 
-    const out = [];
+    const picked = [];
     const seen = new Set();
+    let used = 0;
     for (const item of scored) {
         if (seen.has(item.key)) continue;
+        if (used + item.words.length > maxWords) {
+            // Skip, do not truncate. A shorter unit later may still fit.
+            if (used >= maxWords) break;
+            continue;
+        }
         seen.add(item.key);
-        out.push(item.word);
-        if (out.length >= maxWords) break;
+        picked.push(item);
+        used += item.words.length;
     }
-    return out.join(' ');
+    // Emit in the order the words were written, not the order they scored.
+    return picked
+        .sort((a, b) => a.index - b.index)
+        .flatMap(item => item.words)
+        .join(' ');
 }
 
-function _stripSearchNoiseWords(value) {
+/** A query is not allowed to be stripped below this many words. */
+const NOISE_STRIP_FLOOR = 3;
+
+/**
+ * Delete the filler words a stock/tag API scores as noise ("view", "footage",
+ * "explained") — but ONLY when they are filler in THIS video.
+ *
+ * The flat list was the bug. `SEARCH_NOISE_WORDS` contains words that are pure
+ * packaging in a nature script and are the literal subject in an economics one:
+ * trade, flow, barrel, policy, news, analysis. Deleting them globally is a
+ * one-niche solution wearing a disguise, so three gates now stand in front of
+ * the delete, all fed by data the run already has:
+ *
+ *   • ATOM — the word is part of a name this scene or this run established
+ *     ("aerial view" when the planner keeps writing it, "Red Sea").
+ *   • DECLARED — the Director/Planner listed it as a protected term or entity.
+ *   • VOCABULARY — the word recurs across the scene's own authored fields or
+ *     across the run's other scenes. Repetition is the planner saying it means
+ *     it, and it is exactly what separates "barrel" in an oil script from a
+ *     stray "global" in a nature one.
+ *
+ * Plus a floor: stripping may never take a query below three words, and may
+ * never remove more than half of it. Both are shape rules, not word rules.
+ */
+function _stripSearchNoiseWords(value, ctx = {}) {
     const original = words(value);
-    const kept = original.filter(word => {
+    if (original.length === 0) return clean(value);
+
+    const atoms = Array.isArray(ctx.atoms) ? ctx.atoms : [];
+    const protectedKeys = new Set();
+    for (const term of [
+        ...(Array.isArray(ctx.scene?.protectedTerms) ? ctx.scene.protectedTerms : []),
+        ...(Array.isArray(ctx.scene?.entityContext) ? ctx.scene.entityContext : []),
+    ]) {
+        for (const w of words(term)) protectedKeys.add(w.toLowerCase().replace(/[^\p{L}\p{N}-]/gu, ''));
+    }
+
+    // Which positions sit inside an atom? Computed once over the whole string.
+    const inAtom = new Set();
+    let cursor = 0;
+    for (const unit of phraseAtoms.splitUnits(clean(value), atoms)) {
+        if (unit.isAtom) {
+            for (let k = 0; k < unit.words.length; k++) inAtom.add(cursor + k);
+        }
+        cursor += unit.words.length;
+    }
+
+    // Local recurrence: the same word used twice inside this scene's own fields.
+    const localCounts = new Map();
+    for (const w of words(ctx.localText || '')) {
+        const k = w.toLowerCase().replace(/[^\p{L}\p{N}-]/gu, '');
+        if (k) localCounts.set(k, (localCounts.get(k) || 0) + 1);
+    }
+
+    const maxRemovals = Math.max(0, Math.min(
+        original.length - NOISE_STRIP_FLOOR,
+        Math.floor(original.length / 2),
+    ));
+    let removed = 0;
+    const kept = [];
+    for (let i = 0; i < original.length; i++) {
+        const word = original[i];
         const key = word.toLowerCase().replace(/[^\p{L}\p{N}-]/gu, '');
-        return key && !SEARCH_NOISE_WORDS.has(key);
-    });
+        if (!key) continue;
+        const isNoise = SEARCH_NOISE_WORDS.has(key);
+        const isLoadBearing = inAtom.has(i)
+            || protectedKeys.has(key)
+            || (localCounts.get(key) || 0) >= 2
+            || phraseAtoms.wordWeight(key) >= 3;
+        if (isNoise && !isLoadBearing && removed < maxRemovals) {
+            removed++;
+            continue;
+        }
+        kept.push(word);
+    }
     return kept.length > 0 ? kept.join(' ') : clean(value);
 }
 
@@ -789,7 +914,19 @@ function trimSearchKeyword(keyword, scene = {}, opts = {}) {
         maxCoreWords: opts.maxCoreWords || 4,
     });
     const input = displayRepair.changed ? displayRepair.after : clean(keyword);
-    const original = _stripSearchNoiseWords(_stripUnsupportedMaritimeAerial(_repairMaritimeSearchKeyword(input, scene), scene));
+    const preNoise = _stripUnsupportedMaritimeAerial(_repairMaritimeSearchKeyword(input, scene), scene);
+    // Work out what counts as ONE THING before making any cut. Derived from the
+    // scene's declared entities, the words its own planner fields repeat, its
+    // capitalised runs, and whatever this run has already learned — so the same
+    // code protects "root cellar" on a homestead video and "Strait of Hormuz"
+    // on a geopolitics one.
+    const atoms = phraseAtoms.collectAtoms(scene, opts.scriptContext || {}, { text: preNoise });
+    const original = _stripSearchNoiseWords(preNoise, {
+        scene,
+        atoms,
+        localText: [preNoise, scene?.searchKeyword, scene?.keyword, scene?.stockQuery, scene?.webQuery]
+            .filter(Boolean).join(' '),
+    });
     if (!original) return '';
 
     const combined = [
@@ -821,7 +958,310 @@ function trimSearchKeyword(keyword, scene = {}, opts = {}) {
     }
 
     if (parts.length >= 3) return parts.join(' ');
-    return _tokensByVisualWeight(original, maxWords) || words(original).slice(0, maxWords).join(' ');
+    // Last resort still respects atoms: `trimToBudget` drops whole units, so the
+    // old `slice(0, maxWords)` can no longer cut a name in half either.
+    return _tokensByVisualWeight(original, maxWords, atoms)
+        || phraseAtoms.trimToBudget(original, maxWords, atoms)
+        || words(original).slice(0, maxWords).join(' ');
+}
+
+// ---------------------------------------------------------------------------
+// YouTube dialect
+// ---------------------------------------------------------------------------
+
+/**
+ * Words that name a MEDIUM that is not video. "photo of a barn" describes the
+ * file format, never the barn, and no uploader has ever typed it into a title.
+ * These are stripped unconditionally.
+ */
+const YOUTUBE_MEDIUM_WORDS = new Set([
+    'photo', 'photos', 'image', 'images', 'portrait', 'picture', 'pictures',
+    'showing', 'featuring',
+]);
+
+/**
+ * Words that name a KIND OF EXPLANATION — a thing a video can legitimately be
+ * about. YouTube is full of "heat exchanger diagram explained" and "engine
+ * cutaway", so these are not dead weight the way "photo" is.
+ *
+ * They used to sit in the same always-strip list, which produced the Jul-29
+ * scene-59 failure: the scene's brief was "earth tube diagram cross section",
+ * the YouTube lane searched "ground coupled heat exchanger" with the word
+ * "diagram" deleted, and the scene finished with no media. We asked for a
+ * diagram and then refused to search for one.
+ *
+ * Now they survive only when this scene's own request asked for that packaging
+ * (see media/packaging-intent.js). Topic-adaptive by construction: no niche is
+ * named anywhere: a DIY scene whose brief IS a cutaway keeps the word, and the
+ * next scene in the same video — "excavated clay pipe trench" — still loses it.
+ */
+const YOUTUBE_ARTIFACT_WORDS = new Set([
+    'diagram', 'diagrams', 'chart', 'charts', 'infographic', 'infographics',
+    'illustration', 'illustrations', 'schematic', 'schematics', 'cutaway',
+    'blueprint', 'blueprints',
+]);
+
+function _ytKey(word) {
+    return String(word || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+/**
+ * Measurements never appear in a human-typed title, and YouTube treats them as
+ * required terms — so one of them collapses the whole result set.
+ *
+ * Measured on the "300$ Test" build: `"...groundwater constant temperature
+ * 54–56°F"` returned exactly 1 video (a water-testing clip), and `"root cellar
+ * ... Holmes County Amish farm entrance"` also returned 1. Drop the measurement
+ * and the same scenes return 50 hits including the literal target uploads
+ * ("Buried a Root Cellar Underground...", "How We Developed A Natural Spring").
+ *
+ * Shape-based, not a word list: a NUMBER BOUND TO A UNIT. Accepts a single token
+ * ("54–56°F", "12ft") or a whole protected term ("55 degrees"), so the caller can
+ * ask about either.
+ *
+ * Deliberately NOT "any token containing a digit". That rule looked right and was
+ * wrong in the one direction that matters here: a human-typed title is where
+ * alphanumeric designators live, so it deleted the subject of the search —
+ * `F-16 fighter jet` -> `fighter jet`, `1970s brick ranch` -> `brick ranch`,
+ * `Highway 101 California` -> `Highway California`, `Apollo 11` -> `Apollo`. Two of
+ * those are real "300$ Test" keywords. A bare integer with no unit is not proven
+ * harmful and is often the highest-signal word on the line, so it stays.
+ *
+ * Nothing here is niche-specific, and the stock/web lanes are untouched — they
+ * want these terms, because a tag API scores rather than requires them.
+ */
+/*
+ * `in` and `m` are deliberately ABSENT from the unit list even though they are
+ * real abbreviations. `\d\s*in\b` also matches the English preposition, so
+ * including them re-created the exact bug this function exists to prevent, one
+ * layer down: `Apollo 11 in flight`, `F-16 in flight`, `Route 66 in Arizona` and
+ * `Article 5 in NATO` were all classified as measurements and dropped whole.
+ * `inch`/`inches`/`meter`/`metres` still cover the spelled-out cases, which is
+ * how a human writes a measurement in a video title anyway.
+ */
+const _YT_UNIT = '°|℃|℉|deg|degs|degree|degrees|celsius|fahrenheit|ft|feet|foot|inch|inches'
+    + '|cm|mm|meter|meters|metre|metres|km|mi|mile|miles|kg|lb|lbs|pound|pounds'
+    + '|mph|kph|psi|hz|khz|percent|%';
+const _YT_MEASUREMENT_RE = new RegExp(`\\d\\s*(?:${_YT_UNIT})\\b`, 'i');
+
+function _ytIsMeasurement(value) {
+    const w = String(value || '').trim();
+    if (!w) return false;
+    if (_YT_MEASUREMENT_RE.test(w)) return true;       // "54–56°F", "12ft", "55 degrees"
+    if (/^[°℃℉]+$/.test(w)) return true;               // stray degree mark on its own
+    return /^\d+\s*[x×]\s*\d+$/i.test(w);              // "1920x1080"
+}
+
+/**
+ * Build a YouTube search query.
+ *
+ * Every other consumer of `trimSearchKeyword` is a stock or image API, where the
+ * query is a TAG LOOKUP: short, denatured, proper nouns withheld, and words like
+ * "footage" or "raw" are noise that shrink the result set. YouTube is the exact
+ * opposite — the query is matched against a TITLE A HUMAN TYPED, and the words
+ * that identify the good uploads are precisely the ones the stock cleaner
+ * deletes: "raw", "footage", "b-roll", and above all the place name.
+ *
+ * Running the stock path on a YouTube query therefore strips its best signal and
+ * then caps what is left at 5 words (`trimSearchKeyword` clamps maxWords to 6
+ * regardless of what the caller asks for, and footage-manager calls it twice),
+ * and can rewrite it through a hardcoded phrase table. Hence a separate builder
+ * rather than a flag: the two dialects disagree about nearly every rule, and
+ * entangling them would make both worse. Nothing here touches
+ * `trimSearchKeyword`, so stock/web queries stay byte-identical.
+ *
+ * Niche-agnostic by construction: the only word list is the still-image set
+ * above; everything else comes from the scene's own planner-authored terms.
+ */
+function buildYouTubeQuery(baseQuery, scene = {}, opts = {}) {
+    // `Number(opts.maxWords) || 10` and not `Number(opts.maxWords || 10)`: the
+    // latter turns a junk value into NaN, and Math.min/Math.max propagate NaN, so
+    // the cap silently stops existing and `out.length >= maxWords` never fires.
+    const maxWords = Math.max(4, Math.min(12, Number(opts.maxWords) || 10));
+    const source = clean(baseQuery) || clean(scene?.searchKeyword) || clean(scene?.keyword);
+    if (!source) return '';
+
+    // Does this scene's own brief ask for a drawn explanation? If so the artifact
+    // words are the search, not noise in it.
+    //
+    // `ignoreQuery` is the load-bearing part. We are editing the query, so the
+    // query cannot be its own evidence — a planner that types "diagram" out of
+    // habit would then always justify keeping it and the filter would never fire
+    // again. The word survives only when something OTHER than the string being
+    // filtered asked for it: the planner's full visual intent, or the Media
+    // Agent's must-show list. That is why scene 59 keeps "diagram" (its must-show
+    // list literally reads "earth tube diagram") and the trench scene next door
+    // does not.
+    const requested = opts.requestedPackaging
+        || detectRequestedPackaging({
+            scene,
+            visualIntent: scene?.visualIntent || '',
+            ignoreQuery: true,
+        });
+    const stripped = (word) => {
+        const w = String(word || '').toLowerCase();
+        if (YOUTUBE_MEDIUM_WORDS.has(w)) return true;
+        if (YOUTUBE_ARTIFACT_WORDS.has(w)) return !requested?.graphic;
+        return false;
+    };
+
+    const out = [];
+    const seen = new Set();
+    const push = (list) => {
+        for (const word of list) {
+            if (out.length >= maxWords) return;
+            const key = _ytKey(word);
+            if (!key || seen.has(key) || stripped(word)) continue;
+            if (_ytIsMeasurement(word)) continue;
+            seen.add(key);
+            out.push(word);
+        }
+    };
+
+    push(words(source));
+    if (!out.length) return clean(baseQuery);
+
+    // Proper nouns and places are the highest-value addition here, and the one
+    // thing the stock path deliberately withholds: `_guardProviderQuery` returns
+    // the query untouched on the stated grounds that entity terms are "scoring
+    // context, not search terms". True for a tag API. False for YouTube, where
+    // the uploader typed the place name straight into the title.
+    for (const term of (opts.protectedTerms || [])) {
+        const termWords = words(clean(term));
+        if (!termWords.length) continue;
+        // A whole term can be a measurement even when no single word is: "55
+        // degrees" is two innocent-looking tokens that together are the exact
+        // thing that empties a YouTube result set.
+        if (_ytIsMeasurement(term)) continue;
+
+        // All-or-nothing, enforced against the FILTERS and not just against what
+        // is already in the query. Filtering after the budget check was the bug:
+        // the term was measured whole, then `push` quietly dropped part of it,
+        // so "55 degrees" contributed a naked "degrees" and "no compressor"
+        // contributed a naked "no" — the fragments this rule exists to prevent.
+        const kept = termWords.filter(w => _ytKey(w)
+            && !stripped(w)
+            && !_ytIsMeasurement(w));
+        if (kept.length !== termWords.length) continue;    // a filter ate part of it → drop it whole
+
+        // Words already in the query still count as covered: YouTube does not
+        // require adjacency, so "Holmes" from the base query plus "County" here
+        // is the same match as the intact phrase.
+        const fresh = kept.filter(w => !seen.has(_ytKey(w)));
+        if (!fresh.length) continue;                       // already covered
+        if (out.length + fresh.length > maxWords) continue;
+        push(kept);
+    }
+
+    return out.join(' ');
+}
+
+/**
+ * Grammar glue and camera-move vocabulary — the words that describe HOW a shot is
+ * framed rather than WHAT is in it. Used only to pick the start of the short core
+ * rung, never to edit the specific rung (a real uploader does write "aerial", and
+ * on the full-length query there is budget to spare).
+ *
+ * Niche-agnostic on purpose: English function words plus cinematography terms, no
+ * topic nouns. Reusing `_tokensByVisualWeight` here was rejected — it carries a
+ * hardcoded +20 boost for maritime/industrial nouns (ship, tanker, port, crane…),
+ * which would quietly make YouTube better at one niche than at the others.
+ */
+const YOUTUBE_CORE_GLUE = new Set([
+    'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'from',
+    'and', 'or', 'into', 'onto', 'over', 'under', 'near', 'up', 'down',
+    'aerial', 'drone', 'shot', 'shots', 'closeup', 'close', 'macro', 'wide',
+    'pov', 'angle', 'view', 'looking', 'timelapse', 'slowmotion', 'handheld',
+    'tracking', 'panning', 'establishing',
+]);
+
+const _ytIsGlue = (w) => YOUTUBE_CORE_GLUE.has(String(w || '').toLowerCase());
+const _ytIsCapitalized = (w) => /^[A-Z]/.test(String(w || ''));
+
+/**
+ * Cut the short core rung out of an already-filtered query.
+ *
+ * Not just `slice(0, n)`. Taking the head of the line assumes the first words are
+ * the subject, and for a planner-authored keyword they routinely are not:
+ *
+ *   "aerial drone shot of a root cellar entrance"  head -> "aerial drone shot of"
+ *   "root cellar entrance Holmes County Amish farm" head -> "... entrance Holmes"
+ *
+ * The first spends the entire budget on camera instructions; the second cuts a
+ * place name in half, which matches more noise than the intact phrase would. So:
+ * skip leading glue, then never end the core in the middle of a name.
+ *
+ * "A name" used to mean ONLY a capitalized run, which is why the same build that
+ * kept "Holmes County" whole still shipped these:
+ *
+ *     "stone staircase descending root cellar underground Amish farmhouse"
+ *                                       -> "stone staircase descending root"
+ *     "earthen cellar walls bare dirt no insulation"
+ *                                       -> "earthen cellar walls bare"
+ *
+ * Lowercase compound nouns are names too. The capitalized-run rule is now one of
+ * several atom sources rather than the only one, so this cut protects them all.
+ */
+function _ytCoreQuery(query, coreWords, atoms = []) {
+    let toks = words(clean(query));
+    if (!toks.length) return '';
+
+    let start = 0;
+    while (start < toks.length && _ytIsGlue(toks[start])) start++;
+    // Only honour the skip if real subject words survive it; a query that is all
+    // glue keeps its original head rather than becoming empty.
+    if (toks.length - start >= 2) toks = toks.slice(start);
+
+    if (toks.length > coreWords) {
+        const units = phraseAtoms.splitUnits(toks.join(' '), atoms);
+        const packed = phraseAtoms.packUnits(units, coreWords).flatMap(u => u.words);
+        if (packed.length) {
+            toks = packed;
+        } else {
+            const nextWord = toks[coreWords];
+            let end = coreWords;
+            if (_ytIsCapitalized(nextWord) && _ytIsCapitalized(toks[end - 1])) end--;   // "Holmes | County"
+            toks = toks.slice(0, end);
+        }
+    }
+    while (toks.length > 2 && _ytIsGlue(toks[toks.length - 1])) toks.pop();
+
+    return toks.join(' ');
+}
+
+/**
+ * Two rungs of the same request: the SPECIFIC query (entities and all) and a
+ * short CORE noun phrase. Both are searched; the results merge into one pool.
+ *
+ * Neither rung wins reliably, which is why we stopped choosing. Measured on the
+ * five scenes that came back empty in the "300$ Test" build:
+ *
+ *   #36 root cellar   specific -> 1 junk hit      core -> "Buried a Root Cellar Underground..."
+ *   #39 spring water  specific -> 1 junk hit      core -> "How We Developed A Natural Spring..."
+ *   #45 clay pipe     specific -> "How French Drains Work"   core -> plane wrecks, grain silos
+ *
+ * A long query is an AND against a human's title, so one rare word (a county, a
+ * temperature) empties the result set; a short query matches far too much. The
+ * storyboard screen is what makes running both affordable — it looks inside every
+ * candidate and throws away the plane wrecks, so a noisy pool costs recall
+ * nothing and a narrow one costs it everything.
+ */
+function buildYouTubeQueryLadder(baseQuery, scene = {}, opts = {}) {
+    const coreWords = Math.max(3, Math.min(6, Number(opts.coreWords) || 4));
+    const specific = buildYouTubeQuery(baseQuery, scene, opts);
+    // The core deliberately skips `protectedTerms` as SEARCH terms: entities are
+    // exactly what makes the specific rung narrow, so the fallback rung must not
+    // inherit them. They are still read as ATOMS — knowing "Holmes County" is one
+    // name is what stops the cut landing inside it.
+    const atoms = phraseAtoms.collectAtoms(scene, opts.scriptContext || {}, { text: baseQuery });
+    const core = _ytCoreQuery(buildYouTubeQuery(baseQuery, scene, { maxWords: 12 }), coreWords, atoms);
+
+    const ladder = [];
+    for (const q of [specific, core]) {
+        const v = clean(q);
+        if (v && !ladder.some(x => x.toLowerCase() === v.toLowerCase())) ladder.push(v);
+    }
+    return ladder;
 }
 
 function applySearchKeywordSplit(scene, scriptContext = {}, opts = {}) {
@@ -857,9 +1297,20 @@ function applySearchKeywordSplit(scene, scriptContext = {}, opts = {}) {
 module.exports = {
     applySearchKeywordSplit,
     buildSearchKeywordVariants,
+    buildYouTubeQuery,
+    buildYouTubeQueryLadder,
     isDisplaySearchDirective,
     normalizeEntityContext,
     repairDisplaySearchQuery,
     trimSearchKeyword,
     wordCount,
+    // Phrase memory. The downloader calls `rememberPhraseWin` when a query
+    // actually produced usable footage, which is what makes the atom set get
+    // smarter as a run progresses instead of being fixed at scene 1.
+    collectAtoms: phraseAtoms.collectAtoms,
+    observeScene: phraseAtoms.observeScene,
+    observeScenes: phraseAtoms.observeScenes,
+    rememberPhraseWin: phraseAtoms.rememberPhraseWin,
+    resetPhraseMemory: phraseAtoms.resetPhraseMemory,
+    phraseMemoryStats: phraseAtoms.phraseMemoryStats,
 };

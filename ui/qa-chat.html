@@ -112,7 +112,7 @@ body {
     background: #0d0d0d;
     padding: 1px 5px;
     border-radius: 3px;
-    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-family: 'Consolas', monospace;
     font-size: 12px;
     color: #7dd3a8;
 }
@@ -140,11 +140,11 @@ body {
     width: 6px; height: 6px;
     background: #555;
     border-radius: 50%;
-    animation: bounce 1.2s infinite;
+    animation: typingLift 1.2s cubic-bezier(0.22, 1, 0.36, 1) infinite;
 }
 .typing-dot:nth-child(2) { animation-delay: 0.2s; }
 .typing-dot:nth-child(3) { animation-delay: 0.4s; }
-@keyframes bounce {
+@keyframes typingLift {
     0%, 60%, 100% { transform: translateY(0); }
     30% { transform: translateY(-5px); background: #7dd3a8; }
 }
@@ -220,18 +220,19 @@ body {
 }
 .quick-btn:hover { background: #252525; color: #ccc; border-color: #3a3a3a; }
 </style>
+<link rel="stylesheet" href="css/cut-ledger-surfaces.css">
 </head>
-<body>
+<body class="cut-qa-chat">
 
 <div class="header">
     <div>
-        <h1>🤖 QA Agent Chat</h1>
+        <h1>QA Agent Chat</h1>
         <div class="subtitle" id="project-bar">Loading project...</div>
     </div>
     <div class="niche-select">
         <label>Focus niche:</label>
         <select id="niche-select">
-            <option value="">— none (general) —</option>
+            <option value="">No niche (general)</option>
         </select>
     </div>
     <button id="btn-clear">Clear</button>

@@ -330,7 +330,10 @@ async function processTemplates(scenes, scriptContext, mgScenes, aiInstructions)
             const isPreservedTemplate = preservePlannerTemplateRoles && cand.selectionMode === 'visual-planner-preserved';
             const tpl = _buildTemplateFromVPHint(cand, themeId)
                 || (isPreservedTemplate
-                    ? (_buildFallbackTemplateFromScene(cand, themeId) || _buildCoverageTemplateFromScene(cand, themeId))
+                    // stats.byType is the running tally of everything placed so
+                    // far this video (listicle grid, earlier direct builds) —
+                    // it is what lets the coverage picker stop repeating itself.
+                    ? (_buildFallbackTemplateFromScene(cand, themeId) || _buildCoverageTemplateFromScene(cand, themeId, stats.byType))
                     : null);
             if (!tpl) {
                 if (isPreservedTemplate) {
@@ -812,6 +815,35 @@ RULES:
 - Confidence: 0.9+ = perfect fit, 0.7-0.89 = good, below 0.7 = skip it
 - Default to SKIP (per the GLOBAL EDITORIAL RULE above) — only output a template when footage genuinely cannot carry the beat; a light overlay on footage almost always beats a full-screen card`;
 
+    // What this video has already put on screen.
+    //
+    // The MG author has had this for as long as it has existed
+    // (`ALREADY PLACED: …` in ai-motion-graphics.js) and the template selector
+    // never did — it was handed `existingTemplates` and only ever used the
+    // TIMES inside it, never the types. So it chose every card in ignorance of
+    // every other card, and the measured Aug-1 build came out with the same
+    // takeaway card five times. That is not a taste failure; nothing told it.
+    //
+    // Conditional on purpose: a video with nothing placed yet gets exactly the
+    // prompt it got before, byte for byte. The correction only exists once the
+    // video has a habit to correct, and it is the video's OWN distribution —
+    // no quota, no cap, no per-niche table, so it stays right when the niche,
+    // the format or the card count changes.
+    const placedCounts = {};
+    for (const t of (existingTemplates || [])) {
+        if (t?.type) placedCounts[t.type] = (placedCounts[t.type] || 0) + 1;
+    }
+    const placedEntries = Object.entries(placedCounts).sort((a, b) => b[1] - a[1]);
+    if (placedEntries.length > 0) {
+        const placedStr = placedEntries.map(([t, n]) => (n > 1 ? `${t} ×${n}` : t)).join(', ');
+        prompt += `\n\nALREADY ON SCREEN IN THIS VIDEO: ${placedStr}`;
+        prompt += `\n- Variety is part of looking hand-made: reaching for a card type this video has already used`
+            + ` reads as a machine repeating itself. Prefer a type not in that list — or SKIP.`;
+        if (placedEntries[0][1] > 1) {
+            prompt += ` "${placedEntries[0][0]}" has already been used ${placedEntries[0][1]} times; do not use it again unless the narration leaves no honest alternative.`;
+        }
+    }
+
     // Language instruction — affects text/subText/items (user-facing).
     // Template `type` stays English (it's an enum: factCard|statCard|etc.), as does
     // `iconHint` inside items (maps to icon registry). Confidence/idx are numbers.
@@ -1177,14 +1209,14 @@ function _buildFallbackTemplateFromScene(candidate, themeId) {
     };
 }
 
-function _buildCoverageTemplateFromScene(candidate, themeId) {
+function _buildCoverageTemplateFromScene(candidate, themeId, placedByType = {}) {
     const { scene, hintType, hintContent } = candidate;
     if (!scene) return null;
 
     const sceneStart = Number(scene.startTime) || 0;
     const sceneEnd = Number(scene.endTime) || sceneStart + 4;
     const sceneDur = sceneEnd - sceneStart;
-    const type = _pickCoverageTemplateType(sceneDur);
+    const type = _pickCoverageTemplateType(sceneDur, placedByType);
     const registry = TEMPLATE_REGISTRY[type];
     if (!type || !registry || sceneDur <= 0) return null;
 
@@ -1226,10 +1258,49 @@ function _buildCoverageTemplateFromScene(candidate, themeId) {
     };
 }
 
-function _pickCoverageTemplateType(sceneDur) {
-    if (sceneDur >= TEMPLATE_REGISTRY.keyTakeaway.minDur) return 'keyTakeaway';
-    if (sceneDur >= TEMPLATE_REGISTRY.chapterCard.minDur) return 'chapterCard';
-    return 'locationCard';
+// The three cards a coverage rescue can honestly build. Every other template
+// type needs `items` — real stats, a real quote, two real images — and coverage
+// rescue has only a line of text recovered from the scene, so offering it
+// statCard or splitScreen would mean inventing content. Order is the editorial
+// preference, longest-form first; it is still the tie-break below.
+const COVERAGE_TEMPLATE_LADDER = ['keyTakeaway', 'chapterCard', 'locationCard'];
+
+/**
+ * Which card should this coverage rescue build?
+ *
+ * This used to be duration alone: any scene of 3s or more became a keyTakeaway,
+ * every single time, because the function had no idea what the video had
+ * already placed. On the real build that was measured, `key-takeaway` appeared
+ * five times out of twenty graphics — the single strongest "made by a machine"
+ * signal in the whole page, and it was not a taste failure by any agent. It was
+ * a ladder that could only ever return one answer.
+ *
+ * Now the ladder still decides what is ELIGIBLE (a card the scene is long
+ * enough to hold), and the video's own distribution decides which eligible card
+ * to use: the one it has leaned on least so far. That counts every template
+ * already placed, not just coverage ones, so a video whose AI pass already
+ * chose two keyTakeaways gets a chapterCard here without anyone having to say
+ * so. No cap, no quota, no per-niche table — the correction is whatever the
+ * video has actually been doing, which is the only thing that stays right when
+ * the niche, the format or the scene count changes.
+ *
+ * First-wins tie-breaking keeps the old behaviour exactly for the first
+ * placement: on a video with nothing placed yet, a long scene is still a
+ * keyTakeaway.
+ */
+function _pickCoverageTemplateType(sceneDur, placedByType = {}) {
+    const eligible = COVERAGE_TEMPLATE_LADDER.filter(
+        (t) => sceneDur >= (Number(TEMPLATE_REGISTRY[t]?.minDur) || Infinity)
+    );
+    // Nothing fits: hand back the shortest card exactly as before and let the
+    // timing guard downstream reject it. Changing that here would be a second
+    // decision hiding inside a first one.
+    if (!eligible.length) return COVERAGE_TEMPLATE_LADDER[COVERAGE_TEMPLATE_LADDER.length - 1];
+    let leastUsed = eligible[0];
+    for (const type of eligible) {
+        if ((placedByType[type] || 0) < (placedByType[leastUsed] || 0)) leastUsed = type;
+    }
+    return leastUsed;
 }
 
 function _coverageTemplateText(candidate, parsed = {}) {
@@ -1731,4 +1802,8 @@ module.exports = {
     downloadTemplateItemImages,
     TEMPLATE_TYPES,
     TEMPLATE_REGISTRY,
+    // exported for the verify harness
+    COVERAGE_TEMPLATE_LADDER,
+    _pickCoverageTemplateType,
+    _aiSelectTemplates,
 };

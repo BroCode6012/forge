@@ -1,8 +1,15 @@
 'use strict';
 
 const { applyHardCuts } = require('../../../directives/transition-preset');
-const { editScopedTransitions } = require('../workers/transition-editor');
+const { DEFAULT_DURATIONS, editScopedTransitions } = require('../workers/transition-editor');
 const { resolveSceneTargets, scopeRange } = require('../scope-utils');
+const {
+    array,
+    number,
+    object,
+    string,
+    tool,
+} = require('./capability-contract');
 
 const TYPE_ALIASES = [
     ['blur-dissolve', /\bblur(?:red)?[\s-]+dissolve\b/i],
@@ -24,7 +31,36 @@ const TYPE_ALIASES = [
     ['glitch', /\bglitch\b/i],
     ['crossfade', /\bdissolve\b/i],
 ];
-const TRANSITION_TYPES = new Set(['cut', ...TYPE_ALIASES.map(([type]) => type)]);
+const TRANSITION_TYPES = new Set(Object.keys(DEFAULT_DURATIONS));
+const TRANSITION_BOUNDARIES = ['incoming', 'outgoing', 'nearest', 'all'];
+
+const TRANSITION_EDIT_ARGS = object({
+    type: string({ enum: [...TRANSITION_TYPES] }),
+    duration: number({ min: 0, max: 2 }),
+    durationScale: number({ min: 0.1, max: 4 }),
+    boundary: string({ enum: TRANSITION_BOUNDARIES }),
+}, {
+    anyOfRequired: [['type'], ['duration'], ['durationScale']],
+});
+
+const HARD_CUT_ARGS = object({
+    banned: array(string({ enum: [...TRANSITION_TYPES] }), { maxItems: 32, uniqueItems: true }),
+    boundary: string({ enum: TRANSITION_BOUNDARIES }),
+});
+
+function tools() {
+    return [
+        tool('edit-transition', 'Edit transition type or timing on exact selected boundaries.', TRANSITION_EDIT_ARGS, {
+            visualRepair: true,
+        }),
+        tool('set-transition', 'Set transition type or timing.', TRANSITION_EDIT_ARGS, { canonicalAction: 'edit-transition' }),
+        tool('set-transition-duration', 'Set transition duration.', TRANSITION_EDIT_ARGS, { canonicalAction: 'edit-transition' }),
+        tool('hard-cuts', 'Replace selected transition boundaries with cuts.', HARD_CUT_ARGS, {
+            visualRepair: true,
+        }),
+        tool('remove-transitions', 'Remove selected transitions by replacing them with cuts.', HARD_CUT_ARGS, { canonicalAction: 'hard-cuts' }),
+    ];
+}
 
 function _boundaryMode(text) {
     const raw = String(text || '');
@@ -132,6 +168,7 @@ function normalizeInvocation(invocation, context) {
 
 function manifest() {
     return {
+        contractVersion: 2,
         id: 'transitions',
         specialist: 'Transition Editor',
         domain: 'transitions',
@@ -211,4 +248,4 @@ function inspect(plan, scope) {
     };
 }
 
-module.exports = { execute, inspect, manifest, normalizeInvocation, planFast };
+module.exports = { execute, inspect, manifest, normalizeInvocation, planFast, tools };

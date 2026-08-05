@@ -224,6 +224,27 @@ try {
     assert.strictEqual(loadedA.source, '.fvp');
     assert.strictEqual(loadedA.needsReconcile, false);
 
+    // A mirror written by the SAME save must never outrank the .fvp it was
+    // copied from, no matter how far its mtime lands ahead. This is not
+    // hypothetical: the .fvp candidate is dated by planSavedAt, stamped before
+    // any file is written, while the mirrors carry the mtime of files the same
+    // save wrote and fsynced afterwards — so the mirrors are ALWAYS a little
+    // newer, and under disk contention (a full `npm run verify` run) enough so
+    // that the loader reported temp/video-plan.json as the source of a plan it
+    // had just saved. Forcing the gap makes that race deterministic instead of
+    // leaving it to how busy the disk is.
+    const sameSaveMirrors = [
+        path.join(publicDir, 'video-plan.json'),
+        path.join(tempDir, 'video-plan.json'),
+    ];
+    const slowFsync = new Date(Date.now() + 3000);
+    for (const mirror of sameSaveMirrors) fs.utimesSync(mirror, slowFsync, slowFsync);
+
+    const afterSlowWrite = loadProjectState(options);
+    assert.strictEqual(afterSlowWrite.source, '.fvp');
+    assert.deepStrictEqual(afterSlowWrite.videoPlan, planA);
+    assert.strictEqual(afterSlowWrite.needsReconcile, false);
+
     // Simulate a build writing a newer public plan while the old .fvp remains.
     const planB = {
         totalDuration: 12,

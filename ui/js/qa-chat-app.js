@@ -94,7 +94,7 @@ function addMessage(role, text) {
 
     const avatar = document.createElement('div');
     avatar.className = 'msg-avatar';
-    avatar.textContent = role === 'user' ? '👤' : '🤖';
+    avatar.textContent = role === 'user' ? 'U' : 'AI';
 
     const bubble = document.createElement('div');
     bubble.className = 'msg-bubble';
@@ -126,7 +126,7 @@ function addTypingIndicator() {
 
     const avatar = document.createElement('div');
     avatar.className = 'msg-avatar';
-    avatar.textContent = '🤖';
+    avatar.textContent = 'AI';
 
     const indicator = document.createElement('div');
     indicator.className = 'typing-indicator';

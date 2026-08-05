@@ -333,27 +333,28 @@ function overlayScaleFor(S, S0, kind) {
     const factor = Math.max(c.min, Math.min(c.max, Math.pow(S / Math.max(0.0001, S0), c.k)));
     return factor / S; // world-space scale that yields the desired screen factor
 }
-function buildMapTimelineJS(anim, offset = 0) {
+function buildMapTimelineJS(anim, offset = 0, timelineVar = 'tl') {
+    const timeline = /^[A-Za-z_$][\w$]*$/.test(String(timelineVar || '')) ? String(timelineVar) : 'tl';
     const at = (t) => (offset + t).toFixed(3);
     const L = [];
     L.push(`(function(){ var w="#"+CSS.escape(${JSON.stringify(anim.worldId)});`);
     if (anim.tilt) {
         L.push(`gsap.set("#${anim.tilt.id}",{transformPerspective:1150,transformOrigin:"50% 62%",rotationX:0});`);
-        L.push(`tl.to("#${anim.tilt.id}",{rotationX:${anim.tilt.deg},duration:${anim.tilt.dur.toFixed(2)},ease:"sine.inOut"},${(offset + anim.tilt.at).toFixed(3)});`);
+        L.push(`${timeline}.to("#${anim.tilt.id}",{rotationX:${anim.tilt.deg},duration:${anim.tilt.dur.toFixed(2)},ease:"sine.inOut"},${(offset + anim.tilt.at).toFixed(3)});`);
     }
     L.push(`if(!document.querySelector(w))return;`);
     L.push(`gsap.set(w,{transformOrigin:"0px 0px"});`);
     for (const k of anim.camera) {
-        if (k.set) L.push(`tl.set(w,{x:${k.x},y:${k.y},scale:${k.scale}},${at(0)}); gsap.set(w,{x:${k.x},y:${k.y},scale:${k.scale}});`);
-        else L.push(`tl.to(w,{x:${k.x},y:${k.y},scale:${k.scale},duration:${k.dur.toFixed(3)},ease:"${k.ease}"},${at(k.at)});`);
+        if (k.set) L.push(`${timeline}.set(w,{x:${k.x},y:${k.y},scale:${k.scale}},${at(0)}); gsap.set(w,{x:${k.x},y:${k.y},scale:${k.scale}});`);
+        else L.push(`${timeline}.to(w,{x:${k.x},y:${k.y},scale:${k.scale},duration:${k.dur.toFixed(3)},ease:"${k.ease}"},${at(k.at)});`);
     }
     if (anim.route) {
-        L.push(`tl.fromTo("#${anim.route.glow}",{strokeDasharray:${anim.route.len},strokeDashoffset:${anim.route.len}},{strokeDashoffset:0,duration:${anim.route.dur.toFixed(3)},ease:"none"},${at(anim.route.at)});`);
-        L.push(`tl.fromTo("#${anim.route.dash}",{strokeDashoffset:${anim.route.len}},{strokeDashoffset:0,duration:${anim.route.dur.toFixed(3)},ease:"none"},${at(anim.route.at)});`);
+        L.push(`${timeline}.fromTo("#${anim.route.glow}",{strokeDasharray:${anim.route.len},strokeDashoffset:${anim.route.len}},{strokeDashoffset:0,duration:${anim.route.dur.toFixed(3)},ease:"none"},${at(anim.route.at)});`);
+        L.push(`${timeline}.fromTo("#${anim.route.dash}",{strokeDashoffset:${anim.route.len}},{strokeDashoffset:0,duration:${anim.route.dur.toFixed(3)},ease:"none"},${at(anim.route.at)});`);
     }
     for (const b of anim.borders) {
-        L.push(`tl.set("#${b.id}",{opacity:1},${at(b.at)});`);
-        L.push(`tl.to("#${b.stroke}",{strokeDashoffset:0,duration:${b.dur},ease:"power2.inOut"},${at(b.at)});`);
+        L.push(`${timeline}.set("#${b.id}",{opacity:1},${at(b.at)});`);
+        L.push(`${timeline}.to("#${b.stroke}",{strokeDashoffset:0,duration:${b.dur},ease:"power2.inOut"},${at(b.at)});`);
     }
     for (const p of anim.pins) {
         // Zoom-adaptive counter-scale: pins+labels follow the central
@@ -365,12 +366,12 @@ function buildMapTimelineJS(anim, offset = 0) {
         L.push(`gsap.set("#${p.grp}",{svgOrigin:"${p.x} ${p.y}",scale:${overlayScaleFor(s0, s0, 'pin').toFixed(4)}});`);
         for (const k of camKfs) {
             if (k.set) continue;
-            L.push(`tl.to("#${p.grp}",{scale:${overlayScaleFor(k.scale, s0, 'pin').toFixed(4)},duration:${k.dur.toFixed(3)},ease:"${k.ease}"},${at(k.at)});`);
+            L.push(`${timeline}.to("#${p.grp}",{scale:${overlayScaleFor(k.scale, s0, 'pin').toFixed(4)},duration:${k.dur.toFixed(3)},ease:"${k.ease}"},${at(k.at)});`);
         }
-        L.push(`tl.set("#${p.grp}",{opacity:1},${at(p.at)});`);
-        L.push(`tl.fromTo("#${p.dot}",{scale:0,transformOrigin:"${p.x}px ${p.y}px"},{scale:1,duration:0.5,ease:"back.out(2.4)"},${at(p.at)});`);
-        L.push(`tl.fromTo("#${p.ring}",{attr:{r:4},opacity:0.8},{attr:{r:55},opacity:0,duration:1.2,ease:"power3.out"},${at(p.at + 0.1)});`);
-        L.push(`tl.fromTo("#${p.lbl}",{opacity:0},{opacity:1,duration:0.4},${at(p.at + 0.15)});`);
+        L.push(`${timeline}.set("#${p.grp}",{opacity:1},${at(p.at)});`);
+        L.push(`${timeline}.fromTo("#${p.dot}",{scale:0,transformOrigin:"${p.x}px ${p.y}px"},{scale:1,duration:0.5,ease:"back.out(2.4)"},${at(p.at)});`);
+        L.push(`${timeline}.fromTo("#${p.ring}",{attr:{r:4},opacity:0.8},{attr:{r:55},opacity:0,duration:1.2,ease:"power3.out"},${at(p.at + 0.1)});`);
+        L.push(`${timeline}.fromTo("#${p.lbl}",{opacity:0},{opacity:1,duration:0.4},${at(p.at + 0.15)});`);
     }
     L.push(`})();`);
     return L.join('\n');

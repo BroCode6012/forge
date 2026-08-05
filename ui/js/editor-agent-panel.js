@@ -8,6 +8,7 @@
     let currentSessionId = '';
     let sessionSyncTimer = null;
     let sessionSyncInFlight = false;
+    let liveCapabilities = [];
 
     const ui = {};
 
@@ -79,6 +80,14 @@
         }
     }
 
+    function clonePlain(value, fallback) {
+        try {
+            return JSON.parse(JSON.stringify(value));
+        } catch (_) {
+            return fallback;
+        }
+    }
+
     function scrollToBottom() {
         if (!ui.messages) return;
         ui.messages.scrollTop = ui.messages.scrollHeight;
@@ -98,6 +107,49 @@
         return message;
     }
 
+    function _suggestionLabel(example, specialist = '') {
+        const clean = String(example || '').replace(/[.!?]+$/g, '').trim();
+        if (clean.length <= 34) return clean;
+        const shortSpecialist = String(specialist || '').replace(/\s+(?:Editor|Agent)$/i, '').trim();
+        return shortSpecialist ? `${shortSpecialist} edit` : `${clean.slice(0, 31)}...`;
+    }
+
+    function _liveSuggestions() {
+        const suggestions = [];
+        const usedCapabilities = new Set();
+        for (const capability of liveCapabilities) {
+            const example = (capability.examples || []).find(Boolean)
+                || (capability.tools || []).flatMap((tool) => tool.examples || []).find(Boolean);
+            if (!example || usedCapabilities.has(capability.id)) continue;
+            usedCapabilities.add(capability.id);
+            suggestions.push([
+                _suggestionLabel(example, capability.specialist),
+                String(example),
+            ]);
+            if (suggestions.length >= 6) break;
+        }
+        return suggestions.length ? suggestions : [
+            ['Faster pace', 'Make this selection faster paced'],
+            ['Replace media', 'Find a better alternative for this media'],
+            ['Add animated text', 'Add an animated text treatment'],
+            ['Cold threatening look', 'Make this cold and threatening'],
+            ['Remove vignette only', 'Remove the vignette but keep the grade'],
+            ['Clear effects, keep grade', 'Clear all effects but keep the grade'],
+        ];
+    }
+
+    async function syncCapabilities() {
+        if (!window.electronAPI?.agentCapabilities) return;
+        try {
+            const result = await window.electronAPI.agentCapabilities();
+            if (!result?.success || !Array.isArray(result.capabilities)) return;
+            liveCapabilities = result.capabilities;
+            if (ui.messages?.querySelector('.agent-welcome')) renderWelcome();
+        } catch (_) {
+            // Capability discovery must never block the editing UI.
+        }
+    }
+
     function renderWelcome(titleText = 'Edit by asking', bodyText = '') {
         ui.messages.replaceChildren();
         const welcome = document.createElement('div');
@@ -108,18 +160,18 @@
         const title = document.createElement('h3');
         title.textContent = titleText;
         const body = document.createElement('p');
-        body.textContent = bodyText
-            || 'Select clips or set In/Out points, then describe the result you want. Agent inspects live specialists, plans first, verifies every attempt, and recovers safely when possible.';
+        const liveToolCount = liveCapabilities.reduce(
+            (sum, capability) => sum + (capability.tools?.length || 0),
+            0
+        );
+        body.textContent = bodyText || (
+            liveCapabilities.length
+                ? `${liveCapabilities.length} live specialists and ${liveToolCount} verified editing tools are available. Select a scope, then describe the result you want.`
+                : 'Select clips or set In/Out points, then describe the result you want. Agent inspects live specialists, plans first, verifies every attempt, and recovers safely when possible.'
+        );
         const suggestions = document.createElement('div');
         suggestions.className = 'agent-suggestions';
-        for (const [label, prompt] of [
-            ['Faster pace', 'Make this selection faster paced'],
-            ['Replace media', 'Find a better alternative for this media'],
-            ['Add animated text', 'Add an animated text treatment'],
-            ['Cold threatening look', 'Make this cold and threatening'],
-            ['Remove vignette only', 'Remove the vignette but keep the grade'],
-            ['Clear effects, keep grade', 'Clear all effects but keep the grade'],
-        ]) {
+        for (const [label, prompt] of _liveSuggestions()) {
             const button = document.createElement('button');
             button.type = 'button';
             button.textContent = label;
@@ -620,10 +672,11 @@
 
         refreshScope();
         currentScope = window.EditorAgentHost?.getScopeSnapshot?.() || currentScope;
-        const version = window.EditorAgentHost?.getProjectVersion?.() || {};
+        const scopeAtSubmit = clonePlain(currentScope, currentScope);
         ui.input.value = '';
         appendMessage('user', text);
         conversation.push({ role: 'user', text });
+        const historyAtSubmit = clonePlain(conversation, [...conversation]);
         setBusy(true, ui.effort?.value === 'smart' ? 'Thinking deeply' : 'Planning edit');
         const effort = ui.effort?.value || 'fast';
         setProgress(5, effort === 'smart' ? 'Capturing the exact playhead frame...' : 'Matching editing rules...');
@@ -633,15 +686,35 @@
                 ? await window.EditorAgentHost?.getVisualContext?.()
                 : null;
             setProgress(8, effort === 'smart' ? 'Understanding the request and visible frame...' : 'Matching editing rules...');
-            const result = await window.electronAPI.agentPlan({
+            const requestPayload = {
                 text,
                 effort,
-                scope: currentScope,
-                history: conversation,
-                projectRevision: version.revision,
-                planHash: version.planHash,
+                scope: scopeAtSubmit,
+                history: historyAtSubmit,
                 visualContext,
-            });
+            };
+            const retryApi = window.EditorAgentRequestRetry;
+            const result = retryApi?.planWithConflictRetry
+                ? await retryApi.planWithConflictRetry({
+                    invoke: (payload) => window.electronAPI.agentPlan(payload),
+                    payload: requestPayload,
+                    // Read the version after visual capture. Preview QA/autosave
+                    // may legitimately commit while the screenshot is being made.
+                    getVersion: () => window.EditorAgentHost?.getProjectVersion?.() || {},
+                    maxAttempts: 3,
+                    onConflict: async () => {
+                        setProgress(9, 'Project updated — revalidating the same selected clip...');
+                        await new Promise((resolve) => setTimeout(resolve, 40));
+                    },
+                })
+                : await (async () => {
+                    const version = window.EditorAgentHost?.getProjectVersion?.() || {};
+                    return window.electronAPI.agentPlan({
+                        ...requestPayload,
+                        projectRevision: version.revision,
+                        planHash: version.planHash,
+                    });
+                })();
             if (!result?.success) {
                 throw new Error(result?.error || 'Agent request failed');
             }
@@ -786,6 +859,7 @@
 
         refreshScope();
         refreshHistoryButtons();
+        syncCapabilities();
         syncSession();
     }
 

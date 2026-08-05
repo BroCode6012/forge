@@ -201,7 +201,7 @@ function directivesFloor(rawInstructions = '') {
 
     // framing
     let force = null;
-    if (_boolish(/\b(?:use|prefer|mostly|keep(?:\s+everything)?|make(?:\s+this|\s+the|\s+everything)?)\s+fullscreen\b|\bmake\s+(?:this|the)\s+(?:selection|part|section)\s+fullscreen\b|\beverything\s+fullscreen\b|\ball\s+fullscreen\b/, lower)) force = 'fullscreen';
+    if (_boolish(/\b(?:use|prefer|mostly|keep(?:\s+everything)?|make(?:\s+this|\s+the|\s+everything)?)\s+fullscreen\b|\bmake\s+(?:this|that|the)\s+(?:selection|part|section|scene|clip|shot|image|video)\s+fullscreen\b|\beverything\s+fullscreen\b|\ball\s+fullscreen\b/, lower)) force = 'fullscreen';
     else if (_boolish(/\b(?:use|prefer|more|make(?:\s+this|\s+the|\s+everything)?)\s+floating\b|\bmake\s+(?:this|the)\s+(?:selection|part|section)\s+floating\b/, lower)) force = 'floating';
     else if (_boolish(/\b(?:use|prefer|more|make(?:\s+this|\s+the|\s+everything)?)\s+cinematic\b|\bmake\s+(?:this|the)\s+(?:selection|part|section)\s+cinematic\b/, lower)) force = 'cinematic';
     if (force) d.framing = { force };

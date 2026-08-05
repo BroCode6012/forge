@@ -11,78 +11,72 @@ const {
 } = require('../workers/motion-qa-agent');
 const { authorPlanCompositions } = require('../workers/composition-author');
 const registry = require('./capabilities/registry');
-const { scopeRange, windowOf } = require('./scope-utils');
+const {
+    overlaps,
+    scopeRange,
+    visualMatchesRefs,
+    windowOf,
+} = require('./scope-utils');
 
-const VISUAL_CAPABILITIES = new Set([
-    'captions',
-    'effects',
-    'framing',
-    'graphics',
-    'icons',
-    'media',
-    'pacing',
-    'timeline',
-    'transitions',
-]);
-const SAFE_REPAIR_ACTIONS = Object.freeze({
-    captions: new Set([
-        'edit-captions',
-        'set-caption-style',
-        'set-caption-position',
-        'set-caption-size',
-        'set-caption-background',
-        'set-karaoke',
-        'set-caption-density',
-    ]),
-    effects: new Set([
-        'remove-effects',
-        'set-effect-properties',
-        'tune-effects',
-        'set-grade',
-        'remove-grade',
-        'clear-effects',
-        'reset-look',
-        'edit-look',
-    ]),
-    framing: new Set([
-        'set-framing',
-        'reframe',
-        'adjust-framing',
-        'set-transform',
-        'set-fit',
-        'set-crop',
-    ]),
-    graphics: new Set([
-        'edit-properties',
-        'set-position',
-        'set-animation',
-        'set-background',
-        'set-graphic-style',
-        'set-duration',
-    ]),
-    icons: new Set([
-        'edit-icon-properties',
-        'set-icon-properties',
-        'set-icon-color',
-        'set-icon-position',
-        'set-icon-size',
-        'remove-icons',
-    ]),
-    timeline: new Set(['set-ken-burns']),
-    transitions: new Set([
-        'edit-transition',
-        'set-transition',
-        'set-transition-duration',
-        'hard-cuts',
-        'remove-transitions',
-    ]),
-});
 const RISK_WEIGHT = Object.freeze({
     low: 0,
     moderate: 1,
     expensive: 2,
     structural: 3,
 });
+
+function _toolSpec(capabilityId, action) {
+    return registry.getCapability(capabilityId)?.manifest?.tools?.find((tool) => (
+        tool.action === action
+    )) || null;
+}
+
+function _hasVisualImpact(operation) {
+    return _toolSpec(
+        String(operation?.capabilityId || ''),
+        String(operation?.action || '')
+    )?.visualImpact === true;
+}
+
+function _isSafeRepairAction(capabilityId, action) {
+    const tool = _toolSpec(capabilityId, action);
+    return tool?.visualRepair === true && tool.action === tool.canonicalAction;
+}
+
+function _visualRepairTool(tool) {
+    if (!tool || !Array.isArray(tool.visualRepairFields) || !tool.visualRepairFields.length) {
+        return tool;
+    }
+    const allowed = new Set(tool.visualRepairFields);
+    const args = _clone(tool.args);
+    args.properties = Object.fromEntries(
+        Object.entries(args.properties || {})
+            .filter(([key]) => allowed.has(key))
+    );
+    args.required = (args.required || []).filter((key) => allowed.has(key));
+    args.anyOfRequired = (args.anyOfRequired || [])
+        .map((group) => group.filter((key) => allowed.has(key)))
+        .filter((group) => group.length);
+    return {
+        ...tool,
+        args,
+    };
+}
+
+function _boundedRepairInvocation(invocation, capabilityId, action) {
+    const tool = _toolSpec(capabilityId, action);
+    if (!tool || !Array.isArray(tool.visualRepairFields) || !tool.visualRepairFields.length) {
+        return invocation;
+    }
+    const allowed = new Set(tool.visualRepairFields);
+    return {
+        ...invocation,
+        args: Object.fromEntries(
+            Object.entries(invocation?.args || {})
+                .filter(([key]) => allowed.has(key))
+        ),
+    };
+}
 
 function _clone(value) {
     return value == null ? value : JSON.parse(JSON.stringify(value));
@@ -115,17 +109,17 @@ function _removeContained(parent, child) {
     } catch (_) { }
 }
 
-function _operationCapabilities(operations) {
-    return new Set((operations || []).map((operation) => String(operation?.capabilityId || '')));
-}
-
 function shouldRunVisualQa({ effort, operations, options = {} }) {
     if (options.visualQa === false) return false;
     if (/^(0|false|off|no)$/i.test(String(process.env.AGENT_VISUAL_QA || '').trim())) return false;
     const forced = /^(1|true|on|yes|always)$/i.test(String(process.env.AGENT_VISUAL_QA || '').trim());
-    if (!forced && effort !== 'smart') return false;
-    const capabilities = _operationCapabilities(operations);
-    return [...capabilities].some((id) => VISUAL_CAPABILITIES.has(id));
+    const exactVisualRegeneration = (operations || []).some((operation) => (
+        operation?.capabilityId === 'graphics'
+        && operation?.action === 'regenerate'
+        && operation?.scope?.kind === 'visual'
+    ));
+    if (!forced && effort !== 'smart' && !exactVisualRegeneration) return false;
+    return (operations || []).some(_hasVisualImpact);
 }
 
 function _identity(item, index, prefix) {
@@ -239,6 +233,9 @@ function _changedWindows(beforePlan, afterPlan) {
                 windows.push({
                     id: String(scene.clipId || `scene-${index}`),
                     phase: 'edited-clip',
+                    collection: 'scenes',
+                    index,
+                    item: scene,
                     ...windowOf(scene),
                 });
             }
@@ -258,6 +255,9 @@ function _changedWindows(beforePlan, afterPlan) {
                 windows.push({
                     id: String(item.id || `${collection}-${index}`),
                     phase: 'edited-graphic',
+                    collection,
+                    index,
+                    item,
                     ...windowOf(item, collection === 'templateScenes' ? 4 : 3),
                 });
             }
@@ -305,7 +305,24 @@ function representativeProofTimes(beforePlan, afterPlan, scope, operations, limi
             });
         }
     }
+    const scopedRange = scope?.kind === 'project' ? null : scopeRange(scope, afterPlan);
     for (const item of _changedWindows(beforePlan, afterPlan)) {
+        if (scope?.kind === 'visual') {
+            if (
+                item.phase !== 'edited-graphic'
+                || !visualMatchesRefs(
+                    item.item,
+                    scope.visualRefs,
+                    item.collection,
+                    item.index
+                )
+            ) continue;
+        } else if (
+            scopedRange
+            && !overlaps(item.item, scopedRange.fromSec, scopedRange.toSec)
+        ) {
+            continue;
+        }
         addWindow(item.id, item.phase, item.startTime, item.endTime, item.phase === 'edited-graphic' ? 6 : 4);
     }
     if ((operations || []).some((operation) => operation.capabilityId === 'transitions')) {
@@ -443,17 +460,19 @@ function _localFrameReview(files) {
 
 function _publicManifests(scope) {
     return registry.listManifests()
-        .filter((manifest) => SAFE_REPAIR_ACTIONS[manifest.id])
         .filter((manifest) => manifest.scopes.includes(scope?.kind))
         .map((manifest) => ({
             id: manifest.id,
             specialist: manifest.specialist,
             description: manifest.description,
-            actions: manifest.actions.filter((action) => SAFE_REPAIR_ACTIONS[manifest.id].has(action)),
+            tools: (manifest.tools || []).filter((tool) => (
+                tool.visualRepair === true
+                && tool.action === tool.canonicalAction
+            )).map(_visualRepairTool),
             scopes: manifest.scopes,
             vocabulary: manifest.vocabulary || {},
         }))
-        .filter((manifest) => manifest.actions.length);
+        .filter((manifest) => manifest.tools.length);
 }
 
 async function _reviewWithVision({
@@ -527,14 +546,14 @@ declared property/intensity repair that preserves everything else.
 
 Then judge clear production defects visible in the supplied proof frames:
 - blank, missing, broken, or incorrectly framed media
-- clipped or unreadable text
+- clipped, unreadable, or low-contrast text against the actual footage
 - accidental graphic collisions or unsafe placement
 - extreme visual effects that destroy legibility
 - broken transition frames
 - motion/zoom that exposes black borders or visibly harms composition
 
 Do not redesign good work. Preserve copy, facts, story, media choice, colors, theme, audio, and pacing unless the user's request explicitly changed them.
-If a safe repair is needed, return at most 2 invocations using only the declared live capability ids and actions. Never replace media, rewrite text, restructure pacing, disable captions, hide clips, or broaden the scope.
+If a safe repair is needed, return at most 2 invocations using only the declared live capability ids, tool actions, and argument schemas. Never replace media, rewrite text, restructure pacing, disable captions, hide clips, or broaden the scope.
 Use "block" only for a clear severe defect that cannot be safely repaired with the declared capabilities.
 
 Return strict JSON:
@@ -552,7 +571,7 @@ Return strict JSON:
   "invocations": [
     {
       "capabilityId": "declared id",
-      "action": "declared action",
+      "action": "declared tool action",
       "args": {},
       "description": "safe repair"
     }
@@ -605,11 +624,16 @@ function _normalizeRepairOperations(invocations, context) {
     for (const [index, invocation] of (invocations || []).entries()) {
         const capabilityId = String(invocation?.capabilityId || invocation?.capability || '');
         const action = String(invocation?.action || '');
-        if (!SAFE_REPAIR_ACTIONS[capabilityId]?.has(action)) {
+        if (!_isSafeRepairAction(capabilityId, action)) {
             rejected.push(`${capabilityId || 'unknown'}:${action || 'unknown'} is not an allowed visual repair`);
             continue;
         }
-        const normalized = registry.tryNormalizeInvocation(invocation, {
+        const boundedInvocation = _boundedRepairInvocation(
+            invocation,
+            capabilityId,
+            action
+        );
+        const normalized = registry.tryNormalizeInvocation(boundedInvocation, {
             request: context.request,
             plan: context.plan,
             existingOperations: context.existingOperations,
@@ -626,7 +650,7 @@ function _normalizeRepairOperations(invocations, context) {
                 operationId: `visual-repair-${context.pass}-${index + 1}`,
                 scope: _clone(context.request.scope),
                 description: _compactText(
-                    invocation.description || normalized.operation.description,
+                    boundedInvocation.description || normalized.operation.description,
                     500
                 ),
             }, {
@@ -839,7 +863,9 @@ async function runVisualObserver({
             : normalized.operations.length
                 ? 'repair'
                 : review.verdict === 'repair'
-                    ? 'warn'
+                    ? ((review.findings || []).length
+                        ? 'warn'
+                        : 'pass')
                     : 'pass';
         return {
             status: verdict,

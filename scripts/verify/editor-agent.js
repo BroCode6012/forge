@@ -11,6 +11,11 @@ const history = require('../../src/agents/editor-supervisor/history-store');
 const transactionAssets = require('../../src/agents/editor-supervisor/transaction-assets');
 const { normalizeAgentRequest } = require('../../src/agents/editor-supervisor/schemas');
 const capabilityRegistry = require('../../src/agents/editor-supervisor/capabilities/registry');
+const {
+    object: contractObject,
+    string: contractString,
+    tool: contractTool,
+} = require('../../src/agents/editor-supervisor/capabilities/capability-contract');
 const { coerceSmartPlan } = require('../../src/agents/editor-supervisor/capabilities/smart-router');
 const { planStagedOperations } = require('../../src/agents/editor-supervisor/operation-planner');
 const { summarizePlanDiff } = require('../../src/agents/editor-supervisor/plan-diff');
@@ -26,6 +31,13 @@ const {
     recipeFromScene,
     mergeBaseLook,
 } = require('../../src/render/hf-effects');
+const { MG_REGISTRY } = require('../../src/render/mg-registry');
+const { STYLE_NAMES } = require('../../src/agents/ai-motion-graphics');
+const { TEMPLATE_TYPES } = require('../../src/agents/ai-templates');
+const {
+    regenerateScopedGraphics,
+} = require('../../src/agents/editor-supervisor/workers/graphics-editor');
+const { DEFAULT_DURATIONS } = require('../../src/agents/editor-supervisor/workers/transition-editor');
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -473,6 +485,49 @@ async function run() {
         assert.strictEqual(staged.operations[0].capabilityId, 'graphics');
         assert.strictEqual(staged.operations[0].args.targetIds[0], 'headline-1');
         assert.strictEqual(staged.operations[0].args.accentRuleVisible, false);
+
+        const iconRequest = normalizeAgentRequest({
+            text: 'remove that icon in the top right',
+            originalText: 'remove that icon in the top right',
+            effort: 'smart',
+            scope: {
+                ...wholeSceneScope(1),
+                currentTime: 6.5,
+                totalDuration: 15,
+            },
+            visualContext: {
+                captured: true,
+                imageBase64: 'AA==',
+                mimeType: 'image/jpeg',
+                currentTime: 6.5,
+                renderer: 'hyperframes',
+                width: 960,
+                height: 540,
+            },
+        });
+        const iconGrounding = await groundVisualRequest(iconRequest, plan, {
+            callVisionAI: async () => JSON.stringify({
+                summary: 'The user means the explainer icon in the top-right corner.',
+                confidence: 0.97,
+                target: {
+                    id: 'clip-b:icon:0',
+                    kind: 'icon',
+                    type: 'svg',
+                    semanticPart: 'icon',
+                    visibleDescription: 'orange circular icon in the top-right corner',
+                },
+                invocation: {
+                    capabilityId: 'icons',
+                    action: 'remove-icons',
+                    args: {},
+                    description: 'remove only the visible scene icon',
+                },
+            }),
+        });
+        assert.strictEqual(iconGrounding.status, 'grounded');
+        assert.strictEqual(iconGrounding.invocation.capabilityId, 'icons');
+        assert.strictEqual(iconGrounding.invocation.action, 'remove-icons');
+        assert.deepStrictEqual(iconGrounding.invocation.args.targetIds, ['clip-b:icon:0']);
     }
 
     console.log('[Agent Matrix] dynamic capability registry');
@@ -486,6 +541,15 @@ async function run() {
             Object.keys(capabilityRegistry.inspectCapabilities(fixturePlan(), clipScope())).sort(),
             ['audio', 'captions', 'effects', 'framing', 'graphics', 'icons', 'media', 'pacing', 'timeline', 'transitions'],
             'every live specialist must expose inspectable state to the supervisor'
+        );
+        assert.ok(
+            manifests.every((manifest) => (
+                manifest.contractVersion === 2
+                && /^[a-f0-9]{64}$/.test(manifest.contractHash)
+                && manifest.tools.length === manifest.actions.length
+                && manifest.tools.every((toolSpec) => toolSpec.args?.type === 'object')
+            )),
+            'every live specialist must publish a versioned machine-readable tool contract'
         );
         const effects = manifests.find((manifest) => manifest.id === 'effects');
         assert.deepStrictEqual(effects.vocabulary.effects, EFFECT_IDS);
@@ -504,6 +568,25 @@ async function run() {
         assert.ok(graphics.actions.includes('set-duration'));
         assert.ok(graphics.vocabulary.properties.includes('durationSeconds'));
         assert.ok(graphics.vocabulary.properties.includes('durationScale'));
+        assert.ok(
+            MG_REGISTRY.headline.animations.includes('wordCascade')
+                && graphics.vocabulary.animations.includes('wordCascade'),
+            'new renderer animations must appear in the Agent vocabulary without router edits'
+        );
+        assert.ok(
+            Object.keys(MG_REGISTRY).every((type) => graphics.vocabulary.types.includes(type)),
+            'graphics capability vocabulary must be derived from the live MG registry'
+        );
+        assert.ok(
+            [...TEMPLATE_TYPES].every((type) => graphics.vocabulary.types.includes(type)),
+            'graphics capability vocabulary must include every live template type'
+        );
+        const transitions = manifests.find((manifest) => manifest.id === 'transitions');
+        assert.deepStrictEqual(
+            [...transitions.vocabulary.types].sort(),
+            Object.keys(DEFAULT_DURATIONS).sort(),
+            'transition vocabulary must be derived from the worker implementation'
+        );
         assert.strictEqual(
             capabilityRegistry.inspectCapabilities(fixturePlan(), wholeSceneScope()).icons.targetCount,
             1
@@ -525,6 +608,114 @@ async function run() {
         assert.strictEqual(routed.operations.length, 1);
         assert.strictEqual(routed.operations[0].capabilityId, 'effects');
         assert.strictEqual(routed.operations[0].args.add[0].id, 'fogDrift');
+
+        const dynamicCapability = {
+            tools: () => [
+                contractTool(
+                    'set-runtime-marker',
+                    'Set a test marker through a runtime-discovered capability.',
+                    contractObject({
+                        value: contractString({ minLength: 1, maxLength: 40 }),
+                    }, { required: ['value'] })
+                ),
+            ],
+            manifest: () => ({
+                contractVersion: 2,
+                id: 'runtime-contract-test',
+                specialist: 'Runtime Contract Test',
+                domain: 'test',
+                description: 'Proves capabilities are registered without router changes.',
+                scopes: ['clips'],
+                risk: 'low',
+                directiveKeys: [],
+            }),
+            normalizeInvocation: (invocation, context) => ({
+                capabilityId: 'runtime-contract-test',
+                specialist: 'Runtime Contract Test',
+                action: 'set-runtime-marker',
+                args: { value: invocation.args.value },
+                scope: context.request.scope,
+                risk: 'low',
+                description: 'set runtime marker',
+            }),
+            execute: ({ plan, operation }) => {
+                plan._runtimeContractMarker = operation.args.value;
+                return { changed: 1, stats: { runtimeContractChanged: 1 } };
+            },
+            inspect: (plan) => ({
+                targetCount: plan?._runtimeContractMarker ? 1 : 0,
+                value: plan?._runtimeContractMarker || '',
+            }),
+        };
+        capabilityRegistry.registerCapability(dynamicCapability, { source: 'editor-agent contract test' });
+        try {
+            const dynamicManifest = capabilityRegistry.getCapability('runtime-contract-test').manifest;
+            assert.deepStrictEqual(dynamicManifest.actions, ['set-runtime-marker']);
+            const dynamicRoute = coerceSmartPlan({
+                summary: 'Set the runtime marker',
+                invocations: [{
+                    capabilityId: 'runtime-contract-test',
+                    action: 'set-runtime-marker',
+                    args: { value: 'discovered' },
+                }],
+            }, {
+                request: { text: 'Set the runtime marker', scope: clipScope(), effort: 'smart' },
+                plan: fixturePlan(),
+                existingOperations: [],
+                log: () => { },
+            });
+            assert.strictEqual(dynamicRoute.operations.length, 1);
+            const dynamicPlan = fixturePlan();
+            const dynamicResult = await capabilityRegistry.executeCapabilityOperation(
+                dynamicPlan,
+                dynamicRoute.operations[0]
+            );
+            assert.strictEqual(dynamicResult.changed, 1);
+            assert.strictEqual(dynamicPlan._runtimeContractMarker, 'discovered');
+            const rejected = coerceSmartPlan({
+                summary: 'Invent an unsupported field',
+                invocations: [{
+                    capabilityId: 'runtime-contract-test',
+                    action: 'set-runtime-marker',
+                    args: { value: 'safe', inventedField: true },
+                }],
+            }, {
+                request: { text: 'Set the runtime marker', scope: clipScope(), effort: 'smart' },
+                plan: fixturePlan(),
+                existingOperations: [],
+                log: () => { },
+            });
+            assert.strictEqual(
+                rejected.operations.length,
+                0,
+                'the shared contract must reject arguments the worker does not advertise'
+            );
+        } finally {
+            capabilityRegistry.unregisterCapability('runtime-contract-test');
+        }
+
+        const wordCascadePlan = fixturePlan();
+        const wordCascadeResult = await execute(
+            'Give the headline a word cascade animation',
+            wordCascadePlan,
+            wholeSceneScope(1)
+        );
+        assert.deepStrictEqual(
+            wordCascadeResult.proposal.operations.map((operation) => [
+                operation.capabilityId,
+                operation.action,
+            ]),
+            [['graphics', 'edit-properties']],
+            'a newly registered animation name must route through the generic graphics capability'
+        );
+        const wordCascadeHeadline = wordCascadeResult.result.plan.motionGraphics.find(
+            (graphic) => graphic.id === 'headline-1'
+        );
+        assert.strictEqual(wordCascadeHeadline.animation, 'wordCascade');
+        assert.strictEqual(
+            wordCascadeHeadline.agenticComposition.motion.entrance,
+            'wordCascade'
+        );
 
         const graphicRoute = coerceSmartPlan({
             summary: 'Keep the lower third design and shorten its copy',
@@ -624,6 +815,41 @@ async function run() {
             blockedStyleRegeneration.operations.length,
             0,
             'style ownership must block destructive graphic regeneration'
+        );
+        const invalidStatVariant = coerceSmartPlan({
+            summary: 'Use a punch stat-card layout',
+            invocations: [{
+                capabilityId: 'graphics',
+                action: 'edit-properties',
+                args: {
+                    targetType: 'statCard',
+                    targetIds: ['stat-template-1'],
+                    variant: 'punch',
+                },
+            }],
+        }, {
+            request: {
+                text: 'Use a punch layout for this stat card',
+                scope: {
+                    kind: 'visual',
+                    label: 'Selected stat card',
+                    visualRefs: [{
+                        id: 'stat-template-1',
+                        type: 'statCard',
+                        startTime: 7,
+                        endTime: 9,
+                    }],
+                },
+                effort: 'smart',
+            },
+            plan: fixturePlan(),
+            existingOperations: [],
+            log: () => { },
+        });
+        assert.strictEqual(
+            invalidStatVariant.operations.length,
+            0,
+            'a variant registered for another graphic type must not be applied to a stat card'
         );
 
         const pendingRequest = {
@@ -900,6 +1126,394 @@ async function run() {
     console.log('[Agent Matrix] adversarial surgical actions');
     {
         const plan = fixturePlan();
+        const statCard = plan.templateScenes.find((graphic) => graphic.id === 'stat-template-1');
+        Object.assign(statCard, {
+            clipId: 'stat-template-1',
+            text: '$300 System',
+            subtext: '',
+            startTime: 7,
+            endTime: 9,
+            duration: 2,
+            style: 'editorial-light',
+            variant: 'sideBySide',
+            animation: 'countUp',
+            items: [{ kind: 'stat', icon: 'money', value: '$300', label: 'Complete System' }],
+            _authoredComposition: {
+                html: '<div>$300 System</div>',
+                css: 'div{color:#2c2218}',
+                timeline: 'tl.to("div",{opacity:1})',
+            },
+            _authoredNs: 'auth-stat-template-1',
+            mgData: {
+                type: 'statCard',
+                text: '$300 System',
+                subText: '',
+                startTime: 7,
+                endTime: 9,
+                duration: 2,
+                style: 'editorial-light',
+                variant: 'sideBySide',
+                animation: 'countUp',
+                items: [{ kind: 'stat', icon: 'money', value: '$300', label: 'Complete System' }],
+                _authoredComposition: {
+                    html: '<div>$300 System</div>',
+                    css: 'div{color:#2c2218}',
+                    timeline: 'tl.to("div",{opacity:1})',
+                },
+            },
+        });
+        const scope = {
+            kind: 'visual',
+            scopeMode: 'selection',
+            label: '1 selected graphic',
+            currentTime: 8,
+            fromSec: 7,
+            toSec: 9,
+            totalDuration: 15,
+            contiguous: true,
+            clipRefs: [],
+            iconRefs: [],
+            visualRefs: [{
+                id: 'stat-template-1',
+                type: 'statCard',
+                collection: 'templateScenes',
+                collectionIndex: 0,
+                startTime: 7,
+                endTime: 9,
+                label: '$300 System',
+            }],
+        };
+        const before = clone(statCard);
+        const { proposal, result } = await execute(
+            'give this graphic another style',
+            plan,
+            scope
+        );
+        assert.deepStrictEqual(
+            proposal.operations.map((operation) => [operation.capabilityId, operation.action]),
+            [['graphics', 'edit-properties']],
+            'a generic restyle request must resolve to one in-place graphics edit'
+        );
+        assert.match(proposal.summary, /restyle.+in place.+preserving/i);
+        assert.strictEqual(proposal.estimatedWork.operationCount, 1);
+        const after = result.plan.templateScenes.find(
+            (graphic) => graphic.id === 'stat-template-1'
+        );
+        assert.ok(after, 'the selected stat card must keep its original identity');
+        assert.strictEqual(result.diff.graphicsAdded, 0);
+        assert.strictEqual(result.diff.graphicsRemoved, 0);
+        assert.strictEqual(result.diff.graphicsUpdated, 1);
+        assert.strictEqual(result.diff.scopeLeakCount, 0);
+        assert.strictEqual(after.id, before.id);
+        assert.strictEqual(after.clipId, before.clipId);
+        assert.strictEqual(after.text, before.text);
+        assert.strictEqual(after.subtext, before.subtext);
+        assert.deepStrictEqual(after.items, before.items);
+        assert.strictEqual(after.startTime, before.startTime);
+        assert.strictEqual(after.endTime, before.endTime);
+        assert.strictEqual(after.duration, before.duration);
+        assert.ok(STYLE_NAMES.includes(after.style));
+        assert.notStrictEqual(after.style, before.style);
+        assert.strictEqual(after.variant, 'single');
+        assert.strictEqual(after.subType, 'single');
+        assert.strictEqual(after.styleManual, true);
+        assert.strictEqual(after.variantManual, true);
+        assert.strictEqual(after.authoredCompositionMode, 'fixed-renderer');
+        assert.strictEqual(after._authoredComposition, undefined);
+        assert.strictEqual(after.mgData._authoredComposition, undefined);
+    }
+    {
+        const plan = fixturePlan();
+        const statCard = plan.templateScenes.find((graphic) => graphic.id === 'stat-template-1');
+        Object.assign(statCard, {
+            clipId: 'stat-template-1',
+            text: '$300 System',
+            startTime: 7,
+            endTime: 9,
+            duration: 2,
+            style: 'editorial-light',
+            variant: 'sideBySide',
+            items: [{ value: '$300', label: 'Complete System' }],
+        });
+        const scope = {
+            kind: 'visual',
+            scopeMode: 'selection',
+            label: '1 selected graphic',
+            currentTime: 8,
+            fromSec: 7,
+            toSec: 9,
+            totalDuration: 15,
+            contiguous: true,
+            clipRefs: [],
+            iconRefs: [],
+            visualRefs: [{
+                id: 'stat-template-1',
+                type: 'statCard',
+                collection: 'templateScenes',
+                collectionIndex: 0,
+                startTime: 7,
+                endTime: 9,
+                label: '$300 System',
+            }],
+        };
+        const request = normalizeAgentRequest({
+            text: 'give this graphic another style',
+            originalText: 'give this graphic another style',
+            effort: 'smart',
+            scope,
+        });
+        const staged = await planStagedOperations({
+            graphics: {
+                action: 'regenerate',
+                requestedType: 'statCard',
+            },
+            summary: 'Regenerate the selected stat card.',
+        }, request, plan, {
+            visualGrounding: {
+                status: 'grounded',
+                summary: 'The selected stat card is visible.',
+                invocation: {
+                    capabilityId: 'graphics',
+                    action: 'regenerate',
+                    args: {
+                        action: 'regenerate',
+                        requestedType: 'statCard',
+                        instruction: 'use another style',
+                        fewer: false,
+                        effort: 'smart',
+                    },
+                    description: 'regenerate the selected stat card',
+                },
+            },
+            routeSmartRequest: async () => ({
+                summary: 'Regenerate the selected stat card.',
+                operations: [{
+                    capabilityId: 'graphics',
+                    specialist: 'Motion Graphics Editor',
+                    action: 'regenerate',
+                    args: {
+                        action: 'regenerate',
+                        requestedType: 'statCard',
+                        instruction: 'use another style',
+                        fewer: false,
+                        effort: 'smart',
+                    },
+                    scope: request.scope,
+                    risk: 'moderate',
+                    description: 'author motion graphics for the selected scope',
+                }],
+                supported: ['Motion Graphics Editor: author motion graphics for the selected scope'],
+                unsupported: [],
+                claimedDirectiveKeys: ['graphics'],
+            }),
+            log: () => { },
+        });
+        assert.deepStrictEqual(
+            staged.operations.map((operation) => [operation.capabilityId, operation.action]),
+            [['graphics', 'edit-properties']],
+            'visual grounding and smart routing must not duplicate an exclusively owned graphics edit'
+        );
+        assert.match(staged.summary, /restyle.+in place.+preserving/i);
+    }
+    {
+        const plan = fixturePlan();
+        const before = clone(plan);
+        const scope = {
+            kind: 'visual',
+            scopeMode: 'selection',
+            label: 'Selected headline',
+            currentTime: 7,
+            fromSec: 6,
+            toSec: 8,
+            totalDuration: 15,
+            contiguous: true,
+            clipRefs: [],
+            iconRefs: [],
+            visualRefs: [{
+                id: 'headline-1',
+                type: 'headline',
+                collection: 'motionGraphics',
+                startTime: 6,
+                endTime: 8,
+                label: 'Cooling system headline',
+            }],
+        };
+        const operation = {
+            action: 'regenerate',
+            requestedType: 'headline',
+            instruction: 'regenerate the selected headline',
+            effort: 'fast',
+        };
+        regenerateScopedGraphics(plan, scope, operation);
+        regenerateScopedGraphics(plan, scope, operation);
+        const replacement = plan.motionGraphics.find((graphic) => (
+            graphic._agentReplacesVisualId === 'headline-1'
+        ));
+        assert.ok(replacement, 'repeated regeneration must preserve the original selected identity');
+        assert.ok(replacement._agentReplacesVisualIds.includes('headline-1'));
+        assert.strictEqual(
+            summarizePlanDiff(before, plan, scope).scopeLeakCount,
+            0,
+            'replacement lineage must keep repeated regeneration inside the exact selected scope'
+        );
+    }
+    {
+        const plan = fixturePlan();
+        plan.scenes = [
+            {
+                index: 0,
+                sourceSceneIndex: 0,
+                clipId: 'clip-opening',
+                trackId: 'video-track-1',
+                startTime: 0,
+                endTime: 4.88,
+                text: 'Opening scene',
+            },
+            {
+                index: 1,
+                sourceSceneIndex: 1,
+                clipId: 'clip-before-card',
+                trackId: 'video-track-1',
+                startTime: 4.88,
+                endTime: 13.72,
+                text: 'No wires, no compressor, no thermostat.',
+            },
+            {
+                index: 2,
+                sourceSceneIndex: 3,
+                clipId: 'clip-after-card',
+                trackId: 'video-track-1',
+                startTime: 23.18,
+                endTime: 26.3,
+                text: 'The Amish have been building it for 200 years.',
+            },
+        ];
+        plan.totalDuration = 26.3;
+        plan.mgScenes = [];
+        plan.motionGraphics = [];
+        plan.templateScenes = [{
+            isMGScene: true,
+            disabled: false,
+            trackId: 'video-track-3',
+            mediaType: 'template',
+            clipId: 'template-tpl-0-13720',
+            startTime: 13.72,
+            endTime: 23.18,
+            duration: 9.46,
+            durationFrames: 284,
+            durationUnit: 'seconds',
+            text: '$300 System',
+            subtext: '',
+            type: 'statCard',
+            position: 'center',
+            style: 'editorial-light',
+            sceneIndex: 2,
+            sourceSceneIndex: 2,
+            originalSceneIndex: 2,
+            templateType: true,
+            variant: 'sideBySide',
+            animation: 'countUp',
+            themeId: 'warm-editorial',
+            items: [{ kind: 'stat', icon: 'money', value: '$300', label: 'Complete System' }],
+            templateMediaFile: 'template-bg-000-statcard.png',
+            mgData: {
+                id: 'tpl-0',
+                type: 'statCard',
+                templateType: true,
+                mediaType: 'template',
+                trackId: 'video-track-3',
+                category: 'fullscreen',
+                text: '$300 System',
+                subText: '',
+                startTime: 13.72,
+                endTime: 23.18,
+                duration: 9.46,
+                style: 'editorial-light',
+                variant: 'sideBySide',
+                animation: 'countUp',
+                themeId: 'warm-editorial',
+                items: [{ kind: 'stat', icon: 'money', value: '$300', label: 'Complete System' }],
+                _authoredComposition: {
+                    html: '<div>$300 System</div>',
+                    css: 'div{color:#2c2218}',
+                    timeline: 'tl.to("div",{opacity:1})',
+                },
+            },
+            _authoredComposition: {
+                html: '<div>$300 System</div>',
+                css: 'div{color:#2c2218}',
+                timeline: 'tl.to("div",{opacity:1})',
+            },
+        }];
+        const scope = {
+            kind: 'visual',
+            scopeMode: 'selection',
+            label: '1 selected graphic',
+            currentTime: 16.52,
+            fromSec: 13.72,
+            toSec: 23.18,
+            totalDuration: 26.3,
+            contiguous: true,
+            clipRefs: [],
+            iconRefs: [],
+            visualRefs: [{
+                id: 'template-tpl-0-13720',
+                type: 'statCard',
+                collection: 'templateScenes',
+                collectionIndex: 0,
+                trackId: 'video-track-3',
+                startTime: 13.72,
+                endTime: 23.18,
+                sourceSceneIndex: 2,
+                sceneIndex: 2,
+                label: '$300 System',
+            }],
+        };
+        const original = clone(plan.templateScenes[0]);
+        const result = regenerateScopedGraphics(plan, scope, {
+            action: 'regenerate',
+            requestedType: 'statCard',
+            instruction: 'regenerate the selected stat card',
+            effort: 'fast',
+        });
+        assert.deepStrictEqual(
+            { removed: result.removed, added: result.added },
+            { removed: 1, added: 1 }
+        );
+        assert.strictEqual(plan.templateScenes.length, 1);
+        assert.strictEqual(plan.mgScenes.length, 0);
+        assert.strictEqual(plan.motionGraphics.length, 0);
+        const replacement = plan.templateScenes[0];
+        assert.notStrictEqual(replacement.clipId, original.clipId);
+        assert.strictEqual(replacement._agentReplacesVisualId, original.clipId);
+        assert.strictEqual(replacement.startTime, original.startTime);
+        assert.strictEqual(replacement.endTime, original.endTime);
+        assert.strictEqual(replacement.duration, original.duration);
+        assert.strictEqual(replacement.trackId, original.trackId);
+        assert.strictEqual(replacement.mediaType, original.mediaType);
+        assert.strictEqual(replacement.isMGScene, true);
+        assert.strictEqual(replacement.category, 'fullscreen');
+        assert.strictEqual(replacement.text, original.text);
+        assert.strictEqual(replacement.subtext, original.subtext);
+        assert.deepStrictEqual(replacement.items, original.items);
+        assert.strictEqual(replacement.themeId, original.themeId);
+        assert.strictEqual(replacement.templateMediaFile, original.templateMediaFile);
+        assert.strictEqual(replacement.mgData.text, original.mgData.text);
+        assert.deepStrictEqual(replacement.mgData.items, original.mgData.items);
+        assert.strictEqual(replacement.authoredCompositionMode, 'fixed-renderer');
+        assert.strictEqual(replacement._authoredComposition, undefined);
+        assert.strictEqual(replacement.mgData._authoredComposition, undefined);
+        assert.ok(
+            18.45 >= replacement.startTime && 18.45 < replacement.endTime,
+            'the replacement must remain visible at the selected graphic midpoint'
+        );
+        assert.ok(
+            !(24.44 >= replacement.startTime && 24.44 < replacement.endTime),
+            'the replacement must not move onto the following Amish footage'
+        );
+    }
+    {
+        const plan = fixturePlan();
         const overlay = {
             index: 99,
             sourceSceneIndex: 99,
@@ -1124,6 +1738,7 @@ async function run() {
         assert.strictEqual(afterHeadline.cardStyle, 'transparent');
         assert.strictEqual(afterHeadline.colors.background, 'rgba(0,0,0,0)');
         assert.strictEqual(afterHeadline.colors.text, '#ffffff');
+        assert.strictEqual(afterHeadline.textColorManual, true);
         assert.strictEqual(afterHeadline.accentRuleVisible, false);
         assert.strictEqual(afterHeadline.animation, 'typewriter');
         assert.strictEqual(afterHeadline.subType, 'typewriter');

@@ -18,12 +18,18 @@ const { FULLSCREEN_MG_TYPES } = require('../agents/ai-motion-graphics');
 const { extractFallbackKeyword, repairContextualKeywords, _autoStockQuery, _autoWebQuery } = require('../agents/ai-visual-planner');
 const { applyMediaIntentController } = require('../media/media-intent-controller');
 const { applyRetrievabilityRescue } = require('../media/retrievability-rescue');
-const { applySearchKeywordSplit, normalizeEntityContext, trimSearchKeyword } = require('../media/search-keywords');
+const {
+    applySearchKeywordSplit,
+    normalizeEntityContext,
+    trimSearchKeyword,
+    observeScenes: observePhraseScenes,
+} = require('../media/search-keywords');
 const { filterDisabledSources, sanitizeSourceHint } = require('../media/source-policy');
 const {
     validateTemplateHintPlacement,
     validateOverlayHintPlacement,
 } = require('../agents/planner-display-guards');
+const { recoverDataPairs } = require('../agents/mg-data-recovery');
 
 // Data-required fullscreen MG types. If the AI doesn't give real data from the
 // narration, the MG renders broken (empty bars, sentence-fragment labels, no
@@ -520,6 +526,16 @@ async function preBuildReview(scenes, scriptContext) {
     console.log(`   Niche: ${niche.name} | Theme: ${themeId} | Format: ${format}`);
     console.log(`   Scenes: ${scenes.length} | Entities: ${entities.length}`);
 
+    // Learn THIS video's compound nouns before any keyword is shortened, so
+    // scene 1 is cut with the same knowledge as scene 50. Evidence only —
+    // nothing here rewrites a query.
+    try {
+        const stats = observePhraseScenes(scenes);
+        if (stats && stats.learned > 0) {
+            console.log(`   [Phrases] learned ${stats.learned} multi-word terms from this script`);
+        }
+    } catch { /* evidence gathering is best-effort */ }
+
     const changes = [];
     const warnings = [];
     const leanOrchestrator = _useLeanOrchestrator();
@@ -589,6 +605,20 @@ async function preBuildReview(scenes, scriptContext) {
             const mgContent = s.fullscreenMG.substring(colonIdx + 1).trim();
             const res = _validateDataMGContent(mgType, mgContent);
             if (!res.valid) {
+                // Before repairing the graphic away, look for its numbers in the
+                // scene's own words. The planner routinely picks the right chart
+                // for the right beat and simply doesn't copy the digits into the
+                // MG field, and the repair below then costs us twice: the chart
+                // AND a footage hunt seeded from its title. Recovery returns null
+                // unless the pairs are unambiguous, and whatever it does return
+                // must still clear the very same validator every other MG clears
+                // — so an unprovable chart takes the identical path it takes now.
+                const recovered = recoverDataPairs(s, mgType, mgContent, { minPairs: DATA_REQUIRED_FS_MGS[mgType].minPairs || 2 });
+                if (recovered && _validateDataMGContent(mgType, recovered.content).valid) {
+                    s.fullscreenMG = `${mgType}: ${recovered.content}`;
+                    changes.push(`Scene ${s.index}: fullscreenMG "${mgType}" data recovered from ${recovered.source} -> "${recovered.content}"`);
+                    continue;
+                }
                 changes.push(_repairInvalidFullscreenMG(s, mgType, mgContent, res.reason));
             }
         }

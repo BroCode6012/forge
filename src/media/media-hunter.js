@@ -12,6 +12,9 @@ const {
 const {
     getMediaAgentQueries,
 } = require('./media-agent');
+const {
+    detectRequestedPackaging,
+} = require('./packaging-intent');
 
 const STOCK_PROVIDER_KEYS = new Set(['pexels', 'pixabay', 'storyblocks']);
 
@@ -307,11 +310,27 @@ function buildMediaHunterProfile(scene, scriptContext = {}, opts = {}) {
         ...(strictRaw ? ['real footage', 'b-roll', 'raw video', 'clean visuals'] : []),
         ...(allowScreen ? ['screen recording', 'device close up'] : []),
     ], 14);
+    // Does THIS scene's own request ask for the packaging strictRaw is about to
+    // punish? Read from the query + the planner's visual intent + the Media
+    // Agent's must-show list — never from the narration, which describes the
+    // overlay we will draw, not the footage we need to download. Kept separate
+    // from `allowGraphics` on purpose: a scene asking for a cutaway still wants
+    // raw-footage discipline everywhere else (no anchors, no lower thirds), so
+    // strictRaw stays ON and only the requested layer stops counting as a defect.
+    const requestedPackaging = detectRequestedPackaging({
+        scene,
+        keyword,
+        visualIntent: scene?.visualIntent || '',
+        agentPlan,
+        mediaHunter: { prefer, mandatoryVisible },
+    });
     const avoid = _dedupe([
         ...(agentPlan?.mustAvoid || []),
         ...(agentPlan?.rejectIf || []),
         ...GLOBAL_AVOID_TERMS,
-        ...(strictRaw && !allowGraphics ? TEXT_HEAVY_AVOID_TERMS : []),
+        // Telling the searcher and the judge to avoid charts on a scene whose
+        // brief IS a chart is how scene 59 ended up with nothing.
+        ...(strictRaw && !allowGraphics && !requestedPackaging.graphic ? TEXT_HEAVY_AVOID_TERMS : []),
         ...(allowScreen ? [] : ['screen recording']),
     ], 18);
     const queryBoosts = _dedupe([
@@ -334,6 +353,7 @@ function buildMediaHunterProfile(scene, scriptContext = {}, opts = {}) {
         mode,
         strictRaw,
         allowGraphics,
+        requestedPackaging,
         allowScreen,
         allowRelevantPeople,
         allowEditorialText,

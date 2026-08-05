@@ -23,10 +23,78 @@ function _sceneDurationSec(scene) {
     return 8;
 }
 
+function _normalizeMediaType(value) {
+    const type = String(value || '').trim().toLowerCase();
+    return type === 'image' || type === 'video' ? type : '';
+}
+
+function _isAgenticFallbackScene(scene) {
+    const status = String(scene?.mediaDownloadStatus || '').toLowerCase();
+    const provider = String(scene?.sourceProvider || '').toLowerCase();
+    return status === 'agenticgraphicfallback'
+        || provider.includes('agentic visual fallback');
+}
+
+function _resolveRetryMediaType(scene) {
+    const current = _normalizeMediaType(scene?.mediaType) || 'video';
+    if (!_isAgenticFallbackScene(scene)) return current;
+
+    // Agentic fallback plates are always PNGs, so the downloader overwrites the
+    // scene's mediaType with "image". For a manual retry, recover the planner's
+    // original request instead of searching for another still image.
+    const planned = [
+        scene?._aiChose?.mediaType,
+        scene?.mediaIntent?.requestedMediaType,
+        scene?.mediaIntent?.requestedType,
+        scene?.mediaIntent?.preferredMediaType,
+        scene?.mediaIntent?.preferredType,
+        scene?.mediaIntent?.mediaType,
+    ].map(_normalizeMediaType).find(Boolean);
+
+    return planned || current;
+}
+
+function _snapshotMediaState(scene) {
+    const fields = [
+        'mediaFile', 'mediaPath', 'assetFile', 'assetPath',
+        'mediaExtension', 'mediaType', 'sourceProvider', 'sourceHint',
+        'mediaDownloadStatus', 'visionScore', 'mediaWidth', 'mediaHeight',
+        'aspectRatio', 'isVertical',
+    ];
+    return Object.fromEntries(fields.map((field) => [
+        field,
+        Object.prototype.hasOwnProperty.call(scene || {}, field)
+            ? { present: true, value: scene[field] }
+            : { present: false },
+    ]));
+}
+
+function _restoreMediaState(scene, snapshot) {
+    if (!scene || !snapshot) return;
+    for (const [field, saved] of Object.entries(snapshot)) {
+        if (saved.present) scene[field] = saved.value;
+        else delete scene[field];
+    }
+}
+
+function _resetRetryDiagnostics(scene) {
+    if (!scene) return;
+    scene.mediaDiagnostics = {
+        planner: {},
+        intent: scene.mediaIntent || null,
+        mediaAgent: null,
+        hunter: null,
+        providers: [],
+        final: null,
+        retry: true,
+        startedAt: new Date().toISOString(),
+    };
+}
+
 /**
  * Retry finding + downloading this scene's asset with a FRESH Media Agent plan
- * (new keywords/queries), then swap the file in place. Uses the scene's current
- * media type (video stays video, image stays image).
+ * (new keywords/queries), then replace the scene asset. Normal scenes keep their
+ * current media type; agentic fallback PNGs recover the planner's original type.
  *
  * @param {Object} scene          — scene object from video-plan.json
  * @param {Object} scriptContext  — the build's scriptContext
@@ -39,7 +107,14 @@ async function retrySceneMedia(scene, scriptContext = {}, opts = {}) {
     if (!scene) return { success: false, error: 'no scene supplied' };
     if (!mediaFile) return { success: false, error: 'no media file path resolved for this scene' };
 
-    const mediaType = (scene.mediaType || 'video').toLowerCase() === 'image' ? 'image' : 'video';
+    const originalMediaState = _snapshotMediaState(scene);
+    const currentMediaType = _normalizeMediaType(scene.mediaType) || 'video';
+    const mediaType = _resolveRetryMediaType(scene);
+    if (mediaType !== currentMediaType) {
+        log(`Restoring planner media type for retry: ${currentMediaType} fallback → ${mediaType}`);
+    }
+    scene.mediaType = mediaType;
+    _resetRetryDiagnostics(scene);
 
     // Reset the STALE per-scene budget. The scene still carries `_deadlineAt` from the
     // ORIGINAL build run — a timestamp now in the past — so the downloader reports
@@ -108,7 +183,16 @@ async function retrySceneMedia(scene, scriptContext = {}, opts = {}) {
         scriptContext,
         scene, // give the download pipeline the real scene (context + avoids null-deref)
         onProgress: log,
+        allowExtensionChange: true,
     });
+
+    if (!result?.success) {
+        _restoreMediaState(scene, originalMediaState);
+    } else {
+        scene.keyword = keyword;
+        scene.searchKeyword = keyword;
+        if (sourceHint) scene.sourceHint = sourceHint;
+    }
 
     // Forward the formatted per-scene MEDIA REPORT (candidates, scores, links, winner) to
     // the caller's log sink so it lands in the in-app Media Log panel, not just the console.
@@ -117,7 +201,14 @@ async function retrySceneMedia(scene, scriptContext = {}, opts = {}) {
         if (Array.isArray(lines)) for (const ln of lines) log(ln);
     } catch (_) {}
 
-    return { ...result, keyword, sourceHint, mediaType, mediaFile };
+    return {
+        ...result,
+        keyword,
+        sourceHint,
+        mediaType: _normalizeMediaType(scene.mediaType) || mediaType,
+        mediaFile: result?.newFile || mediaFile,
+        scene,
+    };
 }
 
 /**
@@ -188,4 +279,4 @@ async function ceoEditScene(action, scene, scriptContext = {}, idx = 0, allScene
     }
 }
 
-module.exports = { retrySceneMedia, ceoEditScene };
+module.exports = { retrySceneMedia, ceoEditScene, _resolveRetryMediaType };

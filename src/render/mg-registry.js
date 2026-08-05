@@ -29,7 +29,7 @@ const MG_REGISTRY = {
             stamp:     { label: 'Stamp',          animation: 'popUp' },
             typewriter:{ label: 'Typewriter',     animation: 'typewriter' },
         },
-        animations: ['springScale', 'popUp', 'slideLeft', 'fadeSlide', 'typewriter'],
+        animations: ['springScale', 'popUp', 'slideLeft', 'fadeSlide', 'typewriter', 'wordCascade'],
         defaultType: 'standard',
         fields: ['text', 'subtext', 'position'],
     },

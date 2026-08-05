@@ -43,7 +43,8 @@ const THEMES = {
 
         fonts: {
             heading: 'Oswald, "Bebas Neue", Impact, sans-serif',
-            body: '"Barlow Condensed", Lato, Arial, sans-serif'
+            body: '"Barlow Condensed", Lato, Arial, sans-serif',
+            headingWeight: '700'   // Oswald's heaviest real cut; 900 would be faked
         },
 
         transitions: {
@@ -133,7 +134,8 @@ const THEMES = {
 
         fonts: {
             heading: '"Bebas Neue", Oswald, "Fjalla One", Impact, sans-serif',
-            body: '"Roboto Condensed", "Barlow Condensed", Arial, sans-serif'
+            body: '"Roboto Condensed", "Barlow Condensed", Arial, sans-serif',
+            headingWeight: '400'   // Bebas Neue is a single-weight display face
         },
 
         transitions: {
@@ -178,7 +180,8 @@ const THEMES = {
 
         fonts: {
             heading: '"Libre Baskerville", Merriweather, Georgia, serif',
-            body: 'Lora, "Open Sans", Georgia, sans-serif'
+            body: 'Karla, "Source Sans Pro", "Segoe UI", sans-serif',
+            headingWeight: '700'   // Libre Baskerville ships 400/700 only
         },
 
         transitions: {
@@ -222,8 +225,8 @@ const THEMES = {
         },
 
         fonts: {
-            heading: 'Montserrat, "Work Sans", Arial, sans-serif',
-            body: '"Source Sans Pro", "Open Sans", "Segoe UI", sans-serif'
+            heading: '"Work Sans", Oswald, Arial, sans-serif',
+            body: '"Source Sans Pro", "Segoe UI", Arial, sans-serif'
         },
 
         transitions: {
@@ -269,7 +272,7 @@ const THEMES = {
 
         fonts: {
             heading: '"Playfair Display", "Libre Baskerville", Georgia, serif',
-            body: 'Lato, "Source Sans Pro", "Open Sans", sans-serif'
+            body: 'Spectral, "Source Sans Pro", Georgia, serif'
         },
 
         transitions: {
@@ -314,7 +317,7 @@ const THEMES = {
 
         fonts: {
             heading: '"Playfair Display", "Libre Baskerville", Georgia, serif',
-            body: 'Lato, "Work Sans", "Open Sans", sans-serif'
+            body: '"Source Sans Pro", "Work Sans", "Segoe UI", sans-serif'
         },
 
         transitions: {
@@ -360,7 +363,8 @@ const THEMES = {
 
         fonts: {
             heading: '"Libre Baskerville", "Playfair Display", Georgia, serif',
-            body: 'Lato, "Source Sans Pro", "Open Sans", sans-serif'
+            body: 'Lora, "Libre Baskerville", Georgia, serif',
+            headingWeight: '700'   // Libre Baskerville ships 400/700 only
         },
 
         transitions: {
@@ -1548,11 +1552,23 @@ function getThemeTokens(themeId) {
             bodyFont: theme.fonts.body,
             captionFont: theme.fonts.body,       // caption uses body font stack
             statFont: theme.fonts.heading,       // stats use heading font (bold/display)
-            headingWeight: '900',
-            bodyWeight: '500',
-            captionWeight: '400',
-            statWeight: '900',
-            emphasisWeight: '700',
+
+            // Weight is capped by what each family really ships, so a theme may
+            // override the house default. Asking 900 of a family whose heaviest
+            // real cut is 700 does not produce a heavier face: the browser
+            // smears the 700 outlines to synthesise one, and that fake bold is
+            // one of the tells that makes generated video look generated. A
+            // crisp real 700 beats a faked 900.
+            //
+            // Overrides exist only where the family is genuinely capped
+            // upstream (Oswald 700, Bebas Neue 400, Libre Baskerville 700).
+            // scripts/verify/theme-font-contract.js fails if any slot asks for
+            // a weight with no matching file in assets/fonts.
+            headingWeight: theme.fonts.headingWeight || '900',
+            bodyWeight: theme.fonts.bodyWeight || '500',
+            captionWeight: theme.fonts.captionWeight || '400',
+            statWeight: theme.fonts.headingWeight || '900',   // stats ride the heading face
+            emphasisWeight: theme.fonts.emphasisWeight || '700',
         },
 
         // ---- MG Chrome ----

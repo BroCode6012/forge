@@ -126,7 +126,7 @@ function renderVideos() {
     if (state.videos.length === 0) {
         els.videoList.innerHTML = `
             <div id="video-empty">
-                <span class="icon">▶</span>
+                <span class="icon"><svg width="30" height="30" viewBox="0 0 30 30" fill="none" aria-hidden="true"><rect x="5" y="7" width="20" height="16" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="m13 11 6 4-6 4v-8Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></span>
                 Add a YouTube URL or local video file below to start a session.
             </div>`;
         return;
@@ -134,12 +134,12 @@ function renderVideos() {
     els.videoList.innerHTML = state.videos.map((v, i) => {
         const dur = v.duration ? `${Math.floor(v.duration / 60)}:${String(v.duration % 60).padStart(2, '0')}` : '?:??';
         const src = v.sourceUrl || '(local file)';
-        const statusIcon = v.analyzed === false ? '✗' : v.analyzed === true ? '✓' : '…';
+        const statusIcon = v.analyzed === false ? '!' : v.analyzed === true ? 'OK' : '...';
         const statusClass = v.analyzed === false ? 'failed' : v.analyzed === true ? 'ok' : 'pending';
         const statusTip = v.analyzed === false ? `Analysis failed: ${escapeHtml(v.analysisError || 'unknown error')}` : v.analyzed === true ? 'Analyzed' : 'Pending';
         const errorBlock = v.analyzed === false
             ? `<div class="video-error" title="${statusTip}">
-                   <span class="video-error-msg">⚠ ${escapeHtml(v.analysisError || 'analysis failed')}</span>
+                   <span class="video-error-msg">${escapeHtml(v.analysisError || 'analysis failed')}</span>
                    <button class="video-retry-btn" data-retry-idx="${i}">Retry</button>
                </div>`
             : '';
@@ -213,7 +213,7 @@ function addMessage(role, text, opts) {
     clearChatEmpty();
     const wrap = document.createElement('div');
     wrap.className = `msg ${role}`;
-    const avatar = role === 'user' ? 'U' : '✦';
+    const avatar = role === 'user' ? 'U' : 'AI';
     wrap.innerHTML = `
         <div class="msg-avatar">${avatar}</div>
         <div class="msg-bubble">${renderMarkdown(text)}</div>
@@ -274,7 +274,7 @@ function renderProfile() {
     if (!state.profile || Object.keys(state.profile).length === 0) {
         els.profileContent.innerHTML = `
             <div id="profile-empty">
-                <span class="icon">◌</span>
+                <span class="icon"><svg width="30" height="30" viewBox="0 0 30 30" fill="none" aria-hidden="true"><circle cx="15" cy="15" r="9" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 3"/><path d="M15 10v10M10 15h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span>
                 No profile extracted yet.<br><br>
                 Chat with the agent, then click <strong>Extract Profile</strong> below or say "extract profile" in chat.
             </div>`;
@@ -650,7 +650,7 @@ async function handleEndSession() {
     clearChat();
     els.chatMessages.innerHTML = `
         <div class="chat-empty" id="chat-empty">
-            <span class="big-icon">✦</span>
+            <span class="big-icon"><svg width="46" height="46" viewBox="0 0 46 46" fill="none" aria-hidden="true"><path d="M23 6v34M6 23h34M11 11l24 24M35 11 11 35" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="23" cy="23" r="5" stroke="currentColor" stroke-width="1.4"/></svg></span>
             <h2>Session ended</h2>
             <p>Add another reference video to start a new conversation.</p>
         </div>`;

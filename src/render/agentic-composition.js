@@ -1,3 +1,10 @@
+const {
+    normalizeGraphicShell,
+} = require('./graphic-shells');
+const {
+    resolveGraphicMediaTreatment,
+} = require('./overlay-visual-policy');
+
 function asObject(value) {
     return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
 }
@@ -187,6 +194,45 @@ function normalizeAgenticCompositionSpec(mg = {}, ctx = {}) {
     const styleIntent = asObject(explicit.style) || {};
     const density = pickDensity(items, text, styleIntent);
     const entrance = token(motionIntent.entrance || explicit.motionIntent || visual.animation || mg.animation || mg.templateAnimation || 'fade-slide', 'fade-slide');
+    const hasAsset = Boolean(ctx.hasAsset || mg.mediaPath || mg.assetPath || mg.templateMediaFile || mg.backgroundMediaFile);
+    const mediaTreatment = resolveGraphicMediaTreatment({
+        role,
+        type,
+        requested: explicit.media?.treatment || explicit.mediaTreatment,
+        fallback: role === 'overlay'
+            ? 'transparent'
+            : (hasAsset ? 'cinematic-background' : 'transparent'),
+    });
+    const shell = normalizeGraphicShell(
+        mg.graphicShell
+        || mg.mgData?.graphicShell
+        || explicit.shell
+        || styleIntent.shell,
+        {
+            id: mg.id || mg.clipId || ctx.id || text,
+            role,
+            type,
+            text,
+            subtext: subtext || kicker,
+            items,
+            density,
+            textStrategy: explicit.textStrategy || explicit.strategy || layout,
+            safeZone,
+            layout,
+            mood: `${styleIntent.mood || explicit.mood || visual.styleName || mg.style || ''} ${motionIntent.reason || explicit.compositionIntent || ''}`,
+            manual: mg.graphicShellManual === true || mg.mgData?.graphicShellManual === true,
+            transparentBackground: Boolean(
+                mg.transparentBackground === true
+                || mg.mgData?.transparentBackground === true
+                || visual.cardStyle === 'transparent'
+            ),
+            accentRuleVisible: (
+                visual.accentRuleVisible !== false
+                && mg.accentRuleVisible !== false
+                && mg.mgData?.accentRuleVisible !== false
+            ),
+        }
+    );
 
     return {
         mode: 'agentic',
@@ -200,9 +246,10 @@ function normalizeAgenticCompositionSpec(mg = {}, ctx = {}) {
         title: text,
         subtitle: subtext,
         items,
+        shell,
         media: {
-            hasAsset: Boolean(ctx.hasAsset || mg.mediaPath || mg.assetPath || mg.templateMediaFile || mg.backgroundMediaFile),
-            treatment: token(explicit.media?.treatment || explicit.mediaTreatment || (role === 'overlay' ? 'transparent' : 'cinematic-background'), 'cinematic-background'),
+            hasAsset,
+            treatment: mediaTreatment,
         },
         style: {
             mood: token(styleIntent.mood || explicit.mood || visual.styleName || mg.styleName || mg.style || 'clean', 'clean'),

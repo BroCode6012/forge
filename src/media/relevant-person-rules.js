@@ -5,7 +5,11 @@
  * - reject packaging: anchors, presenters, studio shots, PIP, watermarks, lower thirds
  * - allow clean footage of a relevant subject/person: public figures, officials,
  *   celebrities, athletes, workers, soldiers, or participants tied to the scene
+ * - and, since Fix 5: do not call a layer "packaging" when the scene's own brief
+ *   asked for exactly that layer (see media/packaging-intent.js)
  */
+
+const { detectRequestedPackaging, survivingBuckets } = require('./packaging-intent');
 
 const GRAPHIC_PACKAGED_RE = /\b(map|maps|satellite image|satellite screenshot|route graphic|locator|diagram|infographic|chart|graph|thumbnail|slideshow|animation|animated|cartoon|illustration)\b/i;
 // Subset of GRAPHIC_PACKAGED_RE — only map-shaped graphics get the
@@ -250,6 +254,16 @@ function classifyStrictRawVisual(description, keyword = '', sceneText = '', cont
     if (!desc) return { reject: false, reason: '', allowedPerson: false };
 
     const allowGraphics = !!context?.mediaHunter?.allowGraphics;
+    // What this scene's own brief asked for. A layer the request named is not a
+    // defect — it is the delivery. Resolved once per profile in media-hunter.js;
+    // recomputed here only when a caller hands us a context without one.
+    const requested = context?.mediaHunter?.requestedPackaging
+        || detectRequestedPackaging({
+            scene: context?.scene,
+            keyword,
+            visualIntent: context?.visualIntent || '',
+            mediaHunter: context?.mediaHunter,
+        });
     const graphicHit = !allowGraphics
         && GRAPHIC_PACKAGED_RE.test(desc)
         && !isTopicAccurateMapFromPremiumStock(desc, context);
@@ -257,10 +271,15 @@ function classifyStrictRawVisual(description, keyword = '', sceneText = '', cont
     const presenterHit = PRESENTER_PACKAGED_RE.test(desc);
 
     if (graphicHit || textHit || presenterHit) {
-        const buckets = [];
-        if (graphicHit) buckets.push('graphic');
-        if (textHit) buckets.push('text');
-        if (presenterHit) buckets.push('presenter');
+        const raw = [];
+        if (graphicHit) raw.push('graphic');
+        if (textHit) raw.push('text');
+        if (presenterHit) raw.push('presenter');
+        const buckets = survivingBuckets(raw, requested);
+        // Everything we could complain about is something we asked for.
+        if (buckets.length === 0) {
+            return { reject: false, reason: '', buckets: [], allowedPerson: false, requestedPackaging: raw };
+        }
         return {
             reject: true,
             reason: 'packaged graphic/presenter/overlay visual',
@@ -272,6 +291,7 @@ function classifyStrictRawVisual(description, keyword = '', sceneText = '', cont
     if (PERSON_PRESENTATION_RE.test(desc)) {
         const allowedPerson = allowsRelevantPersonFootage(desc, keyword, sceneText, context);
         if (allowedPerson) return { reject: false, reason: '', allowedPerson: true };
+        if (requested?.presenter) return { reject: false, reason: '', buckets: [], allowedPerson: true, requestedPackaging: ['presenter'] };
         return { reject: true, reason: 'unrelated presenter/person visual for raw-footage target', buckets: ['presenter'], allowedPerson: false };
     }
 

@@ -1,6 +1,28 @@
 'use strict';
 
 const { overlaps, scopeRange, windowOf } = require('../scope-utils');
+const {
+    number,
+    object,
+    tool,
+} = require('./capability-contract');
+
+const VOLUME_ARGS = object({
+    volume: number({ min: 0, max: 1, description: 'Absolute gain from silent to full level.' }),
+    scale: number({ min: 0.1, max: 3, description: 'Multiplier applied to the current gain.' }),
+}, {
+    anyOfRequired: [['volume'], ['scale']],
+});
+
+function tools() {
+    return [
+        tool('set-sfx-volume', 'Set or scale sound-effect volume inside the active scope.', VOLUME_ARGS),
+        tool('remove-sfx', 'Remove sound-effect cues inside the active scope.', object()),
+        tool('set-narration-volume', 'Set or scale the project narration level.', VOLUME_ARGS),
+        tool('set-music-volume', 'Set or scale the project background-music level.', VOLUME_ARGS),
+        tool('remove-music', 'Remove the project background-music bed.', object()),
+    ];
+}
 
 function _projectScope() {
     return {
@@ -148,6 +170,7 @@ function normalizeInvocation(invocation, context) {
 
 function manifest() {
     return {
+        contractVersion: 2,
         id: 'audio',
         specialist: 'Audio Editor',
         domain: 'audio',
@@ -237,4 +260,4 @@ function inspect(plan, scope) {
     };
 }
 
-module.exports = { execute, inspect, manifest, normalizeInvocation, planFast };
+module.exports = { execute, inspect, manifest, normalizeInvocation, planFast, tools };

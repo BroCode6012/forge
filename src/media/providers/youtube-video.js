@@ -30,6 +30,28 @@ const YT_CLIENT_LADDER = [
     process.env.YTDLP_PLAYER_CLIENTS_FALLBACK || 'android,ios,web',
 ];
 
+// ── Cover picture ────────────────────────────────────────────────────────────
+// Every YouTube video's cover image is derivable from its 11-char id, with no
+// key, no quota and no extra request to find it. The API path had these in hand
+// (item.snippet.thumbnails) and threw them away; the yt-dlp path never asked.
+// Publishing them as `_thumbUrl` — the field name every other provider already
+// uses — is what lets the cheap pre-download visual checks see a YouTube result
+// at all. hqdefault is the size that exists for every video ever uploaded;
+// maxres does not.
+function _coverUrl(videoId) {
+    const id = String(videoId || '').trim();
+    return /^[A-Za-z0-9_-]{11}$/.test(id) ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : '';
+}
+
+// ── Search duration guard ────────────────────────────────────────────────────
+// Lower bound only. Shorts/intros under 10s can't yield a 10-15s window, so they
+// stay filtered. There is deliberately NO upper bound: hour-long tours, walking
+// videos and documentaries are the RICHEST source of specific raw B-roll, and an
+// upper cap silently discarded exactly those. Finding the right window inside a
+// long video is the localizer's job, not the search filter's.
+// Override with YOUTUBE_SEARCH_DURATION_FILTER (raw yt-dlp --match-filter expr).
+const SEARCH_DURATION_FILTER = process.env.YOUTUBE_SEARCH_DURATION_FILTER || 'duration > 10';
+
 function _ytErrorText(error) {
     return [error?.message || '', error?.stderr || '', error?.stdout || '']
         .filter(Boolean).join('\n').toLowerCase()
@@ -223,6 +245,37 @@ class YouTubeVideoProvider extends BaseProvider {
         return results.filter(r => {
             // Reject YouTube Shorts URLs (vertical video, unusable for 1920x1080 canvas)
             if (r.url && r.url.includes('/shorts/')) return false;
+            // ...but search does not hand them to us that way. `ytsearch` returns
+            // Shorts as ordinary /watch?v= URLs, so the check above passed every
+            // one of them through: the "300$ Test" scenes came back holding
+            // "Feeding Bees A Banana! #shorts" and "#homeinspo" clips. Fall back
+            // to the two signals search does give us — the self-declared tag and
+            // portrait dimensions.
+            //
+            // Matches the whole hashtag family, not just the bare word: uploaders
+            // write #shortsfeed, #shortsviral, #ytshorts, #shortvideo far more
+            // often than a lone #shorts, and `(?:^|\W)#shorts?(?:\W|$)` let every
+            // one of those through.
+            //
+            // EVERY tail is an allowlist — including the ones after the `s`. A bare
+            // `s\w*` reads as "narrow" but is a `\w*` in disguise the moment the
+            // next letter is an s, and it threw away long-form videos tagged
+            // #shortswords, #shortselling, #shortstop, #shortstories, #shortsleeve.
+            // With the allowlist, #shortfilm / #shorthair / #shortstack survive too
+            // (a short film is usable 16:9 footage and losing that lane would cost
+            // more than the odd Short costs), and a plain "denim shorts" title never
+            // had a hash at all.
+            if (/#(?:yt)?shorts?(?:feed|viral|video|vid|vertical|clip)?\b/i.test(String(r.title || ''))) return false;
+
+            // Dimensions are the weaker half of the pair and currently inert:
+            // both search parsers stamp a placeholder 1920x1080 because a flat
+            // yt-dlp/API search does not report a real frame size, so `h > w` can
+            // only fire if some caller hands us metadata-enriched results. Left in
+            // because it is correct when the numbers are real — but the hashtag
+            // test above is what actually keeps Shorts out today.
+            const w = Number(r.width) || 0;
+            const h = Number(r.height) || 0;
+            if (w > 0 && h > 0 && h > w) return false;
             return true;
         });
     }
@@ -646,6 +699,7 @@ class YouTubeVideoProvider extends BaseProvider {
                 height: 1080,
                 viewCount: viewCounts[item.id.videoId] || 0,
                 duration: durations[item.id.videoId] || 0,
+                _thumbUrl: _coverUrl(item.id.videoId),
             }))
             .sort((a, b) => {
                 // news.politics: prioritize short videos (under 3 min) first, then by views
@@ -669,9 +723,7 @@ class YouTubeVideoProvider extends BaseProvider {
             '--flat-playlist',
         ];
 
-        // 10s minimum to avoid Shorts/intros, 1800s max lets documentary/news
-        // videos surface when they contain short raw B-roll windows.
-        args.push('--match-filter', 'duration > 10 & duration < 1800');
+        args.push('--match-filter', SEARCH_DURATION_FILTER);
 
         try {
             const { stdout } = await execYtdlpWithRetry(this._ytdlpPath, args, {
@@ -684,7 +736,7 @@ class YouTubeVideoProvider extends BaseProvider {
             });
             return this._parseYtdlpOutput(stdout);
         } catch (error) {
-            const fallbackArgs = args.filter(a => a !== '--match-filter' && a !== 'duration > 10 & duration < 1800');
+            const fallbackArgs = args.filter(a => a !== '--match-filter' && a !== SEARCH_DURATION_FILTER);
             if (summarizeYtdlpError(error).includes('match-filter')) {
                 try {
                     const { stdout } = await execYtdlpWithRetry(this._ytdlpPath, fallbackArgs, {
@@ -720,7 +772,7 @@ class YouTubeVideoProvider extends BaseProvider {
         ];
 
         // Keep the same duration guard as global YouTube search.
-        args.push('--match-filter', 'duration > 10 & duration < 1800');
+        args.push('--match-filter', SEARCH_DURATION_FILTER);
 
         try {
             const { stdout } = await execYtdlpWithRetry(this._ytdlpPath, args, {
@@ -737,7 +789,7 @@ class YouTubeVideoProvider extends BaseProvider {
                 _channelScoped: true,
             }));
         } catch (error) {
-            const fallbackArgs = args.filter(a => a !== '--match-filter' && a !== 'duration > 10 & duration < 1800');
+            const fallbackArgs = args.filter(a => a !== '--match-filter' && a !== SEARCH_DURATION_FILTER);
             if (summarizeYtdlpError(error).includes('match-filter')) {
                 try {
                     const { stdout } = await execYtdlpWithRetry(this._ytdlpPath, fallbackArgs, {
@@ -801,6 +853,7 @@ class YouTubeVideoProvider extends BaseProvider {
                     width: 1920,
                     height: 1080,
                     duration: durSec,
+                    _thumbUrl: _coverUrl(videoId),
                 });
             }
         }
@@ -899,6 +952,61 @@ class YouTubeVideoProvider extends BaseProvider {
                     }
                 }
             } catch (_) { /* graceful — fall through to the vision smart-trim */ }
+        }
+
+        // Storyboard Scout: the transcript rung above only fires when the narrator actually
+        // SAYS the thing. On the videos that matter most for B-roll — drives, walking
+        // tours, silent documentaries — captions are ambient noise, and a weak "best-guess"
+        // match lands no better than the heuristic. YouTube publishes free sprite-sheet
+        // storyboards that visually index the whole video, so we can LOOK for the shot
+        // instead of guessing: one small download, no stream resolve, no remote seeking —
+        // which is exactly the cost that forced the smart-segment rung below to be off.
+        //
+        // The duration gate is about PAYOFF, not feasibility. Measured across the 52
+        // YouTube clips of a real 64-scene build, every single candidate had a usable
+        // storyboard — even a 22s one (100 frames) — and boards get DENSER as videos get
+        // shorter (4m53s -> 150 frames @ 2s; 22m -> 135 frames @ 10s), so cost tracks
+        // frame count, not length. What length buys is the odds: on a 30s clip a blind
+        // start is already on the shot, on a 4-minute one it is a 1-in-24 guess. Hence a
+        // few minutes, not "long videos only" — an earlier 600s gate would have fired on
+        // 2 of those 52 clips while all 52 took the blind `window via heuristic start`.
+        //
+        // The per-run video budget in the scout is the actual spend guard. This yields to
+        // a high-confidence transcript hit, and a null changes nothing below.
+        const storyboardEnabled = !/^(0|false|off|no)$/i.test(String(process.env.YOUTUBE_STORYBOARD_SCOUT || '').trim());
+        const storyboardMinDuration = Number(process.env.YOUTUBE_STORYBOARD_MIN_DURATION) || 180;
+        const transcriptCommitScore = Number(process.env.TRANSCRIPT_SCOUT_COMMIT_SCORE) || 0.60;
+        const transcriptWeak = !!options._transcriptScout
+            && Number(options._transcriptScout.score || 0) < transcriptCommitScore;
+        if (storyboardEnabled && keyword && metadata && metadata.duration >= storyboardMinDuration
+            && (startTime === null || transcriptWeak)) {
+            try {
+                const vid = (url.match(/[?&]v=([^&]+)/) || [])[1] || '';
+                if (vid) {
+                    const { locateWindow } = require('../storyboard-scout');
+                    const win = await locateWindow(keyword, vid, {
+                        ytdlpPath: this._ytdlpPath,
+                        signal: options.abortSignal,
+                        sceneText: options.sceneText || '',
+                        // The scene's own clock. Without it the deep scout (~40 vision
+                        // calls) ran to completion no matter how little time was left,
+                        // which is how one candidate could eat the whole scene and
+                        // leave later providers with nothing. Absent (0) = no limit,
+                        // exactly as before for callers that don't set one.
+                        deadline: Number(options.deadlineAt) > 0 ? Number(options.deadlineAt) : 0,
+                    });
+                    if (win) {
+                        options._storyboardScout = win;
+                        startTime = win.startTime;
+                        options._smartStartTimeUsed = startTime;
+                        const mm = Math.floor(startTime / 60);
+                        const ss = String(Math.round(startTime % 60)).padStart(2, '0');
+                        console.log(`  🗺️ [Storyboard Scout] found "${win.probe}" at ${mm}m${ss}s of a ${Math.round(metadata.duration / 60)}min video (conf ${win.confidence.toFixed(2)}, ${win.calls} looks, ${Math.round((win.elapsedMs || 0) / 1000)}s) — "${win.evidence}"`);
+                    } else if (transcriptWeak) {
+                        console.log(`  🗺️ [Storyboard Scout] subject never visible in the storyboard — keeping the transcript best-guess`);
+                    }
+                }
+            } catch (_) { /* graceful — keep whatever window we already had */ }
         }
 
         // Per-candidate vision SMART-SEGMENT is OFF by default. It resolved the stream URL and

@@ -4,6 +4,12 @@ const DISABLED_VIDEO_PROVIDER_KEYS = new Set([
 const DISABLED_SOURCE_HINTS = new Set([
     'vkVideo', 'unsplash', 'googleScrape',
 ]);
+const CANONICAL_SOURCE_HINTS = Object.freeze([
+    'stock',
+    'youtube',
+    'reddit',
+    'web-image',
+]);
 
 const SOURCE_HINT_FALLBACKS = {
     vkVideo:     'youtube',
@@ -53,6 +59,7 @@ function providerToSourceHint(providerKey) {
 }
 
 module.exports = {
+    CANONICAL_SOURCE_HINTS,
     DISABLED_VIDEO_PROVIDER_KEYS,
     DISABLED_SOURCE_HINTS,
     SOURCE_HINT_FALLBACKS,

@@ -28,7 +28,7 @@ const log = require('../util/logger');
 
 function writeVideoPlanAtomic(filePath, videoPlan) {
     const serializable = JSON.parse(JSON.stringify(
-        videoPlan,
+        timelineContract.withContinuityHolds(videoPlan),
         (key, value) => key === '_fileIndex' ? undefined : value
     ));
     atomicWriteJson(filePath, serializable);
@@ -1412,7 +1412,6 @@ async function buildDumbVideo(transcription, audioFile, directorsBrief) {
     const { downloadAllMedia } = require('../media/footage-manager');
     const { assignTransitions } = require('../agents/ai-director');
     const productionMode = directorsBrief?.productionMode || 'faceless';
-    const aiVideosMode = require('../categories').usesAiVideo(productionMode);
 
     const fps = config.video.fps;
     const segments = transcription.segments || [];
@@ -1444,7 +1443,7 @@ async function buildDumbVideo(transcription, audioFile, directorsBrief) {
         const unique = [...new Set(words)].slice(0, 3);
         scene.keyword = unique.join(' ') || 'abstract background';
         scene.mediaType = 'video';
-        scene.sourceHint = aiVideosMode ? 'ai-video' : 'stock';
+        scene.sourceHint = 'stock';
         scene.framing = 'fullscreen';
         scene.backgroundId = 'none';
         scene.background = 'none';
@@ -1608,10 +1607,7 @@ async function buildDumbVideo(transcription, audioFile, directorsBrief) {
     }
 
     // Re-save plan with updated paths
-    fs.writeFileSync(
-        path.join(publicDir, 'video-plan.json'),
-        JSON.stringify(videoPlan, null, 2)
-    );
+    writeVideoPlanAtomic(path.join(publicDir, 'video-plan.json'), videoPlan);
     console.log(`   ✅ Plan saved\n`);
 
     console.log('🎬 ==========================================');
@@ -1718,6 +1714,14 @@ function _normalizeRepeatFromStep(value) {
     if (!raw || raw === 'off' || raw === 'none') return '';
     if (['visual-planner', 'visual_planner', 'vp', 'step4', 'step-4'].includes(raw)) return 'visual-planner';
     if (['media', 'download-media', 'footage', 'step5', 'step-5'].includes(raw)) return 'media';
+    if ([
+        'motion-graphics',
+        'motion_graphics',
+        'graphics',
+        'mg',
+        'step6',
+        'step-6',
+    ].includes(raw)) return 'motion-graphics';
     return raw;
 }
 
@@ -1876,13 +1880,13 @@ const applySceneDirectives = directiveUtil.applySceneDirectives;
 // stamps NOTHING — AI video only happens where the creator explicitly asked).
 //   VEO_SCOPE = 'directives' (default) | 'hero' | 'all'
 function _applyVeoScope(scenes, scriptContext) {
-    // The "AI Videos" category generates ALL eligible B-roll via the ai-video
-    // lane — equivalent to VEO_AI_VIDEO on + VEO_SCOPE='all'. Any other category
-    // (faceless / talkingHead) keeps the exact env-driven behavior below.
-    const aiVideosCat = !!(scriptContext && require('../categories').usesAiVideo(scriptContext.productionMode));
-    const on = aiVideosCat || /^(1|true|yes|on)$/i.test(String(process.env.VEO_AI_VIDEO || '').trim());
+    // Opt-in, env-driven. VEO_AI_VIDEO on + a non-'directives' VEO_SCOPE stamps
+    // sourceHint='ai-video' on eligible scenes so the Step 5 media layer generates
+    // them (Kling/Veo) instead of downloading. Cost-safe default 'directives' stamps
+    // nothing — AI video only happens where the creator explicitly asked.
+    const on = /^(1|true|yes|on)$/i.test(String(process.env.VEO_AI_VIDEO || '').trim());
     if (!on || !Array.isArray(scenes)) return 0;
-    const scope = aiVideosCat ? 'all' : String(process.env.VEO_SCOPE || 'directives').trim().toLowerCase();
+    const scope = String(process.env.VEO_SCOPE || 'directives').trim().toLowerCase();
     if (scope === 'directives' || scope === 'off' || scope === 'none') return 0;
 
     const eligible = (s) => {
@@ -2104,6 +2108,25 @@ async function buildVideo() {
     const DIRECTOR_CHECKPOINT_FILE = path.join(PROJECT_DIR, '.build-director-checkpoint.json');
     const repeatFromStep = _normalizeRepeatFromStep(process.env.BUILD_REPEAT_FROM);
     const repeatVisualPlanner = repeatFromStep === 'visual-planner';
+    const repeatMotionGraphics = repeatFromStep === 'motion-graphics';
+
+    if (repeatMotionGraphics) {
+        log.step('Motion Graphics Only: preserving planning, footage and audio');
+        const { rebuildMotionGraphicsOnly } = require('./rebuild-motion-graphics');
+        const result = await rebuildMotionGraphicsOnly({
+            projectDir: PROJECT_DIR,
+            appRoot: path.resolve(__dirname, '..', '..'),
+            log,
+        });
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        log.banner('BUILD COMPLETE!');
+        log.timing('Total time', elapsed);
+        log.kv('Mode', 'Motion graphics + visual QA only');
+        log.kv('Graphics', result.graphicCount);
+        log.kv('QA', String(result.qa?.status || 'pass').toUpperCase());
+        log.info('Planning, downloaded media, narration, transitions and SFX were preserved.');
+        return result.plan;
+    }
 
     // ── Resume from checkpoint? ──
     // If a checkpoint exists from a previous build (same audio file), skip
@@ -2268,7 +2291,7 @@ async function buildVideo() {
 
     // AI thinking mode (from UI dropdown — works for Gemini, DeepSeek)
     let repeatDirectorCheckpoint = null;
-    if (repeatFromStep && !['visual-planner', 'media'].includes(repeatFromStep)) {
+    if (repeatFromStep && !['visual-planner', 'media', 'motion-graphics'].includes(repeatFromStep)) {
         log.warn(`Unknown repeat-from step "${repeatFromStep}" - running normal build`);
     }
     if (repeatVisualPlanner) {
@@ -2608,9 +2631,7 @@ async function buildVideo() {
     // VEO_AI_VIDEO is on with a non-'directives' scope.
     const _veoStamped = _applyVeoScope(scenesWithKeywords, scriptContext);
     if (_veoStamped > 0) {
-        const _aiVideosCat = require('../categories').usesAiVideo(scriptContext.productionMode);
-        const _veoLabel = _aiVideosCat ? "AI Videos (all eligible scenes)" : `Veo scope='${process.env.VEO_SCOPE}'`;
-        log.ok(`🤖 AI video → ${_veoLabel} → ${_veoStamped} scene(s) will be AI-generated`);
+        log.ok(`🤖 AI video → Veo scope='${process.env.VEO_SCOPE}' → ${_veoStamped} scene(s) will be AI-generated`);
     }
 
     // Step 4.7: Compositor Planner — DISABLED (V2 overlay system needs rework)
@@ -2799,6 +2820,22 @@ async function buildVideo() {
 
     } // end of fresh build else block
 
+    // Snapshot every downloader-facing field BEFORE the last stages that can still
+    // invent a brand-new search query (role restore, map restore, Template Rhythm).
+    // The findability judge in Step 4.8 never saw those queries, so anything that
+    // changes here gets re-judged below instead of shipping unchecked.
+    const _preDownloadQuerySnapshot = new Map();
+    try {
+        for (const s of scenesWithKeywords) {
+            if (!s) continue;
+            _preDownloadQuerySnapshot.set(s.index, [
+                s.stockQuery || '', s.searchKeyword || '', s.keyword || '', s.webQuery || '',
+                s.mediaType || '', s.sourceHint || '', s.mediaIntent?.lane || '',
+                s.fullscreenMG ? 1 : 0, s.templateHint ? 1 : 0,
+            ].join('|'));
+        }
+    } catch (_) {}
+
     if (editorAgentOwnsEditingTasks(scriptContext)) {
         handOffVisualPlannerEditorialDecisions(scenesWithKeywords, scriptContext, 'pre-media-download');
     }
@@ -2832,6 +2869,40 @@ async function buildVideo() {
             log.warn(`Template Rhythm failed: ${error.message} — keeping VP template roles`);
         }
         enforceDisabledSourcePolicy(scenesWithKeywords, 'post-template-rhythm');
+    }
+
+    // ── Step 4.87: Findability re-check on brand-new queries ────────────────────────
+    // Step 4.8's rescue judged the queries that existed THEN. Template Rhythm and the
+    // role/map restores above can demote a scene back to footage with a query written
+    // seconds ago that no library can return — those used to reach the downloader
+    // unjudged and burn the whole per-scene budget. Delta only: same judge, same
+    // prompt, only the scenes whose query actually changed. Off with RETRIEVABILITY_RESCUE=off.
+    if (String(process.env.RETRIEVABILITY_RESCUE || 'on').toLowerCase() !== 'off'
+        && _preDownloadQuerySnapshot.size > 0) {
+        try {
+            const changedIdx = new Set();
+            for (const s of scenesWithKeywords) {
+                if (!s) continue;
+                const before = _preDownloadQuerySnapshot.get(s.index);
+                const after = [
+                    s.stockQuery || '', s.searchKeyword || '', s.keyword || '', s.webQuery || '',
+                    s.mediaType || '', s.sourceHint || '', s.mediaIntent?.lane || '',
+                    s.fullscreenMG ? 1 : 0, s.templateHint ? 1 : 0,
+                ].join('|');
+                if (before === undefined || before !== after) changedIdx.add(s.index);
+            }
+            if (changedIdx.size > 0) {
+                log.step('🔎 Step 4.87: Findability re-check (new queries only)');
+                const { applyRetrievabilityRescue } = require('../media/retrievability-rescue');
+                const rescue = await applyRetrievabilityRescue(scenesWithKeywords, scriptContext, {
+                    onlyIndices: changedIdx,
+                    label: 'post-template-rhythm',
+                });
+                for (const c of (rescue?.changes || [])) log.dim(`   ${c}`);
+            }
+        } catch (e) {
+            log.warn(`Findability re-check skipped: ${e.message}`);
+        }
     }
 
     // Separate fullscreenMG scenes (no footage needed) from scenes that need
@@ -2934,9 +3005,14 @@ async function buildVideo() {
             + (stats.cached || 0)
             + (stats.resumed || 0)
             + (stats.skipped || 0);
+        // A placeholder card is not "ready" — it is the failure we draw when
+        // every provider missed. Counting it as ready is what made this line
+        // read 100% on a build that shipped blank scenes.
         const agenticFallback = stats.agenticGraphicFallback || 0;
-        const totalReady = providerReady + agenticFallback;
-        log.info(`   Media truth: ready=${totalReady}/${stats.total || mediaDownloadScenes.length}, providerReady=${providerReady}, agenticFallback=${agenticFallback}, missing=${stats.failed || 0}, continuityFilled=0 (disabled)`);
+        log.info(`   Media truth: realFootage=${providerReady}/${stats.total || mediaDownloadScenes.length}, placeholder=${agenticFallback}, missing=${stats.failed || 0}, continuityFilled=0 (disabled)`);
+        if (agenticFallback > 0 || (stats.failed || 0) > 0) {
+            log.warn(`   ${agenticFallback + (stats.failed || 0)} scene(s) have no real footage yet — the coverage sweep runs after graphics settle`);
+        }
     }
 
     // Log clip analyzer usage stats
@@ -4126,12 +4202,104 @@ async function buildVideo() {
         if (mb && mb.file) { musicBedFile = mb.file; log.ok(`🎵 Music bed: ${mb.file} (${mb.source})`); }
     } catch (e) { log.warn(`Music bed skipped: ${e.message}`); }
 
-    const finalMissingMedia = scenesWithMedia.filter(scene => scene && !scene.mediaFile && !scene.isMGScene && !scene.fullscreenMG);
-    if (finalMissingMedia.length > 0) {
-        log.warn(`Final media audit: ${finalMissingMedia.length} scene(s) still missing media; continuity reuse is disabled.`);
-    } else {
-        const finalAgenticFallbacks = scenesWithMedia.filter(scene => scene?.mediaDownloadStatus === 'agenticGraphicFallback').length;
-        log.ok(`Final media audit: 0 missing scenes; continuity reuse disabled${finalAgenticFallbacks ? `, agenticFallback=${finalAgenticFallbacks}` : ''}.`);
+    // ── Coverage sweep: the honest final audit, and the road back ────────────────
+    // This replaces an audit that asked `!mediaFile && !isMGScene && !fullscreenMG`
+    // and was structurally incapable of seeing the three ways a scene ends up
+    // empty (see src/media/scene-coverage.js). It ran on a build that shipped
+    // eight blank/apology scenes and printed "0 missing".
+    //
+    // It runs HERE because this is the first moment the graphic lists are final:
+    // the Motion Director (Step 6.9) above is the last stage that adds or removes
+    // fullscreen graphics, and Step 7 below turns everything into the plan. A
+    // graphic disabled earlier has already left the list, so a scene that was
+    // counting on it now shows up as uncovered — which is the whole point.
+    {
+        const coverageCtx = { graphics: [...(mgScenes || []), ...(templateScenes || [])] };
+        // Scenes excluded from the download set never joined the V1 track at all
+        // (fullscreenMG scenes and download:'skip' lanes are filtered out before
+        // Step 5). They must be in the sweep's universe or the two biggest causes
+        // of a blank scene stay invisible. Presenter holds are excluded: their
+        // visual is owned by the presenter system, not the footage system, and
+        // handing one a stock clip would be a worse bug than the blank.
+        const offTrack = (scenesWithKeywords || []).filter(s =>
+            s && !scenesWithMedia.includes(s) && !s._presenterAnchor && !s.presenterInsert
+        );
+        const sweepUniverse = [
+            ...scenesWithMedia.filter(s => s && !s._presenterAnchor && !s.presenterInsert),
+            ...offTrack,
+        ];
+
+        let rescueResult = null;
+        try {
+            const { rescueUncovered } = require('../media/coverage-rescue');
+            rescueResult = await rescueUncovered({
+                scenes: sweepUniverse,
+                graphics: coverageCtx.graphics,
+                scriptContext,
+                nicheId: scriptContext?.nicheId || scriptContext?.niche || null,
+                downloadAllMedia,
+                log: { info: (m) => log.info(m), warn: (m) => log.warn(m), ok: (m) => log.ok(m), dim: (m) => log.dim(m) },
+            });
+        } catch (e) {
+            log.warn(`Coverage sweep failed: ${e.message} — scenes keep whatever they have`);
+        }
+
+        // ── Last rung before the give-up card ────────────────────────────────
+        // A scene the rescue could not fill used to get a generated slide
+        // reading "DOCUMENTARY CONTEXT". That is not a visual, and on screen it
+        // reads as a broken video. Meanwhile this build is normally holding
+        // twenty clips it already found, downloaded and vision-scored for other
+        // scenes of the same video. Handing the closest-matching one to the
+        // empty scene, at a different in-point, is real footage, on topic,
+        // already through every quality gate, free, and instant.
+        //
+        // It runs AFTER the rescue on purpose: searching for the scene's own
+        // footage is always better than reusing someone else's, so borrowing
+        // may only ever see what genuinely could not be found.
+        let borrowResult = null;
+        try {
+            const { borrowForUncovered } = require('../media/footage-borrow');
+            borrowResult = await borrowForUncovered({
+                scenes: sweepUniverse,
+                graphics: coverageCtx.graphics,
+                log: { info: (m) => log.info(m), warn: (m) => log.warn(m), ok: (m) => log.ok(m), dim: (m) => log.dim(m) },
+            });
+        } catch (e) {
+            log.warn(`Footage borrow failed: ${e.message} — scenes keep whatever they have`);
+        }
+
+        // An off-track scene that just gained real footage — whether the rescue
+        // found it or the borrow handed it over — has to join the base track or
+        // nothing will draw it. Same merge the presenter holds use.
+        if ((rescueResult && rescueResult.rescued > 0) || (borrowResult && borrowResult.borrowed > 0)) {
+            const joined = offTrack.filter(s => s.mediaFile && !scenesWithMedia.includes(s));
+            if (joined.length > 0) {
+                scenesWithMedia = [...scenesWithMedia, ...joined]
+                    .sort((a, b) => (Number(a.startTime) || 0) - (Number(b.startTime) || 0));
+                log.info(`   merged ${joined.length} refilled scene(s) back onto the base track`);
+            }
+        }
+
+        // Report what the viewer will actually see. `summarize` uses the same
+        // classifier the rescue and the borrow used, so this line cannot
+        // disagree with either. Borrowed scenes are counted apart from found
+        // ones: they render real footage, but the media system did not find it
+        // for them, and blurring the two would hide how much of the video is
+        // reuse — the exact dishonesty the coverage module exists to stop.
+        const { summarize } = require('../media/scene-coverage');
+        const cover = summarize(sweepUniverse, coverageCtx);
+        const reuseNote = cover.borrowed > 0
+            ? ` ${cover.borrowed} scene(s) reuse footage borrowed from elsewhere in this video.`
+            : '';
+        if (cover.uncovered > 0) {
+            log.warn(`Coverage audit: ${cover.uncovered}/${cover.total} scene(s) have no real footage `
+                + `(placeholder=${cover.placeholder}, orphanedGraphic=${cover.orphanedGraphic}, `
+                + `skippedLane=${cover.skippedLane}, empty=${cover.none}).${reuseNote}`);
+        } else {
+            log.ok(`Coverage audit: all ${cover.total} scene(s) covered `
+                + `(found=${cover.footage}, borrowed=${cover.borrowed}, `
+                + `graphic=${cover.graphic + cover.graphicOwner}).${reuseNote}`);
+        }
     }
 
     // Compact timeline indexes after carving while preserving the original

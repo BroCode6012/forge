@@ -11,6 +11,12 @@ const ICON_POSITIONS = new Set([
     'center-left',
     'center-right',
 ]);
+const ICON_EDITABLE_PROPERTIES = Object.freeze([
+    'color',
+    'position',
+    'scale',
+    'scaleMultiplier',
+]);
 
 function _sceneIndex(plan, scene) {
     return Math.max(0, (plan?.scenes || []).indexOf(scene));
@@ -118,12 +124,9 @@ function _resolveTargets(plan, scope, operation = {}) {
 }
 
 function _propertyCount(operation) {
-    return [
-        operation.color,
-        operation.position,
-        operation.scale,
-        operation.scaleMultiplier,
-    ].filter((value) => value !== undefined && value !== '').length;
+    return ICON_EDITABLE_PROPERTIES
+        .map((property) => operation[property])
+        .filter((value) => value !== undefined && value !== '').length;
 }
 
 function applySceneIconEdit(plan, scope, operation = {}, options = {}) {
@@ -212,6 +215,7 @@ function applySceneIconEdit(plan, scope, operation = {}, options = {}) {
 }
 
 module.exports = {
+    ICON_EDITABLE_PROPERTIES,
     ICON_POSITIONS: [...ICON_POSITIONS],
     applySceneIconEdit,
     iconMomentId,

@@ -1,6 +1,7 @@
 'use strict';
 
 const {
+    GRAPHIC_EDITABLE_PROPERTIES,
     editScopedGraphicContent,
     editScopedGraphicProperties,
     editScopedGraphicTextStyle,
@@ -8,9 +9,59 @@ const {
     regenerateScopedGraphics,
 } = require('../workers/graphics-editor');
 const {
+    FULLSCREEN_MG_TYPES,
+    STYLE_NAMES,
+} = require('../../ai-motion-graphics');
+const {
+    TEMPLATE_REGISTRY,
+    TEMPLATE_TYPES,
+} = require('../../ai-templates');
+const { MG_REGISTRY } = require('../../../render/mg-registry');
+const {
     COLOR_ALIASES,
     normalizeTextColor,
 } = require('../../../render/text-style-ranges');
+const {
+    GRAPHIC_SHELL_VALUES,
+    getGraphicShellRecipes,
+    parseGraphicShellInstruction,
+} = require('../../../render/graphic-shells');
+const {
+    array,
+    boolean: booleanField,
+    integer,
+    number,
+    object,
+    string,
+    tool,
+} = require('./capability-contract');
+
+const GRAPHIC_TYPES = [...new Set([
+    ...Object.keys(MG_REGISTRY || {}),
+    ...FULLSCREEN_MG_TYPES,
+    ...TEMPLATE_TYPES,
+])].sort();
+const GRAPHIC_ANIMATIONS = [...new Set([
+    ...Object.values(MG_REGISTRY || {}).flatMap((entry) => entry?.animations || []),
+    ...Object.values(TEMPLATE_REGISTRY || {}).flatMap((entry) => entry?.animations || []),
+])].sort();
+const GRAPHIC_VARIANTS = [...new Set([
+    ...Object.values(MG_REGISTRY || {}).flatMap((entry) => Object.keys(entry?.types || {})),
+    ...Object.values(TEMPLATE_REGISTRY || {}).flatMap((entry) => entry?.variants || []),
+])].sort();
+const GRAPHIC_SHELL_RECIPES = [
+    ...getGraphicShellRecipes().map((recipe) => recipe.id),
+    'custom',
+];
+const GRAPHIC_POSITIONS = [
+    'top-left',
+    'top-right',
+    'bottom-left',
+    'bottom-right',
+    'center-left',
+    'center-right',
+    'center',
+];
 
 const TYPE_ALIASES = [
     ['lowerThird', /\blower[\s-]?thirds?\b/i],
@@ -138,6 +189,96 @@ function _graphicTarget(request, text, fallback = '') {
         targetIds,
         label: String(label || '').trim(),
     };
+}
+
+function _registeredVariantsForType(type) {
+    return [...new Set([
+        ...Object.keys(MG_REGISTRY?.[type]?.types || {}),
+        ...(TEMPLATE_REGISTRY?.[type]?.variants || []),
+    ].map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+function _stableChoiceIndex(seed, length) {
+    if (length <= 1) return 0;
+    const value = String(seed || '');
+    let hash = 0;
+    for (let index = 0; index < value.length; index++) {
+        hash = ((hash * 31) + value.charCodeAt(index)) >>> 0;
+    }
+    return hash % length;
+}
+
+function _nextDifferent(values, current, seed = '') {
+    const pool = [...new Set((values || []).map((value) => String(value || '').trim()).filter(Boolean))];
+    if (!pool.length) return '';
+    const currentIndex = pool.indexOf(String(current || ''));
+    if (currentIndex >= 0) {
+        return pool.length > 1 ? pool[(currentIndex + 1) % pool.length] : '';
+    }
+    return pool[_stableChoiceIndex(seed, pool.length)] || pool[0] || '';
+}
+
+function _compatibleRestyleVariants(type, variants, itemCount) {
+    if (type !== 'statCard') return variants;
+    if (itemCount <= 1) return variants.includes('single') ? ['single'] : variants;
+    if (itemCount === 2) {
+        const twoStat = variants.filter((variant) => ['sideBySide', 'stacked'].includes(variant));
+        return twoStat.length ? twoStat : variants;
+    }
+    return variants;
+}
+
+function _parseAlternateStyleInstruction(text, directives = {}, request = {}, plan = {}) {
+    const raw = String(text || '').trim();
+    const alternateIntent = (
+        /\b(?:another|different|new|alternate|alternative|fresh)\s+(?:visual\s+)?(?:style|look|design|layout|presentation)\b/i.test(raw)
+        || /\b(?:restyle|re-style|redesign|re-design)\b/i.test(raw)
+        || /\b(?:change|switch|update)\b.{0,36}\b(?:style|look|design|layout)\b/i.test(raw)
+    );
+    if (!alternateIntent) return null;
+
+    const target = _graphicTarget(request, raw, directives?.graphics?.requestedType || '');
+    if (!target.targetType || !_hasExplicitVisualSelection(request)) return null;
+
+    let candidates = inspectScopedGraphics(plan, request.scope);
+    if (target.targetIds.length) {
+        const targetIds = new Set(target.targetIds.map(String));
+        candidates = candidates.filter((graphic) => targetIds.has(String(graphic.id || '')));
+    }
+    const wantedType = String(target.targetType).toLowerCase().replace(/[^a-z0-9]+/g, '');
+    candidates = candidates.filter((graphic) => (
+        String(graphic.type || '').toLowerCase().replace(/[^a-z0-9]+/g, '') === wantedType
+    ));
+    if (candidates.length !== 1) return null;
+
+    const current = candidates[0];
+    const args = {
+        targetType: target.targetType,
+        targetIds: [String(current.id || target.targetIds[0] || '')].filter(Boolean),
+        all: false,
+    };
+    const style = _nextDifferent(
+        STYLE_NAMES,
+        current.style,
+        `${current.id}:${current.type}:${current.style}`
+    );
+    if (style && style !== current.style) args.style = style;
+
+    const variants = _compatibleRestyleVariants(
+        target.targetType,
+        _registeredVariantsForType(target.targetType),
+        Number(current.itemCount) || 0
+    );
+    const variant = _nextDifferent(
+        variants,
+        current.variant,
+        `${current.id}:${current.type}:${current.variant}`
+    );
+    if (variant && variant !== current.variant) args.variant = variant;
+
+    return Object.keys(args).some((key) => !['targetType', 'targetIds', 'all'].includes(key))
+        ? args
+        : null;
 }
 
 function _requestExplicitlyTargetsSceneIcons(request) {
@@ -298,6 +439,7 @@ function _operation(graphics, request) {
         },
         scope: request.scope,
         risk: 'moderate',
+        exclusiveCapability: request.scope?.kind === 'visual',
         description: action === 'reduce' ? 'reduce graphics in the selected scope' : 'author motion graphics for the selected scope',
         progress: {
             phase: 'graphics',
@@ -381,6 +523,172 @@ const ANIMATION_ALIASES = [
     ['cascade', /\bcascade\b/i],
     ['staggerSlide', /\bstagger(?:ed)?\s+slide\b/i],
 ];
+
+function _normalizedIdentifierWords(value) {
+    return String(value || '')
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/[^a-z0-9]+/gi, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+function _registeredAnimationFromText(value) {
+    const haystack = ` ${_normalizedIdentifierWords(value)} `;
+    return [...GRAPHIC_ANIMATIONS]
+        .sort((left, right) => (
+            _normalizedIdentifierWords(right).length - _normalizedIdentifierWords(left).length
+        ))
+        .find((animation) => {
+            const phrase = _normalizedIdentifierWords(animation);
+            return phrase && haystack.includes(` ${phrase} `);
+        }) || '';
+}
+
+const GRAPHIC_TARGET_FIELDS = {
+    targetType: string({ enum: GRAPHIC_TYPES }),
+    type: string({ enum: GRAPHIC_TYPES }),
+    graphicType: string({ enum: GRAPHIC_TYPES }),
+    targetIds: array(string({ minLength: 1, maxLength: 500 }), { maxItems: 120, uniqueItems: true }),
+    all: booleanField(),
+};
+
+const GRAPHIC_PROPERTY_FIELD_SCHEMAS = {
+    position: string({ enum: GRAPHIC_POSITIONS }),
+    animation: string({ enum: GRAPHIC_ANIMATIONS }),
+    animationSpeed: number({ min: 0.25, max: 3 }),
+    animationSpeedScale: number({ min: 0.1, max: 4 }),
+    style: string({ enum: STYLE_NAMES }),
+    variant: string({ enum: GRAPHIC_VARIANTS }),
+    graphicShell: object({
+        preset: string({ enum: GRAPHIC_SHELL_RECIPES }),
+        surface: string({ enum: GRAPHIC_SHELL_VALUES.surface }),
+        accent: string({ enum: GRAPHIC_SHELL_VALUES.accent }),
+        geometry: string({ enum: GRAPHIC_SHELL_VALUES.geometry }),
+        hierarchy: string({ enum: GRAPHIC_SHELL_VALUES.hierarchy }),
+        width: string({ enum: GRAPHIC_SHELL_VALUES.width }),
+        emphasis: string({ enum: GRAPHIC_SHELL_VALUES.emphasis }),
+    }, {
+        minProperties: 1,
+        description: 'Theme-independent structural shell. The theme continues to own color and typography.',
+    }),
+    background: string({ maxLength: 160 }),
+    transparentBackground: booleanField(),
+    accentRuleVisible: booleanField(),
+    backgroundColor: string({ format: 'color' }),
+    cardStyle: string({ maxLength: 80 }),
+    textColor: string({ format: 'color' }),
+    shadowStrength: number({ min: 0, max: 1 }),
+    durationSeconds: number({ min: 0.5, max: 120 }),
+    durationScale: number({ min: 0.1, max: 4 }),
+};
+const GRAPHIC_PRIMARY_PROPERTIES = GRAPHIC_EDITABLE_PROPERTIES.filter((property) => (
+    property !== 'cardStyle'
+));
+for (const property of GRAPHIC_EDITABLE_PROPERTIES) {
+    if (!GRAPHIC_PROPERTY_FIELD_SCHEMAS[property]) {
+        throw new Error(`Motion Graphics Editor property "${property}" has no capability schema`);
+    }
+}
+
+const GRAPHIC_PROPERTY_ARGS = object({
+    ...GRAPHIC_TARGET_FIELDS,
+    ...Object.fromEntries(GRAPHIC_EDITABLE_PROPERTIES.map((property) => [
+        property,
+        GRAPHIC_PROPERTY_FIELD_SCHEMAS[property],
+    ])),
+    color: string({ format: 'color' }),
+    fill: string({ format: 'color' }),
+    duration: number({ min: 0.5, max: 120 }),
+}, {
+    anyOfRequired: [
+        ...GRAPHIC_PRIMARY_PROPERTIES.map((property) => [property]),
+        ['color'],
+        ['fill'],
+        ['duration'],
+    ],
+});
+
+const GRAPHIC_STYLE_ARGS = object({
+    ...GRAPHIC_TARGET_FIELDS,
+    matchText: string({ maxLength: 1_000 }),
+    text: string({ maxLength: 1_000 }),
+    phrase: string({ maxLength: 1_000 }),
+    wholeText: booleanField(),
+    color: string({ format: 'color' }),
+    textColor: string({ format: 'color' }),
+    fill: string({ format: 'color' }),
+    colorName: string({ maxLength: 120 }),
+    occurrence: integer({ min: 0, max: 10_000 }),
+    allOccurrences: booleanField(),
+}, {
+    anyOfRequired: [['color'], ['textColor'], ['fill']],
+});
+
+const GRAPHIC_CONTENT_ARGS = object({
+    ...GRAPHIC_TARGET_FIELDS,
+    text: string({ minLength: 1, maxLength: 2_000 }),
+    content: string({ minLength: 1, maxLength: 2_000 }),
+    copy: string({ minLength: 1, maxLength: 2_000 }),
+    mode: string({ enum: ['set', 'retain'] }),
+    clearSubtext: booleanField(),
+    only: booleanField(),
+}, {
+    anyOfRequired: [['text'], ['content'], ['copy']],
+});
+
+const GRAPHIC_GENERATION_ARGS = object({
+    action: string({ enum: ['add', 'regenerate', 'reduce'] }),
+    requestedType: string({ enum: ['', ...GRAPHIC_TYPES] }),
+    instruction: string({ maxLength: 2_000 }),
+    fewer: booleanField(),
+    effort: string({ enum: ['', 'fast', 'smart'] }),
+});
+
+function tools() {
+    return [
+        tool('edit-properties', 'Edit existing graphic geometry, timing, animation, structural shell, background, or style in place.', GRAPHIC_PROPERTY_ARGS, {
+            visualTargets: ['graphic'],
+            visualRepair: true,
+            visualRepairFields: [
+                'targetType',
+                'targetIds',
+                'all',
+                'position',
+                'graphicShell',
+                'background',
+                'transparentBackground',
+                'backgroundColor',
+                'cardStyle',
+                'accentRuleVisible',
+                'textColor',
+                'shadowStrength',
+            ],
+        }),
+        tool('set-position', 'Move an existing graphic to a supported safe zone.', GRAPHIC_PROPERTY_ARGS, { canonicalAction: 'edit-properties' }),
+        tool('set-animation', 'Set an animation supported by the live graphics registries.', GRAPHIC_PROPERTY_ARGS, { canonicalAction: 'edit-properties' }),
+        tool('set-background', 'Edit an existing graphic background without regenerating it.', GRAPHIC_PROPERTY_ARGS, { canonicalAction: 'edit-properties' }),
+        tool('set-graphic-style', 'Set an existing graphic style or variant.', GRAPHIC_PROPERTY_ARGS, { canonicalAction: 'edit-properties' }),
+        tool('set-duration', 'Set or scale an existing graphic on-screen duration.', GRAPHIC_PROPERTY_ARGS, { canonicalAction: 'edit-properties' }),
+        tool('edit-text-style', 'Edit only matching text style inside an existing graphic.', GRAPHIC_STYLE_ARGS, {
+            visualTargets: ['graphic'],
+            visualImpact: true,
+        }),
+        tool('set-text-color', 'Set existing graphic text color in place.', GRAPHIC_STYLE_ARGS, { canonicalAction: 'edit-text-style' }),
+        tool('recolor-text', 'Recolor matching existing graphic text in place.', GRAPHIC_STYLE_ARGS, { canonicalAction: 'edit-text-style' }),
+        tool('style-text', 'Edit matching graphic text style.', GRAPHIC_STYLE_ARGS, { canonicalAction: 'edit-text-style' }),
+        tool('edit-content', 'Edit existing graphic copy without changing its design.', GRAPHIC_CONTENT_ARGS, {
+            visualTargets: ['graphic'],
+            visualImpact: true,
+        }),
+        tool('set-text', 'Replace existing graphic wording in place.', GRAPHIC_CONTENT_ARGS, { canonicalAction: 'edit-content' }),
+        tool('update-copy', 'Update existing graphic copy in place.', GRAPHIC_CONTENT_ARGS, { canonicalAction: 'edit-content' }),
+        tool('add', 'Author a renderer-supported graphic in the active scope.', GRAPHIC_GENERATION_ARGS, { visualImpact: true }),
+        tool('regenerate', 'Regenerate scoped graphics with renderer-supported types.', GRAPHIC_GENERATION_ARGS, { visualImpact: true }),
+        tool('reduce', 'Reduce scoped graphic density.', GRAPHIC_GENERATION_ARGS, { visualImpact: true }),
+        tool('add-graphic', 'Author a renderer-supported graphic in the active scope.', GRAPHIC_GENERATION_ARGS, { canonicalAction: 'add' }),
+        tool('regenerate-graphic', 'Regenerate scoped graphics.', GRAPHIC_GENERATION_ARGS, { canonicalAction: 'regenerate' }),
+    ];
+}
 
 function _parseDurationInstruction(text) {
     const raw = String(text || '');
@@ -485,7 +793,10 @@ function _parsePropertyInstruction(text, directives = {}, request = {}) {
 
     const motionIntent = /\b(?:animation|motion|entrance|animate)\b/i.test(raw);
     if (motionIntent) {
-        const namedAnimation = ANIMATION_ALIASES.find(([, pattern]) => pattern.test(raw))?.[0] || '';
+        const namedAnimation = (
+            _registeredAnimationFromText(raw)
+            || ANIMATION_ALIASES.find(([, pattern]) => pattern.test(raw))?.[0]
+        );
         if (
             namedAnimation
             && !/\b(?:remove|disable|without|no)\b.{0,24}\b(?:animation|motion|entrance)\b/i.test(raw)
@@ -514,7 +825,21 @@ function _parsePropertyInstruction(text, directives = {}, request = {}) {
     const style = raw.match(/\b(?:style|look)\b.{0,12}\b(?:to|as)\s+(clean|bold|minimal|neon|cinematic|elegant)\b/i);
     if (style) args.style = style[1].toLowerCase();
     const variant = raw.match(/\b(?:variant|template|layout)\b.{0,12}\b(?:to|as)\s+([a-z][a-z0-9-]{1,40})\b/i);
-    if (variant) args.variant = variant[1];
+    if (
+        variant
+        && _registeredVariantsForType(targetType).includes(variant[1])
+    ) args.variant = variant[1];
+    const graphicShell = parseGraphicShellInstruction(raw);
+    if (graphicShell) {
+        args.graphicShell = Object.fromEntries(
+            Object.entries(graphicShell)
+                .filter(([key, value]) => (
+                    ['preset', 'surface', 'accent', 'geometry', 'hierarchy', 'width', 'emphasis'].includes(key)
+                    && value != null
+                    && value !== ''
+                ))
+        );
+    }
 
     if (/\b(?:remove|disable|no)\s+(?:the\s+)?shadow\b/i.test(raw)) {
         args.shadowStrength = 0;
@@ -529,7 +854,7 @@ function _parsePropertyInstruction(text, directives = {}, request = {}) {
     return args;
 }
 
-function planFast({ text, directives, request }) {
+function planFast({ text, directives, request, plan }) {
     if (_requestExplicitlyTargetsSceneIcons(request)) {
         return { operations: [], claimedDirectiveKeys: [] };
     }
@@ -560,6 +885,28 @@ function planFast({ text, directives, request }) {
             claimedDirectiveKeys: ['graphics'],
             supported: [
                 `Motion Graphics Editor: update existing ${propertyEdit.targetType} properties in place`,
+            ],
+        };
+    }
+    const alternateStyleEdit = _parseAlternateStyleInstruction(
+        text,
+        directives,
+        request,
+        plan
+    );
+    if (alternateStyleEdit) {
+        return {
+            operations: [{
+                ..._propertiesOperation(
+                    alternateStyleEdit,
+                    request,
+                    `restyle the selected ${alternateStyleEdit.targetType} in place while preserving its content, timing, and identity`
+                ),
+                authoritativeSummary: true,
+            }],
+            claimedDirectiveKeys: ['graphics'],
+            supported: [
+                `Motion Graphics Editor: restyle the selected ${alternateStyleEdit.targetType} in place`,
             ],
         };
     }
@@ -619,9 +966,24 @@ function normalizeInvocation(invocation, context) {
         if (Number.isFinite(Number(source.animationSpeed))) args.animationSpeed = Number(source.animationSpeed);
         if (Number.isFinite(Number(source.animationSpeedScale))) args.animationSpeedScale = Number(source.animationSpeedScale);
         if (source.style) args.style = String(source.style).slice(0, 80);
-        if (source.variant) args.variant = String(source.variant).slice(0, 80);
+        if (
+            source.variant
+            && _registeredVariantsForType(targetType).includes(String(source.variant))
+        ) args.variant = String(source.variant).slice(0, 80);
+        if (source.graphicShell && typeof source.graphicShell === 'object') {
+            args.graphicShell = Object.fromEntries(
+                Object.entries(source.graphicShell)
+                    .filter(([key, value]) => (
+                        ['preset', 'surface', 'accent', 'geometry', 'hierarchy', 'width', 'emphasis'].includes(key)
+                        && value != null
+                        && value !== ''
+                    ))
+                    .map(([key, value]) => [key, String(value)])
+            );
+        }
         if (source.background) args.background = String(source.background).slice(0, 160);
         if (source.transparentBackground === true) args.transparentBackground = true;
+        if (source.cardStyle) args.cardStyle = String(source.cardStyle).slice(0, 80);
         if (typeof source.accentRuleVisible === 'boolean') {
             args.accentRuleVisible = source.accentRuleVisible;
         }
@@ -704,6 +1066,7 @@ function normalizeInvocation(invocation, context) {
 
 function manifest() {
     return {
+        contractVersion: 2,
         id: 'graphics',
         specialist: 'Motion Graphics Editor',
         domain: 'motion-graphics',
@@ -732,26 +1095,26 @@ function manifest() {
         ],
         directiveKeys: ['graphics', 'maps'],
         vocabulary: {
-            properties: [
-                'position',
-                'animation',
-                'animationSpeed',
-                'style',
-                'variant',
-                'transparentBackground',
-                'backgroundColor',
-                'textColor',
-                'shadowStrength',
-                'accentRuleVisible',
-                'durationSeconds',
-                'durationScale',
-            ],
-            animations: ANIMATION_ALIASES.map(([id]) => id),
+            types: GRAPHIC_TYPES,
+            properties: GRAPHIC_EDITABLE_PROPERTIES,
+            animations: GRAPHIC_ANIMATIONS,
+            variants: GRAPHIC_VARIANTS,
+            graphicShells: {
+                dimensions: GRAPHIC_SHELL_VALUES,
+                recipes: getGraphicShellRecipes(),
+                note: 'Structural only. Theme colors and fonts remain independent and adaptive.',
+            },
+            styles: STYLE_NAMES,
+            positions: GRAPHIC_POSITIONS,
         },
         examples: [
             'Make only 50 Years red without changing the lower-third design',
             'Change this selected graphic text color to #ef4444',
             'Make the headline background transparent, its text white, and use a typewriter animation',
+            'Give this headline an outline shell but keep the current theme colors',
+            'Use a split-label structure for the selected graphic',
+            'Give this selected graphic another style while keeping its content and timing',
+            'Make this callout a clean underline structure without changing its font or palette',
             'Remove the decorative accent bar beside this headline',
             'Make this headline duration 35 percent shorter',
             'Edit the lower third to keep only $300',
@@ -809,4 +1172,5 @@ module.exports = {
     manifest,
     normalizeInvocation,
     planFast,
+    tools,
 };

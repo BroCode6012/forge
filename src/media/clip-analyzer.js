@@ -153,9 +153,45 @@ function _clampInt(value, min, max) {
 }
 
 const _PREMIUM_STOCK_RE = /\b(storyblocks)\b/i;
+/**
+ * The full request, before it was shortened to fit a provider's search box.
+ *
+ * A provider query has to be short, so "thermometer inside dark earthen root
+ * cellar" ships as "thermometer inside dark root cellar". Grading the clip
+ * against the shortened form is how a perfect root-cellar shot gets binned for
+ * "not matching". Emitted only when it actually differs from the keyword.
+ */
+function _requestedVisualLine(context = {}, keyword = '') {
+    const wanted = String(context?.visualIntent || '').trim();
+    if (!wanted) return '';
+    if (wanted.toLowerCase() === String(keyword || '').trim().toLowerCase()) return '';
+    return `WHAT WAS ACTUALLY REQUESTED (full request; the search keyword is a shortened form of this): "${wanted}"`;
+}
+
 function _isPremiumStockProvider(name) {
     return typeof name === 'string' && _PREMIUM_STOCK_RE.test(name);
 }
+
+/**
+ * Did this scene's own brief ask for a drawn explanation? Resolved once per
+ * scene by media-hunter (see media/packaging-intent.js) and carried on the
+ * profile, so nothing is re-derived or re-guessed here.
+ *
+ * `strictRaw` stays ON either way — the scene still wants no anchors, no lower
+ * thirds, no thumbnails. The only thing that changes is that we stop telling the
+ * judge to bin the exact artefact we sent it looking for.
+ */
+function _wantsGraphic(mediaHunter) {
+    return !!mediaHunter?.requestedPackaging?.graphic;
+}
+
+/**
+ * The instruction that REPLACES the blanket graphic rejection on a scene whose
+ * request is itself a graphic. Same slot in the prompt, opposite polarity: the
+ * broadcast packaging we never want is still named, the drawn explanation we
+ * asked for is not.
+ */
+const REQUESTED_GRAPHIC_RULE = '- This scene REQUESTED a drawn explanation (diagram / cross-section / schematic / chart). Score a clear, on-topic diagram or cutaway as good B-roll — its labels, dimensions and callouts are part of what was asked for, not defects. Still score 2 or lower for anchors, presenters, commentators, picture-in-picture faces, channel logos, news tickers, thumbnails, or a graphic about a DIFFERENT subject.';
 
 function _isPromisingSegmentCandidate(context = {}) {
     const hunter = context.mediaHunter || {};
@@ -452,6 +488,7 @@ async function analyzeClip(filePath, duration, keyword, context = {}) {
 
     const contextBlock = [
         context.videoTopic ? `Video topic: "${context.videoTopic}"` : '',
+        _requestedVisualLine(context, keyword),
         context.sceneText ? `Scene narration: "${context.sceneText}"` : '',
         context.niche ? `Niche: ${context.niche}` : '',
         context.sourceTitle ? `Source title/page: "${context.sourceTitle}"` : '',
@@ -467,13 +504,15 @@ async function analyzeClip(filePath, duration, keyword, context = {}) {
     ].filter(Boolean).join('\n');
     const mediaHunter = context.mediaHunter || null;
     const premiumStock = _isPremiumStockProvider(context.sourceProvider);
+    const wantsGraphic = _wantsGraphic(mediaHunter);
     const hunterBlock = mediaHunter ? `
 MEDIA HUNTER TARGET:
 - Target visual: ${mediaHunter.targetDescription || 'literal usable B-roll'}
 - Mode: ${mediaHunter.mode || 'literal'} | strict raw footage: ${mediaHunter.strictRaw ? 'YES' : 'NO'}
 ${mediaHunter.prefer?.length ? `- Prefer visible: ${mediaHunter.prefer.slice(0, 8).join(', ')}` : ''}
 ${mediaHunter.avoid?.length ? `- Avoid/reject: ${mediaHunter.avoid.slice(0, 10).join(', ')}` : ''}
-${mediaHunter.strictRaw && !mediaHunter.allowGraphics ? '- If the clip is mainly anchors, presenters, commentators, picture-in-picture faces, subtitles, lower thirds, maps/satellite screenshots, route graphics, charts, infographics, thumbnails, or animated explainers, score it 2 or lower. Clean footage of a named/relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when they are the subject, not the presenter.' : ''}
+${mediaHunter.strictRaw && !mediaHunter.allowGraphics && !wantsGraphic ? '- If the clip is mainly anchors, presenters, commentators, picture-in-picture faces, subtitles, lower thirds, maps/satellite screenshots, route graphics, charts, infographics, thumbnails, or animated explainers, score it 2 or lower. Clean footage of a named/relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when they are the subject, not the presenter.' : ''}
+${mediaHunter.strictRaw && !mediaHunter.allowGraphics && wantsGraphic ? REQUESTED_GRAPHIC_RULE : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && premiumStock ? `- EXCEPTION: this clip is from ${context.sourceProvider} (premium stock library). If it is a clean reference MAP/satellite/route diagram, 3D map, or map animation that VISIBLY shows the topic's actual place/region/route (e.g. the scene names "Bab el-Mandeb shipping lane" and the map labels Bab el-Mandeb, Red Sea, Suez), score it 6-8 as accurate B-roll. Cartoons, illustrations, non-map animated explainers, and generic world maps that do not visibly depict the topic are NOT exempt.` : ''}
 ${mediaHunter.allowScreen ? '- Screen/device/interface footage is allowed if it directly fits the scene.' : ''}` : '';
 
@@ -536,6 +575,29 @@ SCORE: <1-10 number>`;
 }
 
 /**
+ * Read a score out of a single line that is *meant to be* the score line.
+ *
+ * Twin of `_scoreFromScoreLine` in vision/ai-vision.js — same bug shape, same
+ * fix shape. Tolerates the decoration models actually emit around the number
+ * ("**SCORE: 7**", "- Score: 7/10", "7."), while refusing any line that carries
+ * extra words or extra digits, so "4K", "3 workers", "2019" and "100" can never
+ * be misread as a score.
+ *
+ * Returns an integer 0-10, or null when the line is not a score line.
+ */
+function _scoreFromClipLine(line) {
+    const cleaned = String(line || '')
+        .replace(/[*_`~#>[\]]/g, '')
+        .replace(/^[\s\-•–—]+/, '')
+        .trim();
+    if (!cleaned) return null;
+    const m = cleaned.match(/^(?:(?:final|overall)\s+)?(?:score|rating)?\s*[:=-]?\s*(10|\d)\s*(?:\/\s*10)?\s*[.!]?$/i);
+    if (!m) return null;
+    const n = parseInt(m[1], 10);
+    return Number.isFinite(n) ? n : null;
+}
+
+/**
  * Parse the structured analysis response.
  */
 function _parseClipAnalysis(response) {
@@ -543,7 +605,13 @@ function _parseClipAnalysis(response) {
 
     const lines = response.trim().split('\n');
     const result = {
-        score: 0,
+        // null = "not read yet" — NEVER 0. Every parse path below clamps with
+        // Math.max(1, …), so a score that WAS read can never come out as 0; using
+        // 0 as the sentinel made "I could not read the answer" indistinguishable
+        // from a real verdict, and a good clip got binned for the model's
+        // formatting. Coerced back to 0 (+ parseError) on the way out, so every
+        // caller's contract is unchanged.
+        score: null,
         description: '',
         relevance: '',
         issues: [],
@@ -571,15 +639,47 @@ function _parseClipAnalysis(response) {
                 result.trimSuggestion = trimStr;
             }
         } else if (lower.startsWith('score:')) {
+            // Strict original form FIRST, so every response that parsed before
+            // still parses to exactly the same value.
             const numMatch = line.match(/(\d+)/);
             if (numMatch) result.score = Math.min(10, Math.max(1, parseInt(numMatch[1])));
+        } else if (result.score === null) {
+            // The same line wearing decoration the strict prefix above cannot
+            // see ("**SCORE: 7**", "- Score: 7/10"), or a bare "7" on its own
+            // line. A later real SCORE: line still overrides this.
+            const tolerant = _scoreFromClipLine(line);
+            if (tolerant !== null) result.score = Math.min(10, Math.max(1, tolerant));
         }
     }
 
-    // Fallback score extraction
-    if (result.score === 0) {
-        const anyNum = response.match(/(\d+)\s*(?:\/\s*10)?/);
-        if (anyNum) result.score = Math.min(10, Math.max(1, parseInt(anyNum[1])));
+    // Fallback: an explicitly score-shaped number. The old fallback here took the
+    // FIRST number anywhere in the reply, so "4K aerial drone shot" scored 4 and
+    // "3 workers laying pipe" scored 3 — a clip binned on a number that was never
+    // a score. Anchored forms only: a score/rating label, a lone number on its
+    // own line, or an explicit N/10.
+    if (result.score === null) {
+        const scoreLike = response.match(/(?:score|rating)\D{0,16}(10|[0-9])\s*(?:\/\s*10)?/i)
+            || response.match(/(?:^|\n)\s*(10|[0-9])\s*(?:\/\s*10)?\s*$/m)
+            || response.match(/\b(10|[0-9])\s*\/\s*10\b/);
+        if (scoreLike) result.score = Math.min(10, Math.max(1, parseInt(scoreLike[1])));
+    }
+
+    // Last resort: the model merged the score onto the end of its last line
+    // ("… soil layers. 7" / "… soil layers — 7/10"). A punctuation separator is
+    // REQUIRED so this can never lift a number out of prose ("Route 66.").
+    if (result.score === null && lines.length) {
+        const tail = String(lines[lines.length - 1] || '').replace(/[*_`]/g, '').trim();
+        const merged = tail.match(/[.!?:;—–-]\s*(10|\d)\s*(?:\/\s*10)?\s*[.!]?$/);
+        if (merged) result.score = Math.min(10, Math.max(1, parseInt(merged[1])));
+    }
+
+    if (result.score === null) {
+        // Truly unreadable. Externally the contract is unchanged (score 0), but
+        // parseError now says WHY — footage-manager already forwards it into
+        // applyVisionScoreSanity, which can rescue the clip from its description
+        // instead of binning it. A parse failure is NOT an API failure.
+        result.score = 0;
+        result.parseError = true;
     }
 
     return result;
@@ -875,6 +975,7 @@ async function findBestSegment(streamUrl, totalDuration, neededDuration, keyword
 
     const contextBlock = [
         context.videoTopic ? `Video topic: "${context.videoTopic}"` : '',
+        _requestedVisualLine(context, keyword),
         context.sceneText ? `Scene narration: "${context.sceneText}"` : '',
         context.niche ? `Niche: ${context.niche}` : '',
         context.sourceTitle ? `Source title/page: "${context.sourceTitle}"` : '',
@@ -890,13 +991,15 @@ async function findBestSegment(streamUrl, totalDuration, neededDuration, keyword
     const nicheRules = _getNicheSegmentRules(context.niche || '');
     const premiumStockSegment = _isPremiumStockProvider(context.sourceProvider);
     const priorityChannelSegment = !!context.priorityChannel;
+    const wantsGraphicSegment = _wantsGraphic(mediaHunter);
     const hunterRules = mediaHunter ? `
 MEDIA HUNTER TARGET:
 - Target visual: ${mediaHunter.targetDescription || 'literal usable B-roll'}
 - Mode: ${mediaHunter.mode || 'literal'} | strict raw footage: ${mediaHunter.strictRaw ? 'YES' : 'NO'}
 ${mediaHunter.prefer?.length ? `- Prefer visible: ${mediaHunter.prefer.slice(0, 8).join(', ')}` : ''}
 ${mediaHunter.avoid?.length ? `- Avoid/reject: ${mediaHunter.avoid.slice(0, 10).join(', ')}` : ''}
-${mediaHunter.strictRaw && !mediaHunter.allowGraphics ? '- If a frame is mainly an anchor, presenter, commentator, picture-in-picture face, subtitle/lower-third, map/satellite screenshot, route graphic, chart, infographic, thumbnail, or animated explainer, reject it even when the topic text matches. Clean footage of a named/relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when they are the subject, not the presenter.' : ''}
+${mediaHunter.strictRaw && !mediaHunter.allowGraphics && !wantsGraphicSegment ? '- If a frame is mainly an anchor, presenter, commentator, picture-in-picture face, subtitle/lower-third, map/satellite screenshot, route graphic, chart, infographic, thumbnail, or animated explainer, reject it even when the topic text matches. Clean footage of a named/relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when they are the subject, not the presenter.' : ''}
+${mediaHunter.strictRaw && !mediaHunter.allowGraphics && wantsGraphicSegment ? REQUESTED_GRAPHIC_RULE : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics ? '- Segment hunt rule: prefer exact keyword matches, but accept clean raw domain B-roll that matches the target visual and video topic when the exact place/event label is not visibly provable from the frame.' : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && premiumStockSegment ? `- EXCEPTION: this video is from ${context.sourceProvider} (premium stock library). A clean reference MAP/satellite/route diagram, 3D map, or map animation is ACCEPTABLE when it VISIBLY labels the topic's actual place/region/route. Cartoons, illustrations, non-map animated explainers, and generic world maps without topic labels are NOT exempt.` : ''}
 ${priorityChannelSegment ? '- PRIORITY CHANNEL EXCEPTION: this clip is from a trusted news channel for this niche. Treat baked-in channel logos, news-agency stamps, lower-third banners, and on-screen story captions as INTRINSIC broadcast graphics, NOT watermarks — DO NOT reject for them. Also treat subject-family equivalents within the scene domain as acceptable matches (e.g. for maritime keywords, cargo ship / container ship / oil tanker / bulk carrier / vessel / freighter are all valid; for military keywords, troops / soldiers / convoy / armored vehicle / military aircraft are interchangeable). Reject only when the frame shows a presenter face, animated/illustrated explainer, or a completely unrelated topic.' : ''}
@@ -1092,6 +1195,7 @@ async function validateSegmentWindow(streamUrl, totalDuration, startTime, needed
 
     const contextBlock = [
         context.videoTopic ? `Video topic: "${context.videoTopic}"` : '',
+        _requestedVisualLine(context, keyword),
         context.sceneText ? `Scene narration: "${context.sceneText}"` : '',
         context.niche ? `Niche: ${context.niche}` : '',
         context.sourceTitle ? `Source title/page: "${context.sourceTitle}"` : '',
@@ -1106,13 +1210,15 @@ async function validateSegmentWindow(streamUrl, totalDuration, startTime, needed
 
     const premiumStockWindow = _isPremiumStockProvider(context.sourceProvider);
     const priorityChannelWindow = !!context.priorityChannel;
+    const wantsGraphicWindow = _wantsGraphic(mediaHunter);
     const hunterRules = mediaHunter ? `
 MEDIA HUNTER TARGET:
 - Target visual: ${mediaHunter.targetDescription || 'literal usable B-roll'}
 - Mode: ${mediaHunter.mode || 'literal'} | strict raw footage: ${mediaHunter.strictRaw ? 'YES' : 'NO'}
 ${mediaHunter.prefer?.length ? `- Prefer visible: ${mediaHunter.prefer.slice(0, 8).join(', ')}` : ''}
 ${mediaHunter.avoid?.length ? `- Avoid/reject: ${mediaHunter.avoid.slice(0, 10).join(', ')}` : ''}
-${mediaHunter.strictRaw && !mediaHunter.allowGraphics ? '- This is strict raw footage. Reject if any frame is mainly an anchor, presenter, commentator, picture-in-picture face, subtitle/lower-third, big text overlay, map/satellite screenshot, route graphic, chart, infographic, thumbnail, or animated explainer. Clean footage of a named/relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when they are the subject, not the presenter.' : ''}
+${mediaHunter.strictRaw && !mediaHunter.allowGraphics && !wantsGraphicWindow ? '- This is strict raw footage. Reject if any frame is mainly an anchor, presenter, commentator, picture-in-picture face, subtitle/lower-third, big text overlay, map/satellite screenshot, route graphic, chart, infographic, thumbnail, or animated explainer. Clean footage of a named/relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when they are the subject, not the presenter.' : ''}
+${mediaHunter.strictRaw && !mediaHunter.allowGraphics && wantsGraphicWindow ? REQUESTED_GRAPHIC_RULE : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && premiumStockWindow ? `- EXCEPTION: this clip is from ${context.sourceProvider} (premium stock library). PASS the window when it is a clean reference MAP/satellite/route diagram, 3D map, or map animation that VISIBLY labels the topic's actual place/region/route. Cartoons, illustrations, non-map animated explainers, and generic world maps without topic labels are NOT exempt.` : ''}
 ${priorityChannelWindow ? '- PRIORITY CHANNEL EXCEPTION: this window is from a trusted news channel for the scene niche. DO NOT REJECT for: baked-in channel logos, news-agency watermarks, lower-third banners, story-captions, foreign-language burned subtitles — these are intrinsic broadcast graphics, not packaging defects. Also accept subject-family equivalents within the scene domain (maritime: cargo ship / container ship / oil tanker / bulk carrier / vessel / freighter all interchangeable; military: troops / soldiers / armored vehicles / military aircraft interchangeable). Only REJECT for: presenter face on camera, animated/illustrated explainer, picture-in-picture commentary, or a hard cut to a completely unrelated topic.' : ''}
 ${mediaHunter.allowScreen ? '- Screen/device/interface footage is allowed if it directly fits the scene.' : ''}` : '';
@@ -1232,13 +1338,18 @@ function _parseWindowValidation(response, context = {}) {
     const raw = String(response || '').trim();
     const result = {
         ok: false,
-        score: 0,
+        // null = "not read yet", same sentinel rule as _parseClipAnalysis above.
+        // Coerced to 0 (+ parseError) before returning; null and 0 compare
+        // identically in every check below, so nothing downstream shifts.
+        score: null,
         reason: '',
         issues: [],
         raw,
     };
     if (!raw) {
         result.reason = 'empty validation response';
+        result.score = 0;
+        result.parseError = true;
         return result;
     }
 
@@ -1260,11 +1371,16 @@ function _parseWindowValidation(response, context = {}) {
         } else if (lower.startsWith('score:')) {
             const numMatch = trimmed.match(/(\d+(?:\.\d+)?)/);
             if (numMatch) result.score = Math.min(10, Math.max(1, Math.round(Number(numMatch[1]))));
+        } else if (result.score === null) {
+            const tolerant = _scoreFromClipLine(trimmed);
+            if (tolerant !== null) result.score = Math.min(10, Math.max(1, tolerant));
         }
     }
 
-    if (!result.score) {
-        const scoreMatch = raw.match(/score[^0-9]*(\d+(?:\.\d+)?)/i) || raw.match(/\b(\d+(?:\.\d+)?)\s*\/\s*10\b/);
+    if (result.score === null) {
+        const scoreMatch = raw.match(/score[^0-9]*(\d+(?:\.\d+)?)/i)
+            || raw.match(/\b(\d+(?:\.\d+)?)\s*\/\s*10\b/)
+            || raw.match(/(?:^|\n)\s*(10|[0-9])\s*$/m);
         if (scoreMatch) result.score = Math.min(10, Math.max(1, Math.round(Number(scoreMatch[1]))));
     }
 
@@ -1305,6 +1421,11 @@ function _parseWindowValidation(response, context = {}) {
         result.ok = false;
     } else {
         result.ok = Boolean(result.score >= 6 && !hardProblem);
+    }
+
+    if (result.score === null) {
+        result.score = 0;
+        result.parseError = true;
     }
 
     if (!result.reason) {
@@ -1352,4 +1473,9 @@ module.exports = {
     getOmniBudget,
     getStats,
     DEFAULTS,
+    // Exported for scripts/verify/vision-score-parse.js only — the score
+    // sentinel/parser is a regression-gated invariant, not a public API.
+    _parseClipAnalysis,
+    _parseWindowValidation,
+    _scoreFromClipLine,
 };

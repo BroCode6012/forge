@@ -14,6 +14,7 @@ const { runQualityLoop } = require('./quality-loop');
 const { cleanupStage } = require('./transaction-assets');
 const { runAutonomousOperations } = require('./autonomous-runner');
 const { runVisualObserver } = require('./visual-observer');
+const { verifyStableScopeTargets } = require('./scope-utils');
 const {
     groundVisualRequest,
     publicVisualGrounding,
@@ -689,10 +690,43 @@ async function executePlanned(planIdValue, current, opts = {}) {
         error.code = 'AGENT_PLAN_EXPIRED';
         throw error;
     }
-    if (Number(current?.revision) !== planned.baseRevision || String(current?.planHash || '') !== planned.basePlanHash) {
-        const error = new Error('The project changed after the Agent prepared this edit. Ask the Agent to plan it again.');
-        error.code = 'AGENT_PLAN_CONFLICT';
-        throw error;
+    const currentRevision = Number(current?.revision) || 0;
+    const currentPlanHash = String(current?.planHash || '');
+    const versionChanged = (
+        currentRevision !== planned.baseRevision
+        || currentPlanHash !== planned.basePlanHash
+    );
+    let versionRebase = null;
+    if (versionChanged) {
+        const rebaseCheck = opts.allowStableScopeRebase === true
+            ? verifyStableScopeTargets(current?.plan, planned.scope, {
+                operations: planned.operations,
+            })
+            : {
+                safe: false,
+                reason: 'stable-scope rebase was not enabled',
+                targetCount: 0,
+                missing: [],
+                ambiguous: [],
+            };
+        if (!rebaseCheck.safe) {
+            const error = new Error('The project changed after the Agent prepared this edit. Ask the Agent to plan it again.');
+            error.code = 'AGENT_PLAN_CONFLICT';
+            error.rebaseCheck = rebaseCheck;
+            throw error;
+        }
+        versionRebase = {
+            fromRevision: planned.baseRevision,
+            toRevision: currentRevision,
+            fromPlanHash: planned.basePlanHash,
+            toPlanHash: currentPlanHash,
+            targetCount: rebaseCheck.targetCount,
+        };
+        opts.progress?.(
+            'validate',
+            `Project refreshed; revalidated ${rebaseCheck.targetCount} exact scoped target${rebaseCheck.targetCount === 1 ? '' : 's'} before applying.`,
+            14
+        );
     }
 
     const beforePlan = _clone(current.plan);
@@ -708,7 +742,13 @@ async function executePlanned(planIdValue, current, opts = {}) {
     };
     let operationResults = [];
     let recoveries = [];
-    let decisionLog = [];
+    let decisionLog = versionRebase
+        ? [{
+            phase: 'version-rebase',
+            status: 'revalidated',
+            message: `Project revision advanced from ${versionRebase.fromRevision} to ${versionRebase.toRevision}; all ${versionRebase.targetCount} scoped target(s) still resolved exactly once.`,
+        }]
+        : [];
     let specialistChanged = 0;
     let structuralRange = null;
     let visualQa = null;
@@ -890,6 +930,7 @@ async function executePlanned(planIdValue, current, opts = {}) {
         decisionLog,
         capabilityIds: planned.capabilityIds || [],
         beforePlanHash: planned.basePlanHash,
+        versionRebase,
         stats: {
             perSceneChanged: (Number(result.changed) || 0) + specialistChanged,
             fixed: Array.isArray(result.report?.fixed) ? result.report.fixed.length : 0,

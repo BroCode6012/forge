@@ -30,6 +30,11 @@ const { callVisionAI } = require('../brain/ai-provider');
 const { normalizeUrlForDedup } = require('../util/url-utils');
 
 const _verdictCache = new Map(); // `${sceneKey}|${urlKey}` -> { keep, reason }
+// Deliberately NOT shared with _verdictCache. A gate verdict ("is this
+// packaged content?") and a screen verdict ("does this picture show the
+// subject?") answer different questions; letting one populate the other would
+// turn a ranking hint into a silent rejection, or vice versa.
+const _screenCache = new Map();  // `screen|${sceneKey}|${urlKey}` -> 'yes'|'no'|'unsure'
 const _serpCache = new Map();    // `yt|${normalizedQuery}` -> { buffer, mime, ts }
 const _SERP_TTL_MS = 30 * 60 * 1000;
 
@@ -401,6 +406,12 @@ async function _composeGrid(items) {
         const y = pad + r * (tileH + labelH + pad);
 
         try {
+            // Sniff BEFORE decoding — a TIFF segfaults @napi-rs/canvas outright,
+            // which this catch could never see. Thumbnails are arbitrary remote
+            // bytes, so treat an unknown format as a missing thumb, not a crash.
+            const { isCanvasSafeImage } = require('../util/image-bytes');
+            if (!isCanvasSafeImage(items[i].thumbBuffer)) throw new Error('unsafe image bytes');
+
             const img = await canvasLib.loadImage(items[i].thumbBuffer);
             ctx.drawImage(img, x, y, tileW, tileH);
         } catch (_) {
@@ -510,6 +521,200 @@ async function judgeThumbnailGrid(results, contract, scene, opts = {}) {
     return _buildReturn(results, decisions, providerName, 'judged');
 }
 
+// ───── Public: pre-download thumbnail SCREEN (ranking, never a gate) ─────
+
+/**
+ * Look at every candidate's free preview picture in ONE grid, ONE vision call,
+ * and race the ones that visibly show the subject first.
+ *
+ * WHY THIS IS A RANKING AND NOT A GATE. The scene only ever downloads the top
+ * few candidates, so re-ordering is the whole lever: promoting three good clips
+ * to the front is worth exactly as much as deleting the twenty bad ones behind
+ * them, and it cannot lose footage. A grid of 25 numbered tiles is also the
+ * shape where vision models mis-bind a verdict to the wrong tile number (the
+ * Storyboard Scout measured 2/8 on "which cell shows X", against 17/17 on
+ * plain presence). Under a gate, one mis-bound number silently deletes a good
+ * clip. Under a ranking, the worst case is a slightly wrong order.
+ *
+ * THE NO-POSITIVES GUARD is the other half of that reasoning. The screen earns
+ * its keep by promoting winners, so if it names no winner at all we do not
+ * trust its losers either — the list is returned exactly as it arrived. That
+ * makes the screen strictly non-destructive: it either helps or does nothing.
+ *
+ * Same one-call-per-grid economics as every other grid pass in the app: the
+ * cost is the call, not the pictures inside it.
+ */
+async function screenThumbnailGrid(results, contract, scene, opts = {}) {
+    const unchanged = { ranked: results || [], confirmed: [], saw: 0, missed: 0, unsure: 0, screened: 0, log: '' };
+    if (!Array.isArray(results) || results.length < 2) return unchanged;
+    if (String(process.env.MEDIA_THUMBNAIL_SCREEN || '').trim() === '0') return unchanged;
+    // No visual contract means no agreed target to compare a picture against.
+    if (!contract?.enabled) return unchanged;
+
+    const sceneKey = _sceneKey(scene);
+    const providerName = opts.providerName || 'provider';
+    const getThumbUrl = opts.getThumbUrl || ((r) => r?._thumbUrl || r?.thumbUrl || '');
+
+    const verdicts = new Map(); // result -> 'yes' | 'no' | 'unsure'
+    const pending = [];
+    for (const result of results) {
+        const thumbUrl = getThumbUrl(result);
+        if (!thumbUrl) continue; // unscreened — stays in the neutral band
+        const urlKey = _resultUrlKey(result) || `t:${_resultTitle(result).toLowerCase().slice(0, 80)}`;
+        const cacheKey = `screen|${sceneKey}|${urlKey}`;
+        if (_screenCache.has(cacheKey)) {
+            verdicts.set(result, _screenCache.get(cacheKey));
+            continue;
+        }
+        pending.push({ result, title: _resultTitle(result), thumbUrl, cacheKey });
+    }
+
+    if (pending.length > 0) {
+        const batch = pending.slice(0, _screenGridSize());
+
+        await Promise.all(batch.map(async item => {
+            try { item.thumbBuffer = await _fetchImageBuffer(item.thumbUrl, 6000); }
+            catch (_) { item.thumbBuffer = null; }
+        }));
+        if (!batch.some(b => b.thumbBuffer)) return unchanged;
+
+        let gridBuf;
+        try { gridBuf = await _composeGrid(batch); }
+        catch (_) { return unchanged; }
+
+        let parsed = new Map();
+        try {
+            const respText = await callVisionAI(
+                _buildScreenPrompt(scene, contract, batch, opts.niche),
+                Buffer.from(gridBuf).toString('base64'),
+                'image/jpeg',
+                { maxTokens: 60 + batch.length * 22 }
+            );
+            parsed = _parseScreenResponse(respText, batch.length);
+        } catch (_) {
+            return unchanged; // vision unavailable — behave exactly as before
+        }
+
+        for (let j = 0; j < batch.length; j++) {
+            const verdict = parsed.get(j + 1);
+            if (!verdict) continue; // no answer → neutral, never a demotion
+            _screenCache.set(batch[j].cacheKey, verdict);
+            verdicts.set(batch[j].result, verdict);
+        }
+    }
+
+    let saw = 0, missed = 0, unsure = 0;
+    for (const v of verdicts.values()) {
+        if (v === 'yes') saw++;
+        else if (v === 'no') missed++;
+        else unsure++;
+    }
+
+    // The guard: no confirmed winner → no reordering at all.
+    if (saw === 0) {
+        return {
+            ranked: results,
+            confirmed: [],
+            saw, missed, unsure,
+            screened: verdicts.size,
+            log: verdicts.size
+                ? `  👁️ [Thumbnail Screen] [${providerName}] looked at ${verdicts.size} preview(s) before downloading, none clearly showed "${_screenTarget(contract)}" — order unchanged`
+                : '',
+        };
+    }
+
+    //   0  the preview shows it
+    //   1  unscreened, unsure, or unanswered — no evidence either way
+    //   2  looked and it shows something else
+    // Stable within each band, so every ranker that ran before this still
+    // decides ties.
+    const band = (r) => {
+        const v = verdicts.get(r);
+        if (v === 'yes') return 0;
+        if (v === 'no') return 2;
+        return 1;
+    };
+    const order = new Map(results.map((r, i) => [r, i]));
+    const ranked = [...results].sort((a, b) => (band(a) - band(b)) || (order.get(a) - order.get(b)));
+
+    const topTitle = _resultTitle(ranked[0]) || String(ranked[0]?.url || '');
+    // Handed back explicitly rather than left for the caller to infer from
+    // position: "the first `saw` entries" only holds while the banding above
+    // stays exactly as written, and a caller that marks the wrong candidates
+    // hands the race a confidence bonus it never earned.
+    const confirmed = [];
+    for (const [result, verdict] of verdicts) {
+        if (verdict === 'yes') confirmed.push(result);
+    }
+    return {
+        ranked,
+        confirmed,
+        saw, missed, unsure,
+        screened: verdicts.size,
+        log: `  👁️ [Thumbnail Screen] [${providerName}] looked at ${verdicts.size} preview(s) before downloading: ${saw} show "${_screenTarget(contract)}", ${missed} don't${unsure ? `, ${unsure} unclear` : ''} — racing "${topTitle.slice(0, 60)}" first`,
+    };
+}
+
+function _screenGridSize() {
+    const raw = parseInt(process.env.MEDIA_THUMBNAIL_SCREEN_GRID || '', 10);
+    if (Number.isFinite(raw) && raw >= 2) return Math.min(raw, MAX_CANDIDATES_IN_PROMPT);
+    return MAX_CANDIDATES_IN_PROMPT;
+}
+
+function _screenTarget(contract) {
+    const target = String(contract?.target || '').replace(/\s+/g, ' ').trim();
+    if (target) return target.slice(0, 60);
+    const first = (contract?.mustShow || [])[0];
+    return String(first || 'the subject').slice(0, 60);
+}
+
+function _buildScreenPrompt(scene, contract, batch, niche = '') {
+    const sceneText = String(scene?.text || scene?.transcript || '').replace(/\s+/g, ' ').trim().slice(0, 280);
+    const target = String(contract.target || '').slice(0, 200);
+    const mustShow = (contract.mustShow || []).slice(0, 8).join(', ') || '(any)';
+    const mustAvoid = (contract.mustNotShow || []).slice(0, 6).join(', ') || '(none)';
+    const nicheStr = String(niche || contract.niche || scene?.niche || '').trim();
+    const list = batch.map((it, i) => `${i + 1}. "${String(it.title || '').slice(0, 64)}"`).join('\n');
+
+    return `You are looking at a numbered grid of candidate preview pictures. Each tile is one candidate clip or photo for ONE shot in a video.
+
+SCENE NARRATION: "${sceneText}"
+${nicheStr ? `NICHE: ${nicheStr}\n` : ''}TARGET FOOTAGE: ${target}
+MUST SHOW (any of): ${mustShow}
+MUST AVOID: ${mustAvoid}
+
+CANDIDATE LABELS (matched to the numbered tiles):
+${list}
+
+For EACH numbered tile, judge ONLY what the picture itself shows.
+
+YES    — the picture plausibly shows the target subject. Related or adjacent
+         framing of the same subject/environment still counts as YES.
+NO     — the picture clearly shows a different subject, or something in MUST AVOID.
+UNSURE — too small, dark, cropped or ambiguous to tell.
+
+Prefer UNSURE over NO when you are not certain. A wrong NO costs a good shot.
+
+Output EXACTLY one line per tile, no other text:
+N|YES|<reason ≤6 words>
+N|NO|<reason ≤6 words>
+N|UNSURE|<reason ≤6 words>`;
+}
+
+function _parseScreenResponse(text, count) {
+    const out = new Map();
+    if (!text) return out;
+    for (const raw of String(text).split(/\r?\n/)) {
+        const m = raw.trim().match(/^\s*(\d+)\s*[|:\-]\s*(YES|NO|UNSURE)\b/i);
+        if (!m) continue;
+        const idx = Number(m[1]);
+        if (!Number.isFinite(idx) || idx < 1 || idx > count) continue;
+        if (out.has(idx)) continue;
+        out.set(idx, m[2].toLowerCase());
+    }
+    return out;
+}
+
 // ───── Shared return-builder ─────
 
 function _buildReturn(results, decisions, providerName, statusTag) {
@@ -536,12 +741,14 @@ function _buildReturn(results, decisions, providerName, statusTag) {
 
 function resetThumbnailVisionCache() {
     _verdictCache.clear();
+    _screenCache.clear();
     _serpCache.clear();
 }
 
 module.exports = {
     judgeYouTubeSERP,
     judgeThumbnailGrid,
+    screenThumbnailGrid,
     closeThumbnailVisionBrowser,
     resetThumbnailVisionCache,
 };

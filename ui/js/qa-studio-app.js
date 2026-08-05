@@ -695,8 +695,8 @@
 
         const btn = document.createElement('button');
         btn.className = 'analyze-single-btn';
-        btn.textContent = `▶ Analyze Scene #${scene.sceneIndex}`;
-        btn.style.cssText = 'margin-top:12px;padding:8px 20px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;';
+        btn.textContent = `Analyze scene #${scene.sceneIndex}`;
+        btn.style.cssText = 'margin-top:12px;padding:8px 20px;background:var(--accent);color:#11160e;border:none;border-radius:5px;font-size:12px;font-weight:700;cursor:pointer;';
         btn.addEventListener('click', () => {
             if (!state.isRunning) runSingleScene(scene.sceneIndex);
         });
@@ -1933,7 +1933,7 @@
 
         const avatar = document.createElement('div');
         avatar.className = 'chat-avatar';
-        avatar.textContent = role === 'user' ? '👤' : '🤖';
+        avatar.textContent = role === 'user' ? 'U' : 'AI';
 
         const bubble = document.createElement('div');
         bubble.className = 'chat-bubble';
@@ -1955,7 +1955,7 @@
 
         const avatar = document.createElement('div');
         avatar.className = 'chat-avatar';
-        avatar.textContent = '🤖';
+        avatar.textContent = 'AI';
 
         const indicator = document.createElement('div');
         indicator.className = 'chat-typing';

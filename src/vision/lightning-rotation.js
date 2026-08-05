@@ -1,6 +1,6 @@
 /**
  * lightning-rotation.js — rotate across multiple Lightning.ai accounts to pool their free
- * monthly credit (~$15 ≈ ~21 L4-hrs each). Lightning exposes NO credit-balance API, so
+ * monthly GPU credit. Lightning exposes NO reliable credit-balance API here, so
  * exhaustion is detected by a hybrid: (a) proactive usage accounting against a per-account
  * GPU-hour budget, and (b) reactive failure handling (a start failure cools the account down,
  * repeated failures exhaust it). The monthly credit refresh is MANUAL — the user clicks
@@ -147,6 +147,7 @@ function markHealthy(acct) {
     s.failCount = 0;
     s.cooldownUntil = 0;
     s.healthy = true;
+    s.lastError = null;
     _saveState();
 }
 
@@ -193,7 +194,7 @@ function addAccount(input) {
         studioName: String(a.studioName).trim(),
         teamspace: String(a.teamspace || '').trim(),
         user: String(a.user || '').trim(),
-        machine: String(a.machine || 'L4').trim(),
+        machine: String(a.machine || 'T4').trim(),
         monthlyBudgetHours: Number(a.monthlyBudgetHours) > 0 ? Number(a.monthlyBudgetHours) : DEFAULT_BUDGET_HOURS,
     });
     if (!_writeJson(_accountsFile(), accounts)) return { ok: false, error: 'could not write lightning-accounts.json' };
@@ -252,7 +253,7 @@ function poolDetails() {
             studioName: a.studioName,
             teamspace: a.teamspace || '',
             user: a.user || '',
-            machine: a.machine || 'L4',
+            machine: a.machine || 'T4',
             apiKeyMasked: '••••' + String(a.apiKey).slice(-4),
             usedHours: +used.toFixed(2),
             budgetHours: a.monthlyBudgetHours,

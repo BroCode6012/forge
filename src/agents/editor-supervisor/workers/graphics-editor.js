@@ -20,7 +20,28 @@ const {
 const {
     requireFixedRenderer,
 } = require('../../../render/authored-composition-policy');
+const {
+    normalizeGraphicShell,
+} = require('../../../render/graphic-shells');
 
+const GRAPHIC_EDITABLE_PROPERTIES = Object.freeze([
+    'position',
+    'animation',
+    'animationSpeed',
+    'animationSpeedScale',
+    'durationSeconds',
+    'durationScale',
+    'style',
+    'variant',
+    'graphicShell',
+    'background',
+    'transparentBackground',
+    'backgroundColor',
+    'cardStyle',
+    'accentRuleVisible',
+    'textColor',
+    'shadowStrength',
+]);
 const OVERLAY_FALLBACK_TYPES = ['kineticText', 'headline', 'focusWord', 'callout', 'typewriter'];
 const PRIMARY_CONTENT_FIELDS = ['title', 'headline', 'label', 'templateText', 'templateTitle'];
 const SECONDARY_CONTENT_FIELDS = [
@@ -113,9 +134,28 @@ function _buildForScene(plan, scene, sceneIndex, type, operation, sourceVisual =
     graphic.sourceClipId = scene.clipId;
     if (sourceVisual) {
         const sourceTiming = windowOf(sourceVisual, 3);
+        const sourceId = String(sourceVisual.id || sourceVisual.clipId || '');
+        const replacementIds = [...new Set([
+            ...(Array.isArray(sourceVisual._agentReplacesVisualIds)
+                ? sourceVisual._agentReplacesVisualIds
+                : []),
+            sourceVisual._agentReplacesVisualId,
+            ...(Array.isArray(sourceVisual?.mgData?._agentReplacesVisualIds)
+                ? sourceVisual.mgData._agentReplacesVisualIds
+                : []),
+            sourceVisual?.mgData?._agentReplacesVisualId,
+            sourceId,
+        ].map((value) => String(value || '')).filter(Boolean))];
+        const originalId = String(
+            sourceVisual._agentReplacesVisualId
+            || sourceVisual?.mgData?._agentReplacesVisualId
+            || replacementIds[0]
+            || sourceId
+        );
         graphic.startTime = sourceTiming.startTime;
         graphic.duration = sourceTiming.endTime - sourceTiming.startTime;
-        graphic._agentReplacesVisualId = String(sourceVisual.id || sourceVisual.clipId || '');
+        graphic._agentReplacesVisualId = originalId;
+        graphic._agentReplacesVisualIds = replacementIds;
         if (sourceVisual.position) graphic.position = sourceVisual.position;
     }
     graphic.startTime = Math.max(timing.startTime, Math.min(graphic.startTime, timing.endTime - 0.2));
@@ -138,9 +178,14 @@ function _appendGraphic(plan, graphic, collection) {
     }
     plan[targetCollection] = Array.isArray(plan[targetCollection]) ? plan[targetCollection] : [];
     if (targetCollection === 'templateScenes') {
-        graphic.templateType = graphic.type;
+        if (graphic.templateType == null) graphic.templateType = graphic.type;
+        graphic.isMGScene = graphic.isMGScene !== false;
+        graphic.mediaType = graphic.mediaType || 'template';
+        graphic.trackId = graphic.trackId || graphic?.mgData?.trackId || 'video-track-3';
         graphic.category = 'fullscreen';
     } else if (targetCollection === 'mgScenes') {
+        graphic.isMGScene = graphic.isMGScene !== false;
+        graphic.trackId = graphic.trackId || graphic?.mgData?.trackId || 'video-track-3';
         graphic.category = 'fullscreen';
     }
     plan[targetCollection].push(graphic);
@@ -192,10 +237,23 @@ function inspectScopedGraphics(plan, scope) {
         type: _graphicType(visual),
         text: _displayText(visual),
         subtext: _displaySubtext(visual),
+        itemCount: (
+            Array.isArray(visual?.items)
+                ? visual.items
+                : (Array.isArray(visual?.mgData?.items) ? visual.mgData.items : [])
+        ).length,
         startTime: Number(visual?.startTime) || 0,
         duration: Number(visual?.duration) || 0,
         style: String(visual?.style || ''),
         variant: String(visual?.subType || visual?.variant || ''),
+        graphicShell: _cloneValue(
+            visual?.graphicShell
+            || visual?.mgData?.graphicShell
+            || visual?.agenticComposition?.shell
+            || null
+        ),
+        graphicShellManual: visual?.graphicShellManual === true
+            || visual?.mgData?.graphicShellManual === true,
         position: String(visual?.position || ''),
         authored: Boolean(visual?._authoredComposition || visual?.mgData?._authoredComposition),
         accentRuleVisible: visual?.accentRuleVisible !== false
@@ -504,6 +562,107 @@ function _setAgenticGraphicProperty(visual, path, value) {
     }
 }
 
+function _replacementLineage(sourceVisual) {
+    const sourceId = String(sourceVisual?.id || sourceVisual?.clipId || '');
+    const replacementIds = [...new Set([
+        ...(Array.isArray(sourceVisual?._agentReplacesVisualIds)
+            ? sourceVisual._agentReplacesVisualIds
+            : []),
+        sourceVisual?._agentReplacesVisualId,
+        ...(Array.isArray(sourceVisual?.mgData?._agentReplacesVisualIds)
+            ? sourceVisual.mgData._agentReplacesVisualIds
+            : []),
+        sourceVisual?.mgData?._agentReplacesVisualId,
+        sourceId,
+    ].map((value) => String(value || '')).filter(Boolean))];
+    return {
+        sourceId,
+        replacementIds,
+        originalId: String(
+            sourceVisual?._agentReplacesVisualId
+            || sourceVisual?.mgData?._agentReplacesVisualId
+            || replacementIds[0]
+            || sourceId
+        ),
+    };
+}
+
+function _buildReplacementForVisual(plan, sourceVisual, collection, type, operation) {
+    const graphic = _cloneValue(sourceVisual) || {};
+    const sourceTiming = windowOf(sourceVisual, collection === 'templateScenes' ? 4 : 3);
+    const windowDuration = Math.max(0.5, sourceTiming.endTime - sourceTiming.startTime);
+    const savedDuration = Number(sourceVisual?.duration);
+    const duration = Number.isFinite(savedDuration)
+        && savedDuration >= 0.5
+        && Math.abs(savedDuration - windowDuration) < 0.05
+        ? savedDuration
+        : windowDuration;
+    const lineage = _replacementLineage(sourceVisual);
+    const sourceToken = lineage.sourceId
+        || `${collection}-${Math.round(sourceTiming.startTime * 1000)}`;
+    const nextId = _uniqueId(
+        plan,
+        `agent-mg-${sourceToken.replace(/[^a-zA-Z0-9._-]+/g, '-')}-${type}`
+    );
+    const fps = Math.max(1, Number(plan?.fps) || 30);
+
+    graphic.id = nextId;
+    graphic.clipId = nextId;
+    graphic.type = type;
+    graphic.startTime = sourceTiming.startTime;
+    graphic.endTime = sourceTiming.endTime;
+    graphic.duration = duration;
+    graphic.durationFrames = Math.max(1, Math.round(duration * fps));
+    graphic.durationUnit = 'seconds';
+    graphic.selectionMode = 'editor-agent';
+    graphic.agentInstruction = String(operation.instruction || '').slice(0, 500);
+    graphic._agentReplacesVisualId = lineage.originalId;
+    graphic._agentReplacesVisualIds = lineage.replacementIds;
+    graphic.style = graphic.style || graphic?.mgData?.style || plan.mgStyle || 'clean';
+
+    if (graphic.mgData && typeof graphic.mgData === 'object') {
+        graphic.mgData.id = nextId;
+        graphic.mgData.clipId = nextId;
+        graphic.mgData.type = type;
+        graphic.mgData.startTime = sourceTiming.startTime;
+        graphic.mgData.endTime = sourceTiming.endTime;
+        graphic.mgData.duration = duration;
+        graphic.mgData.durationFrames = graphic.durationFrames;
+        graphic.mgData.durationUnit = 'seconds';
+        graphic.mgData.selectionMode = 'editor-agent';
+        graphic.mgData.agentInstruction = graphic.agentInstruction;
+        graphic.mgData._agentReplacesVisualId = lineage.originalId;
+        graphic.mgData._agentReplacesVisualIds = [...lineage.replacementIds];
+    }
+
+    if (collection === 'templateScenes') {
+        graphic.isMGScene = sourceVisual?.isMGScene !== false;
+        graphic.mediaType = sourceVisual?.mediaType || 'template';
+        graphic.trackId = sourceVisual?.trackId || sourceVisual?.mgData?.trackId || 'video-track-3';
+        graphic.category = 'fullscreen';
+        graphic.templateType = sourceVisual?.templateType === true ? true : type;
+        if (graphic.mgData && typeof graphic.mgData === 'object') {
+            graphic.mgData.templateType = sourceVisual?.mgData?.templateType === true ? true : type;
+            graphic.mgData.mediaType = graphic.mediaType;
+            graphic.mgData.trackId = graphic.trackId;
+            graphic.mgData.category = 'fullscreen';
+        }
+    } else if (collection === 'mgScenes') {
+        graphic.isMGScene = sourceVisual?.isMGScene !== false;
+        graphic.trackId = sourceVisual?.trackId || sourceVisual?.mgData?.trackId || 'video-track-3';
+        graphic.category = 'fullscreen';
+        if (graphic.mgData && typeof graphic.mgData === 'object') {
+            graphic.mgData.trackId = graphic.trackId;
+            graphic.mgData.category = 'fullscreen';
+        }
+    } else {
+        graphic.category = sourceVisual?.category || sourceVisual?.mgData?.category || 'overlay';
+    }
+
+    requireFixedRenderer(graphic, 'editor-agent-regenerate');
+    return graphic;
+}
+
 function editScopedGraphicProperties(plan, scope, operation = {}, options = {}) {
     const targets = _resolveContentTargets(plan, scope, operation);
 
@@ -573,6 +732,60 @@ function editScopedGraphicProperties(plan, scope, operation = {}, options = {}) 
             _setGraphicField(visual, 'variant', operation.variant);
             _setGraphicField(visual, 'variantManual', true);
         }
+        if (operation.graphicShell && typeof operation.graphicShell === 'object') {
+            const existingShell = (
+                visual?.graphicShell
+                || visual?.mgData?.graphicShell
+                || visual?.agenticComposition?.shell
+                || visual?.mgData?.agenticComposition?.shell
+                || {}
+            );
+            const shellRequest = operation.graphicShell.preset
+                ? operation.graphicShell
+                : { ...existingShell, ...operation.graphicShell };
+            const shell = normalizeGraphicShell(shellRequest, {
+                id: visual?.id || visual?.clipId,
+                role: collection === 'motionGraphics' ? 'overlay' : (collection === 'templateScenes' ? 'template' : 'fullscreen'),
+                type: _graphicType(visual),
+                text: _displayText(visual),
+                subtext: _displaySubtext(visual),
+                items: visual?.items || visual?.mgData?.items || visual?.agenticComposition?.items || [],
+                density: visual?.agenticComposition?.density,
+                textStrategy: visual?.agenticComposition?.textStrategy,
+                safeZone: visual?.safeZone || visual?.position,
+                layout: visual?.agenticComposition?.layout,
+                mood: `${visual?.style || ''} ${visual?.agenticComposition?.style?.mood || ''}`,
+                manual: true,
+            });
+            _setGraphicField(visual, 'graphicShell', shell);
+            _setGraphicField(visual, 'graphicShellManual', true);
+            _setAgenticGraphicProperty(visual, ['shell'], shell);
+            _setAgenticGraphicProperty(visual, ['style', 'shell'], shell);
+            // A direct structural request is newer intent than stale card/accent
+            // flags. Keep automatic shells subordinate to those flags, but let
+            // an explicit Agent edit intentionally restore a surface or accent.
+            if (shell.surface !== 'none') {
+                _setGraphicField(visual, 'transparentBackground', false);
+                if (
+                    visual?.cardStyle === 'transparent'
+                    || visual?.mgData?.cardStyle === 'transparent'
+                ) {
+                    _setGraphicField(
+                        visual,
+                        'cardStyle',
+                        shell.surface === 'outline'
+                            ? 'outline'
+                            : (shell.surface === 'soft' ? 'glass' : 'filled')
+                    );
+                }
+            }
+            _setGraphicField(visual, 'accentRuleVisible', shell.accent !== 'none');
+            _setAgenticGraphicProperty(
+                visual,
+                ['style', 'accentRule'],
+                shell.accent !== 'none'
+            );
+        }
         if (
             operation.animation === 'typewriter'
             && _typeKey(_graphicType(visual)) === _typeKey('headline')
@@ -615,6 +828,7 @@ function editScopedGraphicProperties(plan, scope, operation = {}, options = {}) 
         const textColor = normalizeTextColor(operation.textColor);
         if (textColor) {
             _mergeGraphicObject(visual, 'colors', { text: textColor });
+            _setGraphicField(visual, 'textColorManual', true);
             _setGraphicField(visual, 'textStyleRanges', []);
         }
         if (Number.isFinite(Number(operation.shadowStrength))) {
@@ -667,15 +881,15 @@ function regenerateScopedGraphics(plan, scope, operation = {}, options = {}) {
     const sceneTargets = [];
     if (visualTargets.length) {
         for (const { collection, visual } of visualTargets) {
-            const match = _sceneForVisual(plan, visual);
-            if (match) {
-                sceneTargets.push({
-                    ...match,
-                    collection,
-                    sourceVisual: visual,
-                    type: operation.requestedType || visual.type || visual.templateType || '',
-                });
-            }
+            sceneTargets.push({
+                scene: null,
+                index: Number.isInteger(Number(visual?.sceneIndex))
+                    ? Number(visual.sceneIndex)
+                    : Number(visual?.sourceSceneIndex) || 0,
+                collection,
+                sourceVisual: visual,
+                type: operation.requestedType || visual.type || visual.templateType || '',
+            });
         }
     } else {
         for (const scene of resolveSceneTargets(plan, scope, { includeDescendants: true })) {
@@ -689,7 +903,7 @@ function regenerateScopedGraphics(plan, scope, operation = {}, options = {}) {
             });
         }
     }
-    if (!sceneTargets.length) throw new Error('No narration scene is available for motion-graphic regeneration');
+    if (!sceneTargets.length) throw new Error('No visual or narration scene is available for motion-graphic regeneration');
 
     const maxGraphics = operation.effort === 'smart' ? 8 : 4;
     const spacedTargets = sceneTargets.length <= maxGraphics
@@ -702,18 +916,25 @@ function regenerateScopedGraphics(plan, scope, operation = {}, options = {}) {
     let added = 0;
     for (const { scene, index, collection, sourceVisual, type: targetType } of spacedTargets) {
         const type = targetType || _pickType(scene, index, plan, operation, placedTypes);
-        const graphic = _buildForScene(plan, scene, index, type, operation, sourceVisual);
+        const graphic = sourceVisual
+            ? _buildReplacementForVisual(plan, sourceVisual, collection, type, operation)
+            : _buildForScene(plan, scene, index, type, operation, null);
         if (!graphic) continue;
         _appendGraphic(plan, graphic, collection);
         placedTypes.push(type);
         added++;
-        options.log?.(`Graphics worker added ${type} for clip ${scene.clipId || index}`);
+        options.log?.(
+            sourceVisual
+                ? `Graphics worker regenerated ${type} in ${collection} without changing its role or timing`
+                : `Graphics worker added ${type} for clip ${scene.clipId || index}`
+        );
     }
     if (!added && !removed) throw new Error('The graphics worker could not produce a valid visual for this scope');
     return { changed: added + removed, removed, added };
 }
 
 module.exports = {
+    GRAPHIC_EDITABLE_PROPERTIES,
     editScopedGraphicContent,
     editScopedGraphicProperties,
     editScopedGraphicTextStyle,

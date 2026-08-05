@@ -72,32 +72,90 @@ async function transcribeAudio(audioPath, options = {}) {
 let _engineCache = null;
 const _pyCache = {};
 
-// Resolve a python interpreter that actually has `mod` importable. CRITICAL: on
-// some machines bare `python` resolves to an install with NO whisper packages
+// How long a single interpreter probe may take before we give up on it.
+// Deliberately generous: this ceiling exists to escape a wedged interpreter,
+// NOT to bound normal work. See _pythonsFor for why that distinction matters.
+const PROBE_TIMEOUT_MS = Number(process.env.WHISPER_PROBE_TIMEOUT_MS || 45000);
+
+// Resolve every python interpreter that has `mod` installed, best first. CRITICAL:
+// on some machines bare `python` resolves to an install with NO whisper packages
 // (e.g. a 3.11 alongside a 3.10 that has them), which silently breaks/stalls
-// transcription. We probe candidates and cache the first that imports `mod`.
-// Override the whole search with WHISPER_PYTHON (a python.exe path).
-function _pythonFor(mod) {
+// transcription. Override the whole search with WHISPER_PYTHON (a python.exe path).
+//
+// The probe asks "is `mod` INSTALLED here" (importlib.find_spec), not "can `mod`
+// fully load here" (import). That distinction is the whole fix. `import
+// faster_whisper` executes the package, which drags in ctranslate2/torch and their
+// DLLs; measured cold on this machine (2026-08-04) that is 34s wall-clock, of which
+// 0.1s is CPU — the rest is Windows faulting hundreds of MB of native libraries off
+// disk. The old probe used a 20s timeout, so it SIGTERM'd a working interpreter
+// mid-import, scored it "does not have the package", and moved on to do the same to
+// the next one. The build then died with "no python interpreter with the required
+// whisper package was found" while `python -c "import faster_whisper"` succeeded from
+// a shell one minute later. Warm, that import is ~2s — which is why this only bites
+// after a reboot or a long idle gap and looks like a random flake.
+//
+// find_spec just walks sys.path for the module; it never executes it, so it costs
+// interpreter startup and nothing else. It also can't be starved by a cold page cache.
+// It is a weaker claim than a real import (a corrupt DLL would still pass here), so we
+// keep EVERY interpreter that passes and let _runPy fall through to the next one if the
+// real run fails to import. The authoritative import test is the actual transcription.
+function _pythonsFor(mod) {
     if (mod in _pyCache) return _pyCache[mod];
     const candidates = [];
     if (process.env.WHISPER_PYTHON) candidates.push({ bin: process.env.WHISPER_PYTHON, args: [] });
     candidates.push({ bin: 'py', args: ['-3.10'] }, { bin: 'python', args: [] }, { bin: 'python3', args: [] }, { bin: 'py', args: ['-3.11'] }, { bin: 'py', args: ['-3'] });
+
+    // Stop once there is one to use and one to fall back to. Measured on this
+    // machine (2026-08-04) probing all five costs ~27s of pure waiting per module
+    // — 5.1s + 10.2s for the two that have faster_whisper, then 11.6s more asking
+    // three interpreters that don't. A third spare buys almost nothing: find_spec
+    // has already proved the package is on sys.path, so the only way the run still
+    // fails is a broken native DLL, which would break every install of that same
+    // package the same way.
+    const KEEP = 2;
+    const found = [];
+    let timedOut = 0;
+    // No double quotes in this one-liner — it crosses Windows' argument escaping as a
+    // single argv entry. If find_spec itself raises, python exits non-zero, which is
+    // the verdict we want anyway.
+    const probe = `import importlib.util as u,sys; sys.exit(0 if u.find_spec('${mod}') is not None else 1)`;
     for (const c of candidates) {
         try {
-            const r = spawnSync(c.bin, [...c.args, '-c', `import ${mod}`], { stdio: 'ignore', timeout: 20000 });
-            if (r.status === 0) { _pyCache[mod] = c; return c; }
+            const r = spawnSync(c.bin, [...c.args, '-c', probe], { stdio: 'ignore', timeout: PROBE_TIMEOUT_MS });
+            if (r.status === 0) found.push(c);
+            else if (r.error && (r.error.code === 'ETIMEDOUT' || r.signal)) timedOut++;
         } catch (_) { /* try next */ }
+        if (found.length >= KEEP) break;
     }
-    _pyCache[mod] = null;
-    return null;
+    if (found.length) {
+        console.log(`🐍 ${mod}: ${found.length} interpreter(s) available — using ${found[0].bin} ${found[0].args.join(' ')}`.trim());
+    } else if (timedOut) {
+        // Say WHICH failure this was. "not found" and "found but unresponsive" have
+        // opposite fixes, and the old message collapsed them into the wrong one.
+        console.warn(`⚠️  ${mod}: no interpreter had it, and ${timedOut} probe(s) timed out after ${PROBE_TIMEOUT_MS}ms — raise WHISPER_PROBE_TIMEOUT_MS if python is just slow to start here`);
+    }
+    _pyCache[mod] = found;
+    return found;
 }
 
-// Run a python script with the resolved interpreter (no shell → paths with
-// spaces are safe). Throws on non-zero exit.
-function _runPy(py, scriptPath) {
-    if (!py) throw new Error('no python interpreter with the required whisper package was found');
-    const r = spawnSync(py.bin, [...py.args, scriptPath], { stdio: 'inherit', timeout: 3_600_000 });
-    if (r.status !== 0) throw new Error(`python exited with ${r.status}${r.error ? ': ' + r.error.message : ''}`);
+// Run a python script, trying each interpreter that reported having the package
+// (no shell → paths with spaces are safe). find_spec proved the module is on the
+// path; only the real run proves it loads, so a failure here means "try the next
+// interpreter", not "give up". Throws once every candidate has been exhausted.
+function _runPy(pys, scriptPath) {
+    const list = Array.isArray(pys) ? pys : (pys ? [pys] : []);
+    if (!list.length) throw new Error('no python interpreter with the required whisper package was found');
+    let lastErr = null;
+    for (let i = 0; i < list.length; i++) {
+        const py = list[i];
+        const r = spawnSync(py.bin, [...py.args, scriptPath], { stdio: 'inherit', timeout: 3_600_000 });
+        if (r.status === 0) return;
+        lastErr = `python exited with ${r.status}${r.error ? ': ' + r.error.message : ''}`;
+        if (i < list.length - 1) {
+            console.warn(`⚠️  ${py.bin} ${py.args.join(' ')} failed (${lastErr}) — trying next interpreter`.trim());
+        }
+    }
+    throw new Error(lastErr);
 }
 
 function _resolveEngine() {
@@ -107,8 +165,8 @@ function _resolveEngine() {
     if (_engineCache) return _engineCache;
     // Prefer faster-whisper (4-12x faster on CPU, same word timings), then
     // WhisperX (adds forced alignment — slow on CPU), then vanilla Whisper.
-    if (_pythonFor('faster_whisper')) _engineCache = 'faster-whisper';
-    else if (_pythonFor('whisperx')) _engineCache = 'whisperx';
+    if (_pythonsFor('faster_whisper').length) _engineCache = 'faster-whisper';
+    else if (_pythonsFor('whisperx').length) _engineCache = 'whisperx';
     else _engineCache = 'whisper';
     return _engineCache;
 }
@@ -228,7 +286,7 @@ except Exception as e:
     try {
         fs.writeFileSync(scriptPath, pythonScript);
         console.log('⏳ Running WhisperX (transcribe + align)…');
-        _runPy(_pythonFor('whisperx'), scriptPath);
+        _runPy(_pythonsFor('whisperx'), scriptPath);
 
         if (!fs.existsSync(outputPath)) {
             throw new Error('WhisperX produced no transcription.json');
@@ -289,7 +347,7 @@ except Exception as e:
     try {
         fs.writeFileSync(scriptPath, pythonScript);
         console.log('⏳ Running faster-whisper…');
-        _runPy(_pythonFor('faster_whisper'), scriptPath);
+        _runPy(_pythonsFor('faster_whisper'), scriptPath);
         if (!fs.existsSync(outputPath)) {
             throw new Error('Transcription output file was not created by faster-whisper.');
         }
@@ -376,7 +434,7 @@ except Exception as e:
     try {
         fs.writeFileSync(scriptPath, pythonScript);
         console.log('⏳ Running Whisper (this may take a minute)...');
-        _runPy(_pythonFor('whisper'), scriptPath);
+        _runPy(_pythonsFor('whisper'), scriptPath);
 
         if (!fs.existsSync(outputPath)) {
             throw new Error('Transcription output file was not created by Python script.');

@@ -1,6 +1,13 @@
 const { callAIJson } = require('../brain/strict-json');
 let MG_REGISTRY = {};
 try { ({ MG_REGISTRY = {} } = require('./mg-registry')); } catch (_) { MG_REGISTRY = {}; }
+const {
+  getGraphicShellCapabilities,
+  normalizeGraphicShell,
+} = require('./graphic-shells');
+const {
+  resolveGraphicMediaTreatment,
+} = require('./overlay-visual-policy');
 
 // kebab type ('kinetic-text') → camel registry key ('kineticText')
 function registryKeyFromType(type) {
@@ -200,7 +207,7 @@ function buildItemEnvelope(group, index, item, scenes) {
       : 'overlay';
   const existing = item?.agenticComposition || item?.hyperframeComposition || item?.compositionSpec || null;
 
-  return {
+  const envelope = {
     id: `${group}:${index}`,
     group,
     index,
@@ -223,8 +230,32 @@ function buildItemEnvelope(group, index, item, scenes) {
     existingVariant: item?.variant || item?.templateVariant || '',
     existingStyle: item?.style || item?.themeStyle || '',
     existingAnimation: item?.animation || item?.animationType || '',
+    existingShell: item?.graphicShell || existing?.shell || existing?.style?.shell || null,
+    existingShellManual: item?.graphicShellManual === true || item?.mgData?.graphicShellManual === true,
+    transparentBackground: item?.transparentBackground === true
+      || item?.mgData?.transparentBackground === true
+      || item?.cardStyle === 'transparent'
+      || item?.mgData?.cardStyle === 'transparent',
+    accentRuleVisible: item?.accentRuleVisible !== false
+      && item?.mgData?.accentRuleVisible !== false,
     variants: variantsForType(type),
   };
+  envelope.shellCapabilities = getGraphicShellCapabilities({
+    id: envelope.id,
+    role,
+    type,
+    text: envelope.text,
+    subtext: envelope.subtext,
+    itemCount: Array.isArray(existing?.items) ? existing.items.length : 0,
+    density: existing?.density,
+    textStrategy: existing?.textStrategy,
+    safeZone: envelope.existingSafeZone,
+    layout: envelope.existingLayout,
+    mood: `${envelope.existingStyle} ${envelope.visualIntent}`,
+    transparentBackground: envelope.transparentBackground,
+    accentRuleVisible: envelope.accentRuleVisible,
+  });
+  return envelope;
 }
 
 function chunk(items, size) {
@@ -288,10 +319,43 @@ function normalizeSpec(raw, envelope) {
   const variant = allowedVariants.includes(rawVariant)
     ? rawVariant
     : (allowedVariants.includes(envelope.existingVariant) ? envelope.existingVariant : '');
+  const role = pickAllowed(raw?.role, new Set(['overlay', 'fullscreen', 'template']), envelope.role);
+  const requestedMediaTreatment = pickAllowed(
+    raw?.mediaTreatment || raw?.media?.treatment,
+    MEDIA_TREATMENTS,
+    envelope.hasMediaAsset ? 'cinematic-background' : 'transparent'
+  );
+  const mediaTreatment = resolveGraphicMediaTreatment({
+    role,
+    type: envelope.type,
+    requested: requestedMediaTreatment,
+    fallback: envelope.hasMediaAsset ? 'cinematic-background' : 'transparent',
+  });
+  const shell = normalizeGraphicShell(
+    envelope.existingShellManual
+      ? envelope.existingShell
+      : (raw?.shell || style.shell || envelope.existingShell),
+    {
+      id: envelope.id,
+      role: envelope.role,
+      type: envelope.type,
+      text: title,
+      subtext: subtitle || kicker,
+      items: cleanItems(raw?.items || raw?.bullets),
+      density: raw?.density || style.density,
+      textStrategy: raw?.textStrategy,
+      safeZone: raw?.safeZone || envelope.existingSafeZone,
+      layout: raw?.layout || envelope.existingLayout,
+      mood: `${style.mood || raw?.mood || ''} ${raw?.reason || envelope.visualIntent || ''}`,
+      manual: envelope.existingShellManual,
+      transparentBackground: envelope.transparentBackground,
+      accentRuleVisible: envelope.accentRuleVisible,
+    }
+  );
 
   return {
     mode: 'agentic',
-    role: pickAllowed(raw?.role, new Set(['overlay', 'fullscreen', 'template']), envelope.role),
+    role,
     type: envelope.type,
     variant: variant || undefined,
     layout: pickAllowed(raw?.layout, LAYOUTS, envelope.existingLayout || 'focus-panel'),
@@ -302,9 +366,10 @@ function normalizeSpec(raw, envelope) {
     title,
     subtitle: subtitle || undefined,
     items: cleanItems(raw?.items || raw?.bullets),
+    shell,
     media: {
       hasAsset: envelope.hasMediaAsset,
-      treatment: pickAllowed(raw?.mediaTreatment || raw?.media?.treatment, MEDIA_TREATMENTS, envelope.hasMediaAsset ? 'cinematic-background' : 'transparent'),
+      treatment: mediaTreatment,
     },
     style: {
       mood: truncate(style.mood || raw?.mood || '', 80) || undefined,
@@ -353,8 +418,15 @@ Rules:
 - Template/fullscreen scenes should feel like real scene explanations, title cards, chapter cards, map explainers, evidence boards, or data moments.
 - Overlay MGs must avoid important visual areas and remain readable.
 - Keep text concise. If a line is too long, shorten without changing meaning.
-- Use media treatment intentionally: darken/blur backgrounds for readability, map-focus for maps, image-focus for evidence, transparent for pure overlays.
+- FOOTAGE INTEGRITY: every overlay except focus-word MUST use mediaTreatment "transparent". Normal overlays may use a bounded local text/card plate, but must never darken, blur, tint, vignette, or shade the whole frame.
+- focus-word is the only overlay allowed to use a subtle full-frame focus treatment (darken-background, blur-background, image-focus, or cinematic-background).
+- Fullscreen/template graphics may use media treatments intentionally: darken/blur for readability, map-focus for maps, and image-focus for evidence.
 - Avoid decorative complexity when it hurts clarity.
+- "shell" is structural chrome only. It never chooses colors or fonts; the active theme and adaptive-contrast system own those.
+- Compose the shell from the exact live dimensions listed on each item. Choose it from the copy length, hierarchy, safe zone, mood, and neighboring visual role—not from a fixed graphic-type template.
+- Respect explicit editing state: when transparentBackground is true, use surface "none"; when accentRuleVisible is false, use accent "none".
+- Use split hierarchy only when secondary copy is useful. Prefer simple underline/rail/naked structures over decorative boxes unless density or readability needs a surface.
+- Vary shell combinations across the video with editorial intent; do not rotate them mechanically and do not force every item into a box.
 
 DATA/LIST FULLSCREEN TYPES NEED REAL CONTENT. If an item's type is bullet-list, ranking-list,
 timeline, comparison-card, bar-chart or donut-chart, you MUST return an "items" array with 3-6
@@ -407,6 +479,14 @@ Return strict JSON only:
       "title": "main visible text",
       "subtitle": "optional support text",
       "items": ["optional short bullets"],
+      "shell": {
+        "surface": "one allowed surface from this item's shellCapabilities",
+        "accent": "one allowed accent",
+        "geometry": "one allowed geometry",
+        "hierarchy": "one allowed hierarchy",
+        "width": "one allowed width",
+        "emphasis": "one allowed emphasis"
+      },
       "mediaTreatment": "one allowed mediaTreatment",
       "style": {
         "mood": "brief visual mood",
@@ -455,6 +535,10 @@ function applySpec(target, spec) {
   if (Array.isArray(spec.items) && spec.items.length) {
     target.items = spec.items;
     if (target.mgData && typeof target.mgData === 'object') target.mgData.items = spec.items;
+  }
+  if (spec.shell && target.graphicShellManual !== true && target?.mgData?.graphicShellManual !== true) {
+    target.graphicShell = spec.shell;
+    if (target.mgData && typeof target.mgData === 'object') target.mgData.graphicShell = spec.shell;
   }
   const existing = target.agenticComposition && typeof target.agenticComposition === 'object'
     ? target.agenticComposition
@@ -526,7 +610,7 @@ async function applyHyperframesMotionDirector({
         maxTokens,
         temperature: 0.35,
         maxRetries: 2,
-        schemaDescription: '{"items":[{"id":"same id from input","layout":"allowed layout","safeZone":"allowed safeZone","density":"compact|standard|spacious","textStrategy":"full|headline|keyword|minimal|data","title":"text","items":[{"label":"text","value":"optional"}],"mediaTreatment":"allowed media treatment","style":{},"motion":{},"constraints":{}}]}',
+        schemaDescription: '{"items":[{"id":"same id from input","layout":"allowed layout","safeZone":"allowed safeZone","density":"compact|standard|spacious","textStrategy":"full|headline|keyword|minimal|data","title":"text","items":[{"label":"text","value":"optional"}],"shell":{"surface":"allowed","accent":"allowed","geometry":"allowed","hierarchy":"allowed","width":"allowed","emphasis":"allowed"},"mediaTreatment":"allowed media treatment","style":{},"motion":{},"constraints":{}}]}',
         validate(value) {
           if (!value || !Array.isArray(value.items)) return 'items array is required';
           const expected = new Set(promptItems.map(item => item.id));
@@ -548,7 +632,7 @@ async function applyHyperframesMotionDirector({
         const spec = normalizeSpec(rawSpec, envelope);
         applySpec(envelope.target, spec);
         applied += 1;
-        logLine(log, 'dim', `[Motion Director] ${id} ${envelope.type}: layout=${spec.layout} safe=${spec.safeZone} media=${spec.media.treatment}`);
+        logLine(log, 'dim', `[Motion Director] ${id} ${envelope.type}: layout=${spec.layout} shell=${spec.shell.surface}/${spec.shell.accent}/${spec.shell.hierarchy} safe=${spec.safeZone} media=${spec.media.treatment}`);
       }
     } catch (error) {
       failures.push(error?.message || String(error));

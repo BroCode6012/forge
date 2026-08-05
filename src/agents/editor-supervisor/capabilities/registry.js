@@ -1,17 +1,77 @@
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const {
+    assertToolArgs,
+    contractHash,
+    normalizeTools,
+} = require('./capability-contract');
 
 const CAPABILITY_FILE = /^[a-z0-9][a-z0-9-]*\.js$/i;
-const RESERVED_FILES = new Set(['registry.js', 'smart-router.js']);
+const RESERVED_FILES = new Set(['capability-contract.js', 'registry.js', 'smart-router.js']);
 const RISK_LEVELS = new Set(['low', 'moderate', 'expensive', 'structural']);
 
 let discovered = null;
+let discoveredFingerprint = '';
 const registered = new Map();
+
+const WATCHED_PATHS = [
+    __dirname,
+    path.resolve(__dirname, '..', 'workers'),
+    path.resolve(__dirname, '..', '..', 'workers', 'icon-director.js'),
+    path.resolve(__dirname, '..', '..', '..', 'render', 'hf-effects.js'),
+    path.resolve(__dirname, '..', '..', '..', 'render', 'mg-registry.js'),
+    path.resolve(__dirname, '..', '..', '..', 'render', 'graphic-shells.js'),
+    path.resolve(__dirname, '..', '..', 'ai-motion-graphics.js'),
+    path.resolve(__dirname, '..', '..', 'ai-templates.js'),
+    path.resolve(__dirname, '..', '..', '..', 'directives', 'framing-preset.js'),
+    path.resolve(__dirname, '..', '..', '..', 'media', 'source-policy.js'),
+];
 
 function _clone(value) {
     return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function _watchedFiles() {
+    const files = [];
+    const visit = (target) => {
+        if (!fs.existsSync(target)) return;
+        const stat = fs.statSync(target);
+        if (stat.isFile()) {
+            if (target.endsWith('.js')) files.push(path.resolve(target));
+            return;
+        }
+        for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
+            const child = path.join(target, entry.name);
+            if (entry.isDirectory()) visit(child);
+            else if (entry.isFile() && entry.name.endsWith('.js')) files.push(path.resolve(child));
+        }
+    };
+    WATCHED_PATHS.forEach(visit);
+    return [...new Set(files)].sort((left, right) => left.localeCompare(right));
+}
+
+function _sourceFingerprint() {
+    const hash = crypto.createHash('sha1');
+    for (const filePath of _watchedFiles()) {
+        const stat = fs.statSync(filePath);
+        hash.update(filePath);
+        hash.update(String(stat.size));
+        hash.update(String(stat.mtimeMs));
+    }
+    return hash.digest('hex');
+}
+
+function _clearWatchedModuleCache() {
+    const registryPath = path.resolve(__filename);
+    for (const filePath of _watchedFiles()) {
+        if (filePath === registryPath) continue;
+        try {
+            delete require.cache[require.resolve(filePath)];
+        } catch (_) { }
+    }
 }
 
 function _readManifest(capability, source = 'capability') {
@@ -29,30 +89,60 @@ function _readManifest(capability, source = 'capability') {
     if (!/^[a-z0-9][a-z0-9-]{0,63}$/i.test(id)) {
         throw new Error(`${source} has an invalid capability id`);
     }
-    const actions = Array.isArray(manifest.actions)
-        ? [...new Set(manifest.actions.map((action) => String(action || '').trim()).filter(Boolean))]
-        : [];
-    if (!actions.length) throw new Error(`${source} must declare at least one action`);
     const scopes = Array.isArray(manifest.scopes)
         ? [...new Set(manifest.scopes.map((scope) => String(scope || '').trim()).filter(Boolean))]
         : [];
     if (!scopes.length) throw new Error(`${source} must declare at least one scope`);
     const risk = RISK_LEVELS.has(manifest.risk) ? manifest.risk : 'moderate';
-    return {
+    const tools = normalizeTools(
+        typeof capability.tools === 'function' ? capability.tools() : manifest.tools,
+        {
+            specialist: String(manifest.specialist || id),
+            scopes,
+            risk,
+        }
+    );
+    const declaredActions = Array.isArray(manifest.actions)
+        ? [...new Set(manifest.actions.map((action) => String(action || '').trim()).filter(Boolean))]
+        : [];
+    const actions = tools.length ? tools.map((entry) => entry.action) : declaredActions;
+    if (!actions.length) throw new Error(`${source} must declare at least one action`);
+    if (tools.length && declaredActions.length) {
+        const declared = [...declaredActions].sort();
+        const contracted = [...actions].sort();
+        if (JSON.stringify(declared) !== JSON.stringify(contracted)) {
+            throw new Error(`${source} actions must be generated from its tool contract`);
+        }
+    }
+    const normalized = {
         ..._clone(manifest),
         id,
         specialist: String(manifest.specialist || id),
         actions,
         scopes,
         risk,
+        contractVersion: tools.length ? Math.max(2, Number(manifest.contractVersion) || 2) : 1,
+        tools,
         directiveKeys: Array.isArray(manifest.directiveKeys)
             ? [...new Set(manifest.directiveKeys.map((key) => String(key || '').trim()).filter(Boolean))]
             : [],
     };
+    normalized.contractHash = contractHash({
+        id: normalized.id,
+        specialist: normalized.specialist,
+        scopes: normalized.scopes,
+        risk: normalized.risk,
+        tools: normalized.tools,
+        vocabulary: normalized.vocabulary || {},
+        limitations: normalized.limitations || [],
+    });
+    return normalized;
 }
 
 function _discover() {
-    if (discovered) return discovered;
+    const fingerprint = _sourceFingerprint();
+    if (discovered && fingerprint === discoveredFingerprint) return discovered;
+    if (discovered && fingerprint !== discoveredFingerprint) _clearWatchedModuleCache();
     discovered = new Map();
     const files = fs.readdirSync(__dirname, { withFileTypes: true })
         .filter((entry) => entry.isFile()
@@ -73,6 +163,7 @@ function _discover() {
             source: modulePath,
         });
     }
+    discoveredFingerprint = fingerprint;
     return discovered;
 }
 
@@ -113,7 +204,9 @@ function unregisterCapability(idValue) {
 }
 
 function reloadCapabilities() {
+    _clearWatchedModuleCache();
     discovered = null;
+    discoveredFingerprint = '';
     return listManifests();
 }
 
@@ -129,6 +222,14 @@ function validateOperation(operation, context = {}) {
     const action = String(operation.action || '').trim();
     if (!entry.manifest.actions.includes(action)) {
         throw new Error(`${entry.manifest.specialist} does not expose action "${action || '(empty)'}"`);
+    }
+    const toolSpec = entry.manifest.tools.find((candidate) => candidate.action === action);
+    if (toolSpec) {
+        assertToolArgs(
+            toolSpec,
+            operation.args && typeof operation.args === 'object' ? operation.args : {},
+            `${entry.manifest.specialist}.${action}`
+        );
     }
     const scope = operation.scope || context?.request?.scope;
     const scopeKind = _scopeKind({ ...operation, scope }, context);
@@ -166,6 +267,18 @@ function tryNormalizeInvocation(invocation, context = {}) {
         ).trim();
         const entry = getCapability(capabilityId);
         if (!entry) throw new Error(`Unknown Editor Agent capability: ${capabilityId || '(empty)'}`);
+        const invocationAction = String(invocation?.action || '').trim();
+        const inputTool = entry.manifest.tools.find((candidate) => candidate.action === invocationAction);
+        if (entry.manifest.tools.length && !inputTool) {
+            throw new Error(`${entry.manifest.specialist} does not expose action "${invocationAction || '(empty)'}"`);
+        }
+        if (inputTool) {
+            assertToolArgs(
+                inputTool,
+                invocation?.args && typeof invocation.args === 'object' ? invocation.args : {},
+                `${entry.manifest.specialist}.${invocationAction}`
+            );
+        }
         if (typeof entry.capability.normalizeInvocation !== 'function') {
             throw new Error(`${entry.manifest.specialist} cannot normalize smart invocations`);
         }

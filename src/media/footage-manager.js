@@ -44,11 +44,14 @@ const { applyVisionScoreSanity } = require('../vision/vision-score-sanity');
 const {
     judgeYouTubeSERP: _thumbnailVisionYouTube,
     judgeThumbnailGrid: _thumbnailVisionGrid,
+    screenThumbnailGrid: _thumbnailScreen,
 } = require('../vision/thumbnail-vision');
 const {
     rankCandidateFinalists,
 } = require('./candidate-finalist-scout');
 const { runCandidateRace, getProviderConcurrency } = require('./candidate-race');
+const providerScoreboard = require('./provider-scoreboard');
+const downloadPatience = require('./download-patience');
 const {
     initMediaMemoryBank,
     rememberMediaSource,
@@ -59,9 +62,12 @@ const {
 const {
     applySearchKeywordSplit,
     buildSearchKeywordVariants,
+    buildYouTubeQueryLadder,
     normalizeEntityContext,
     repairDisplaySearchQuery,
     trimSearchKeyword,
+    observeScenes: observePhraseScenes,
+    rememberPhraseWin,
 } = require('./search-keywords');
 const { DISABLED_VIDEO_PROVIDER_KEYS, sanitizeSourceHint } = require('./source-policy');
 
@@ -240,6 +246,11 @@ const IMAGE_DOWNLOAD_MIN_BUDGET_MS = Math.max(3_000, parseInt(process.env.IMAGE_
 const IMAGE_VISION_BUDGET_MS = Math.max(4_000, parseInt(process.env.IMAGE_VISION_BUDGET_MS || '4000', 10) || 4_000);
 const IMAGE_MAX_TRIES = Math.max(3, Math.min(12, parseInt(process.env.IMAGE_MAX_TRIES || '8', 10) || 8));
 const FINALIST_SCOUT_MIN_BUDGET_MS = Math.max(4_000, parseInt(process.env.MEDIA_FINALIST_SCOUT_MIN_BUDGET_MS || '7000', 10) || 7_000);
+// One vision call plus a handful of thumbnail fetches. Deliberately cheaper
+// than the finalist scout's floor: this pass runs BEFORE any download, so on a
+// tight scene it is the pass most worth affording — skipping it is what makes
+// the rest of the scene expensive.
+const THUMBNAIL_SCREEN_MIN_BUDGET_MS = Math.max(4_000, parseInt(process.env.MEDIA_THUMBNAIL_SCREEN_MIN_BUDGET_MS || '9000', 10) || 9_000);
 
 // ── ONE VISION LAYER (default ON) ──────────────────────────────────────────
 // Keep ONLY the post-download merged vision score (clipAnalyzer.analyzeClip) — the actual
@@ -887,7 +898,12 @@ function createAgenticGraphicFallback(scene, opts = {}) {
         || keyword,
         90
     );
-    const body = _fallbackText(scene?.text || scene?.visualIntent || opts.reason || keyword, 240);
+    // `reason` is a DIAGNOSTIC ("scene download timed out after 15.2 min"). It
+    // belongs in the log and in the scene record, never on the canvas — this
+    // card is shipped in the finished video, and engineering text on screen is
+    // worse than the blank it replaced. Body falls back to the keyword, so a
+    // scene with no text still gets its subject rather than an error message.
+    const body = _fallbackText(scene?.text || scene?.visualIntent || keyword, 240);
     const reason = _fallbackText(opts.reason || 'all media providers exhausted', 120);
     const canvasLib = _getCanvasLibForFallback();
     if (!canvasLib?.createCanvas) {
@@ -942,14 +958,17 @@ function createAgenticGraphicFallback(scene, opts = {}) {
 
         ctx.fillStyle = accent;
         ctx.fillRect(190, 220, 12, 640);
-        ctx.fillStyle = 'rgba(255,255,255,0.86)';
-        ctx.font = '700 34px Arial, sans-serif';
-        ctx.fillText('DOCUMENTARY CONTEXT', 235, 280);
 
+        // There used to be a fixed eyebrow reading "DOCUMENTARY CONTEXT" above
+        // the title. It said nothing about the scene, appeared on every card in
+        // every video, and was the single clearest tell that the viewer was
+        // looking at generated filler rather than a shot. The title below is
+        // already the scene's subject, so the label was pure noise — dropped,
+        // and the title starts where it used to sit.
         ctx.fillStyle = '#ffffff';
         ctx.font = '800 82px Arial, sans-serif';
         const titleLines = _wrapCanvasText(ctx, title, 1110, 3);
-        let y = 390;
+        let y = 330;
         for (const line of titleLines) {
             ctx.fillText(line, 235, y);
             y += 92;
@@ -964,11 +983,27 @@ function createAgenticGraphicFallback(scene, opts = {}) {
             y += 52;
         }
 
-        const chips = [
-            keyword,
-            _fallbackText(scene?._mediaAgentPlan?.viewerNeed || scene?.sourceHint || 'contextual visual', 44),
-            _fallbackText(reason, 48),
-        ].filter(Boolean);
+        // Deliberately NOT including `reason` — see the note where it is built.
+        //
+        // Two chips used to be painted unconditionally, and in practice both were
+        // noise. The first was the keyword, which is usually the same string as
+        // the title directly above it — the card said "inflation" twice. The
+        // second fell back to `sourceHint` ("stock") or the literal "contextual
+        // visual": an internal lane name and a fixed label, neither of which
+        // means anything to a viewer. That is the same defect as the eyebrow
+        // removed above, so it gets the same treatment: a chip has to carry
+        // something the title does not already say, or it is not drawn. If
+        // nothing qualifies, the card shows no chips at all.
+        const titleKey = String(title || '').trim().toLowerCase();
+        const chips = [];
+        for (const raw of [keyword, scene?._mediaAgentPlan?.viewerNeed]) {
+            const label = _fallbackText(raw, 44);
+            if (!label) continue;
+            const key = label.trim().toLowerCase();
+            if (!key || key === titleKey) continue;
+            if (chips.some(c => c.trim().toLowerCase() === key)) continue;
+            chips.push(label);
+        }
         ctx.font = '600 28px Arial, sans-serif';
         let chipX = 235;
         const chipY = 805;
@@ -2020,6 +2055,12 @@ function _isReferenceImageContext(context = null) {
 async function _detectReferenceImageTitleBanner(filePath, context = null) {
     if (!_isReferenceImageContext(context)) return null;
     try {
+        // Sniff BEFORE decoding. @napi-rs/canvas segfaults on a TIFF — no
+        // exception, so this try/catch would never see it and the whole build
+        // would die silently. A web-image URL ending .jpg can serve anything.
+        const { isCanvasSafeImage } = require('../util/image-bytes');
+        if (!isCanvasSafeImage(filePath)) return null;   // banner check is optional; skip, never crash
+
         const { createCanvas, loadImage } = require('@napi-rs/canvas');
         const image = await loadImage(filePath);
         const srcW = Number(image.width || 0);
@@ -3019,13 +3060,19 @@ function _strictRawDiscontinuityRejectReason(clipAnalysis, hunterProfile) {
 
 let _visionEnabled = false;
 let _scoreVideoFrame = null;
+let _verifyEditorialTextOverlay = null;
 
 function enableInlineVision() {
     try {
-        const { scoreVideoFrame, isVisionAvailable } = require('../vision/ai-vision');
+        const {
+            scoreVideoFrame,
+            verifyEditorialTextOverlay,
+            isVisionAvailable,
+        } = require('../vision/ai-vision');
         if (isVisionAvailable()) {
             _visionEnabled = true;
             _scoreVideoFrame = scoreVideoFrame;
+            _verifyEditorialTextOverlay = verifyEditorialTextOverlay;
             console.log(`  👁️ Inline vision scoring enabled`);
         }
     } catch {}
@@ -3055,6 +3102,7 @@ async function _scoreVideoMerged(filePath, keyword, context) {
             mediaAgent: context?.mediaAgent || null,
             mediaHunter: context?.mediaHunter || null,
             sourceProvider: context?.sourceProvider || '',
+            visualIntent: context?.visualIntent || '',
         });
         if (!clipAnalysis || typeof clipAnalysis.score !== 'number') return null;
 
@@ -3070,6 +3118,7 @@ async function _scoreVideoMerged(filePath, keyword, context) {
             console.log(`    🗺️  Topic-map rescue (merged): bumping ${baseScore} → 7/10`);
         }
 
+        let sanityRescued = false;
         if (!mapRescued) {
             const sanity = applyVisionScoreSanity(
                 { score: finalScore, description, parseError: !!clipAnalysis.parseError },
@@ -3080,7 +3129,19 @@ async function _scoreVideoMerged(filePath, keyword, context) {
             if (sanity?.scoreSanity?.adjusted) {
                 console.log(`    [Score Sanity] merged clip: ${sanity.scoreSanity.from}/10 -> ${sanity.scoreSanity.to}/10 (${sanity.scoreSanity.reason})`);
                 finalScore = sanity.score;
+                sanityRescued = true;
             }
+        }
+
+        // The model answered, but we could not read a score out of it, and the
+        // description was not enough to rescue it either. That is "not judged",
+        // never "judged bad" — returning 0 here would bin a clip nobody rejected.
+        // Fall through to the per-frame path, exactly as the caller below already
+        // documents; before the parser signalled parseError this branch was
+        // unreachable, so an unreadable answer silently became a 0.
+        if (clipAnalysis.parseError && !mapRescued && !sanityRescued) {
+            console.log(`    ↺ [Merged] score unreadable in the model's reply — re-scoring per-frame instead of binning`);
+            return null;
         }
 
         // Mismatch penalty (same as per-frame path).
@@ -3359,7 +3420,30 @@ async function _scoreDownloadedMedia(filePath, ext, keyword, context) {
         // the subject (shipping lane, cargo ship, port, map) get rejected.
         // Without this, an abstract red motion-blur PNG scored 5/10 simply
         // because Qwen pattern-matched the word "instability" from the scene.
-        const rawImgResult = await _scoreVideoFrame(base64, mimeType, keyword, context);
+        let rawImgResult = await _scoreVideoFrame(base64, mimeType, keyword, context);
+        let overlayVerification = null;
+        if (_EDITORIAL_OVERLAY_PREFIX_RE.test(String(rawImgResult?.description || ''))) {
+            overlayVerification = _verifyEditorialTextOverlay
+                ? await _verifyEditorialTextOverlay(base64, mimeType)
+                : null;
+            if (overlayVerification?.present) {
+                console.log(`    [Overlay OCR] confirmed "${_short(overlayVerification.text, 70)}" (${overlayVerification.confidence}/10)`);
+            } else {
+                console.log('    [Overlay OCR] vision overlay claim was not confirmed from pixels; rescoring without source metadata');
+                const rescored = await _scoreVideoFrame(base64, mimeType, keyword, {
+                    ...(context || {}),
+                    sourceTitle: '',
+                    overlayVerifiedAbsent: true,
+                });
+                if (rescored) rawImgResult = rescored;
+                if (_EDITORIAL_OVERLAY_PREFIX_RE.test(String(rawImgResult?.description || ''))) {
+                    rawImgResult = {
+                        ...rawImgResult,
+                        description: 'Pixel-only text check was unconfirmed; candidate judged on visual fit only.',
+                    };
+                }
+            }
+        }
         const imgResult = applyVisionScoreSanity(rawImgResult, keyword, context, { floor: 5 });
         if (!imgResult) return null;
         if (imgResult?.scoreSanity?.adjusted) {
@@ -3376,9 +3460,24 @@ async function _scoreDownloadedMedia(filePath, ext, keyword, context) {
         if (imgPenalty.penalty > 0) {
             console.log(`    ⛔ Image mismatch penalty -${imgPenalty.penalty} (${imgPenalty.reasons.join('; ')}) → ${imgResult.score} → ${imgPenalty.score}`);
         }
-        const bannerArtifact = imgPenalty.score > 4
+        const bannerSuspect = imgPenalty.score > 4
             ? await _detectReferenceImageTitleBanner(filePath, context)
             : null;
+        let bannerArtifact = null;
+        if (bannerSuspect?.reject) {
+            const confirmation = overlayVerification
+                || (_verifyEditorialTextOverlay
+                    ? await _verifyEditorialTextOverlay(base64, mimeType)
+                    : null);
+            if (confirmation?.present) {
+                bannerArtifact = {
+                    ...bannerSuspect,
+                    reason: `${bannerSuspect.reason}; OCR "${_short(confirmation.text, 70)}" (${confirmation.confidence}/10)`,
+                };
+            } else {
+                console.log(`    Image artifact guard ignored (${bannerSuspect.reason}) — no pixel/OCR text confirmation`);
+            }
+        }
         const finalScore = bannerArtifact?.reject ? Math.min(4, imgPenalty.score) : imgPenalty.score;
         const penaltyReasons = [...imgPenalty.reasons];
         let description = imgResult.description;
@@ -3666,18 +3765,43 @@ function getSmartPriority(sourceHint, mediaType, scriptContext) {
 
     // === POST-FILTERS ===
 
-    // Niche allowlist: only keep providers listed in niche's footagePriority
-    // This ensures removing a provider from a niche actually takes effect
-    // regardless of which priority map was used above.
+    // Completeness tail: whichever tier above produced the order, it was a
+    // *preference list*, not the set of providers that exist. When the niche
+    // supplied it (tier 2) the order literally IS the niche's two or three
+    // favourites — so every other provider was unreachable through the
+    // deterministic path no matter how badly the favourites were doing.
+    //
+    // Every remaining provider for this media type is appended at the tail, in
+    // the app's default order. Nothing that led before leads any less; we only
+    // stop the ladder from ending early. The rungs added here are the ones the
+    // scene reaches after its preferred sources have already failed it — which
+    // is exactly the moment a scene used to ship with no footage at all.
+    const universe = mediaType === 'video' ? VIDEO_PRIORITY : IMAGE_PRIORITY;
+    for (const p of universe) {
+        if (!order.includes(p)) order.push(p);
+    }
+
+    // Niche preference: providers the topic asks for come FIRST — but the ones
+    // it does not ask for are demoted, never deleted.
+    //
+    // This used to be a hard allowlist (`order.filter(...)`), which turned a
+    // preference into a capability ceiling. Because every niche lists only
+    // `pexels, pixabay` for images, Brave was removed from every topic in the
+    // app and could never be reached deterministically no matter how badly the
+    // first two were doing; Bing only survived through a hardcoded rescue right
+    // here. A topic saying "I like stock best" must not mean "I would rather
+    // ship a scene with no footage than open anything else".
+    //
+    // Real bans still delete: `excludeVideoProviders` below, the disabled-
+    // provider list, and whatever the user switched off in the UI.
     if (nicheId) {
         const niche = getNiche(nicheId);
-        const nicheAllowed = niche.footagePriority?.[mediaType];
-        if (nicheAllowed && nicheAllowed.length > 0) {
-            const allowedSet = new Set(nicheAllowed);
-            if (mediaType === 'image' && sourceHint && sourceHint !== 'stock') {
-                allowedSet.add('bing');
-            }
-            order = order.filter(p => allowedSet.has(p));
+        const nichePreferred = niche.footagePriority?.[mediaType];
+        if (nichePreferred && nichePreferred.length > 0) {
+            const preferredSet = new Set(nichePreferred);
+            const preferred = order.filter(p => preferredSet.has(p));
+            const demoted = order.filter(p => !preferredSet.has(p));
+            order = [...preferred, ...demoted];
         }
     }
 
@@ -4242,6 +4366,28 @@ function _scoreResultAgainstProtectedTerms(result, protectedTerms) {
     return score;
 }
 
+/**
+ * Re-apply the small-image reserve tail AFTER every title-based ranker has run.
+ *
+ * Size is a RANKING, never a reject: a sub-1280x720 photo is kept so a scene can
+ * never end up empty, but it must lose to any full-size photo that exists.
+ * filterResults() expresses that by appending the small ones with _undersized,
+ * and then _rankResultsByProtectedTerms / rankResultsForHunter each re-sort the
+ * whole array on their own title score — which puts a keyword-rich 640x427 back
+ * ahead of a plain-titled 1920x1280. This is a stable partition, so the rankers'
+ * work is fully preserved WITHIN each group; only the big-beats-small split is
+ * restored on top. No-op unless the list actually mixes both.
+ */
+function _reserveUndersizedTail(results, providerName) {
+    if (!Array.isArray(results) || results.length < 2) return results;
+    const big = [];
+    const small = [];
+    for (const r of results) (r && r._undersized ? small : big).push(r);
+    if (!small.length || !big.length) return results;
+    console.log(`  📐 [${providerName}] ${small.length} under-size image(s) held behind ${big.length} full-size one(s)`);
+    return big.concat(small);
+}
+
 function _rankResultsByProtectedTerms(results, scene, providerName) {
     const protectedTerms = _sceneProtectedTerms(scene, { searchGuard: true });
     if (!protectedTerms.length || results.length < 2) return results;
@@ -4792,6 +4938,39 @@ function _sceneAbortSignal(scene) {
     return _isAbortSignalLike(scene?._abortSignal) ? scene._abortSignal : null;
 }
 
+/**
+ * Merge several abort signals into one, so a download can be stopped by
+ * whichever authority gives up first: the scene (the whole scene ran out of
+ * time) or this one race soldier (only THIS candidate was abandoned).
+ *
+ * Before this existed only the scene signal was passed down, which meant an
+ * abandoned soldier kept downloading at full speed — competing with the live
+ * batch for the same bandwidth and the same rented GPU.
+ *
+ * @param {...(AbortSignal|null|undefined)} signals
+ * @returns {AbortSignal|null} null when nothing real was passed
+ */
+function _combineAbortSignals(...signals) {
+    const real = signals.filter(_isAbortSignalLike);
+    if (real.length === 0) return null;
+    if (real.length === 1) return real[0];
+    // Node 20+ / Electron: one line, and it cleans up its own listeners.
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function') {
+        try { return AbortSignal.any(real); } catch (_) { /* fall through */ }
+    }
+    const ctl = new AbortController();
+    for (const signal of real) {
+        if (signal.aborted) {
+            try { ctl.abort(signal.reason); } catch (_) { ctl.abort(); }
+            return ctl.signal;
+        }
+        signal.addEventListener('abort', () => {
+            try { ctl.abort(signal.reason); } catch (_) { ctl.abort(); }
+        }, { once: true });
+    }
+    return ctl.signal;
+}
+
 // ============ DOWNLOAD LOGIC ============
 
 /**
@@ -4836,6 +5015,13 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
         sourceHint = safeSourceHint;
         if (scene) scene.sourceHint = sourceHint;
     }
+    // What we ACTUALLY want to see, in full, before any shortening. The query we
+    // send a provider has to be short; the judge that decides if a clip is right
+    // must not be graded against that short version. Captured once, up front.
+    const fullVisualIntent = _fallbackText(
+        scene?.visualIntent || scene?.searchKeyword || scene?.keyword || keyword || '',
+        220,
+    );
     if (scene) {
         if (options.forceKeywordQuery === true) {
             // Forced retry/repair queries are deliberate exploration. Trim only
@@ -5057,6 +5243,22 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
     } else if (_shouldPromoteYouTubeForMaritimeBroll(scene, keyword, hunterProfile) && priorityOrder.includes('youtube')) {
         console.log(`  [YouTube B-roll] maritime/canal signal noted (Media Agent keeps provider authority)`);
     }
+    // Live evidence correction. The Media Agent keeps authority over WHICH
+    // providers make sense for this scene; this only re-ranks what it chose,
+    // using what those same providers have actually delivered in THIS build.
+    // A provider with several openings and no wins sinks; a provider that keeps
+    // winning rises. Bounded to a couple of places and never removes anything,
+    // so one lucky or unlucky scene cannot hijack the ordering.
+    if (priorityOrder.length > 1) {
+        const adjusted = providerScoreboard.adjustOrder(priorityOrder, mediaType);
+        if (adjusted.moved.length > 0) {
+            priorityOrder = adjusted.order;
+            const detail = adjusted.moved
+                .map(m => `${m.provider} ${m.from + 1}->${m.to + 1} (${m.winRate} win rate over ${m.opens})`)
+                .join(', ');
+            console.log(`  [Provider Scoreboard] this build's record re-ranked the mission: ${detail}`);
+        }
+    }
     if (priorityOrder.length > 0) {
         console.log(`  [Media Agent] final provider mission -> ${priorityOrder.slice(0, 6).join(' > ')}${priorityOrder.length > 6 ? ' > ...' : ''}`);
     }
@@ -5155,16 +5357,32 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
     }
 
     let providersStarted = 0;
+    // When the ladder stops before the bottom, say so and say what was left.
+    // A scene that ends with no footage while three providers were never opened
+    // is a very different bug from one that genuinely ran out of options, and
+    // until now the log could not tell them apart.
+    let ladderIndex = -1;
+    const bailOut = (why) => {
+        const untried = providers.slice(Math.max(0, ladderIndex)).map(p => getProviderKey(p));
+        if (untried.length > 0) {
+            console.log(`  [Provider Ladder] stopped at rung ${ladderIndex + 1}/${providers.length} — ${why}. `
+                + `Never opened: ${untried.join(', ')}`);
+        }
+        return null;
+    };
     for (const provider of providers) {
+        ladderIndex++;
         if (isAborted()) {
             console.log(`  ⏱️ Scene aborted — stopping provider loop`);
-            return null;
+            return bailOut('scene aborted');
         }
         if (providersStarted > 0 && shouldReserveForControlledStock()) {
             console.log(`  [Deadline Reserve] ${Math.round(remainingMs() / 1000)}s left; reserving time for controlled stock-video fallback`);
-            return null;
+            return bailOut('reserving time for controlled stock-video fallback');
         }
-        if (!hasSceneBudget(providerStartMinBudgetMs, 'next provider')) return null;
+        if (!hasSceneBudget(providerStartMinBudgetMs, 'next provider')) {
+            return bailOut(`scene budget exhausted (${Math.round(remainingMs() / 1000)}s left)`);
+        }
         if (!provider.isAvailable()) continue;
 
         try {
@@ -5187,6 +5405,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                 continue;
             }
             providersStarted++;
+            providerScoreboard.recordOpen(mediaType, providerKey);
             const isStock = STOCK_PROVIDERS.has(providerKey);
             const isWeb = WEB_PROVIDERS.has(providerKey);
             const isYouTube = YOUTUBE_PROVIDERS.has(providerKey);
@@ -5247,6 +5466,47 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     console.log(`  Media Hunter: forced retry keeps "${searchQuery}"${providerQueryPlan.length > 1 ? ` (alt: ${providerQueryPlan.slice(1).join(' | ')})` : ''}`);
                 }
             }
+
+            // YouTube dialect. Everything above was tuned for stock/image APIs,
+            // where a query is a tag lookup — so by this point the chain has
+            // handed YouTube a string authored for Bing image search, deleted the
+            // words uploaders actually title with ("footage", "raw", "clip"),
+            // withheld the place name, and clamped the remainder to ~5 words.
+            // On a tag API that is correct. On YouTube it removes the signal.
+            //
+            // Rebuild lane 1 in the uploader-title dialect and demote the
+            // stock-shaped string to a later lane rather than discarding it —
+            // two differently-phrased searches are strictly better evidence than
+            // one, and the loop below now credits videos that appear in both.
+            // Forced retries are exempt: those must search exactly what was asked.
+            let ytLadderLanes = 0;
+            if (isYouTube && !forceProviderQuery) {
+                const ytLadder = buildYouTubeQueryLadder(keyword, scene, {
+                    protectedTerms: _sceneProtectedTerms(scene, { searchGuard: true }),
+                });
+                const ytQuery = ytLadder[0];
+                if (ytQuery) {
+                    const sameAsStock = ytQuery.toLowerCase() === String(searchQuery || '').toLowerCase();
+                    // Rung 2 outranks the stock-shaped string: it is still the
+                    // YouTube dialect, just broader. The stock phrasing stays as
+                    // a later lane rather than being dropped.
+                    //
+                    // Queued even when rung 1 happens to equal the stock string:
+                    // the broad rung is the half that found the root cellar and
+                    // the natural spring, and it does not stop being useful just
+                    // because the narrow rung came out identical to what the
+                    // stock cleaner produced.
+                    if (ytLadder.length > 1) {
+                        providerQueryPlan = [...ytLadder.slice(1), searchQuery, ...providerQueryPlan];
+                        ytLadderLanes = ytLadder.length - 1;
+                    }
+                    if (!sameAsStock) {
+                        console.log(`  [YouTube Query] "${searchQuery}" -> ${ytLadder.map(q => `"${q}"`).join(' + ')} (uploader-title dialect)`);
+                        searchQuery = ytQuery;
+                    }
+                }
+            }
+
             let topicScoutResults = _topicScoutResultsForProvider(scene, providerKey, mediaType);
             if (providerKey === 'youtube' && youtubeChannelScope && topicScoutResults.length > 0) {
                 console.log(`  [YouTube Channel Scout] ignoring ${topicScoutResults.length} global YouTube scout candidate(s); using Kanal13AZ channel search`);
@@ -5322,7 +5582,12 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                 hunterProfile,
                 visualContract,
                 mediaAgentPlan,
-            });
+            })
+                // Each ladder rung the block above queued needs a lane of its own,
+                // otherwise the cap eats the broad rung and the stock phrasing the
+                // comment there promises to keep. Only widens for YouTube, and only
+                // by however many rungs were actually added.
+                + ytLadderLanes;
             const searchLanes = _uniqueQueryLanes([
                 searchQuery,
                 ...providerQueryPlan,
@@ -5334,6 +5599,20 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
             if (searchLanes.length > 1) {
                 console.log(`  [Media Agent] search lanes for ${provider.name}: ${searchLanes.map(q => `"${_short(q, 60)}"`).join(' -> ')}`);
             }
+            // Cross-lane agreement. A video that surfaces under two differently
+            // worded searches is far more likely to genuinely be about the
+            // subject than one that only matches a single phrasing — the second
+            // lane is an independent vote, and it is free (the search already
+            // ran). Counted here rather than after the merge because
+            // _mergeSearchResults DISCARDS the duplicate, so by then the
+            // agreement is gone.
+            const laneAgreement = new Map();
+            // YouTube must hear at least a second phrasing before the
+            // "enough results" shortcut fires. Elsewhere the shortcut is right:
+            // stock lanes return near-identical tag results, so lane 2 is
+            // redundant. On YouTube the lanes are different dialects of the same
+            // request and disagree constantly, which is exactly the point.
+            const minLanesBeforeEarlyStop = isYouTube ? Math.min(2, Math.max(1, searchLanes.length)) : 1;
             if (hasSceneBudget(searchMinBudgetMs, `${provider.name} live search`)) {
                 for (let laneIndex = 0; laneIndex < Math.max(1, searchLanes.length); laneIndex++) {
                     const laneQuery = searchLanes[laneIndex] || searchQuery;
@@ -5372,6 +5651,13 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             if (result && typeof result === 'object' && !result._sourceSearchQuery) {
                                 result._sourceSearchQuery = laneQuery;
                             }
+                            const identityKeys = result ? _candidateIdentityKeys(result) : [];
+                            for (const identityKey of identityKeys) {
+                                if (!identityKey) continue;
+                                let lanesSeen = laneAgreement.get(identityKey);
+                                if (!lanesSeen) laneAgreement.set(identityKey, (lanesSeen = new Set()));
+                                lanesSeen.add(laneIndex);
+                            }
                         }
                         liveResults = _mergeSearchResults(liveResults, laneResults || []);
                         if (laneIndex > 0 && laneResults?.length) {
@@ -5384,7 +5670,32 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             throw searchErr;
                         }
                     }
-                    if (!strictRawWebSearch && liveResults.length >= 20) break;
+                    if (!strictRawWebSearch && liveResults.length >= 20 && (laneIndex + 1) >= minLanesBeforeEarlyStop) break;
+                }
+            }
+            // Stamp the agreement count onto the surviving (merged) results so
+            // ranking can use it.
+            //
+            // YouTube only. Stamping every provider was the mistake: the ranker
+            // reads `_laneHits`, so stock and web results silently started being
+            // re-ordered by it too — and their lanes are near-identical tag
+            // queries, where agreeing twice means "the tag matched twice", not
+            // "two different phrasings independently found this". That is a
+            // behaviour change in lanes this work was supposed to leave alone.
+            if (isYouTube && laneAgreement.size > 0) {
+                let agreeing = 0;
+                for (const result of liveResults) {
+                    if (!result || typeof result !== 'object') continue;
+                    let hits = 1;
+                    for (const identityKey of _candidateIdentityKeys(result)) {
+                        const lanesSeen = laneAgreement.get(identityKey);
+                        if (lanesSeen && lanesSeen.size > hits) hits = lanesSeen.size;
+                    }
+                    result._laneHits = hits;
+                    if (hits > 1) agreeing++;
+                }
+                if (agreeing > 0) {
+                    console.log(`  [Media Agent] ${provider.name}: ${agreeing} result(s) appeared in more than one search phrasing`);
                 }
             }
             let results = liveResults;
@@ -5453,6 +5764,13 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
             const hardVisualEntityRequired = visualContract?.enabled
                 ? _hasHardVisualEntityRequirement(visualContract)
                 : false;
+            // Set by any provider-specific pass that has ALREADY looked at this
+            // candidate list's pictures before downloading (Storyblocks' grid,
+            // YouTube's SERP shot and storyboard screen). The generic thumbnail
+            // screen further down reads it so we never pay a second vision call
+            // to learn the same thing twice. A future provider that grows its
+            // own look just sets this flag.
+            let preDownloadLookApplied = false;
             if (mediaType === 'video' && visualContract?.enabled) {
                 let storyblocksThumbnailVisionApplied = false;
 
@@ -5470,6 +5788,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             getThumbUrl: (result) => result?._thumbUrl || result?.thumbUrl || '',
                         });
                         storyblocksThumbnailVisionApplied = true;
+                        preDownloadLookApplied = true;
                         for (const kept of tv.kept) {
                             if (kept && typeof kept === 'object') kept._thumbnailVisionPassed = true;
                         }
@@ -5647,8 +5966,89 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             });
                         }
                         results = tv.kept;
+                        preDownloadLookApplied = true;
                     } catch (e) {
                         console.log(`  ⚠️ Thumbnail Vision skipped (${e.message})`);
+                    }
+                }
+
+                // Storyboard Screen — LOOK INSIDE the video before downloading it.
+                //
+                // Everything above this line picks a YouTube video from its TITLE:
+                // a string an uploader typed for humans, full of SEO padding, and
+                // frequently describing something the video does not show. That is
+                // how a build spends minutes downloading and vision-scoring a clip
+                // it was never going to keep, and why the honest fix is upstream of
+                // the download rather than another rescue rung after it.
+                //
+                // YouTube publishes free sprite-sheet storyboards — a visual index
+                // of the whole video. For one small fetch and a couple of vision
+                // calls we can pack them into contact sheets and ask the same
+                // presence question the Storyboard Scout already uses, before
+                // committing to a multi-minute download.
+                //
+                // RANKING, NOT A GATE. A yes promotes; a no demotes but keeps the
+                // candidate (the screen samples frames, so a brief appearance can be
+                // missed); no answer at all changes nothing. Worst case we race the
+                // same list in the same order we would have anyway.
+                if (results.length > 1
+                    && providerKey === 'youtube'
+                    && !youtubeChannelScope
+                    && hasSceneBudget(25_000, `${provider.name} storyboard screen`)) {
+                    try {
+                        const { screenVideos } = require('./storyboard-scout');
+                        const topN = Math.max(2, Math.min(8, parseInt(process.env.YOUTUBE_STORYBOARD_SCREEN_TOP || '5', 10) || 5));
+                        const shortlist = results.slice(0, topN);
+                        const idOf = (r) => String(r?.id || (String(r?.url || '').match(/[?&]v=([^&]+)/) || [])[1] || '').trim();
+                        const screens = await screenVideos(keyword, shortlist.map(idOf), {
+                            ytdlpPath: provider._ytdlpPath,
+                            sceneText: scene?.text || '',
+                            signal: abortSignal,
+                            deadlineMs: Math.max(10_000, Math.min(45_000, remainingMs() - 20_000)),
+                        });
+                        if (screens.size > 0) {
+                            preDownloadLookApplied = true;
+                            let saw = 0, missed = 0;
+                            for (const result of shortlist) {
+                                const screen = screens.get(idOf(result));
+                                if (!screen || !result || typeof result !== 'object') continue;
+                                result._storyboardScreen = screen;
+                                if (screen.present && screen.strictConfirmed !== false && screen.source !== 'cover') {
+                                    saw++;
+                                    // Same meaning as the thumbnail gates above — a
+                                    // cheap look confirmed the subject — so it feeds
+                                    // the race's existing pre-download evidence bonus
+                                    // instead of inventing a parallel signal.
+                                    result._thumbnailVisionPassed = true;
+                                } else {
+                                    missed++;
+                                }
+                            }
+                            if (saw || missed) {
+                                // Stable partition, best evidence first:
+                                //   0  answered BOTH the plain and the specific question
+                                //   1  weaker yes — either the plain question only (right
+                                //      kind of thing, maybe not the right thing), or a
+                                //      cover picture instead of frames from the video
+                                //   2  never screened — no evidence either way
+                                //   3  looked and did not see it
+                                // Order inside each band is preserved, so the media
+                                // scout's ranking still decides ties.
+                                const band = (r) => {
+                                    const s = r?._storyboardScreen;
+                                    if (!s) return 2;
+                                    if (!s.present) return 3;
+                                    return (s.strictConfirmed === false || s.source === 'cover') ? 1 : 0;
+                                };
+                                const order = new Map(results.map((r, i) => [r, i]));
+                                results = [...results].sort((a, b) => (band(a) - band(b)) || (order.get(a) - order.get(b)));
+                                const top = results[0]?._storyboardScreen;
+                                const weak = shortlist.filter(r => r?._storyboardScreen?.strictConfirmed === false).length;
+                                console.log(`  🗺️ [Storyboard Screen] looked inside ${screens.size} video(s) before downloading: ${saw} show "${top?.probe || keyword}", ${missed} don't${weak ? `, ${weak} only loosely` : ''}${saw ? ` — racing "${_short(results[0]?.title || '', 60)}" first` : ''}`);
+                            }
+                        }
+                    } catch (e) {
+                        console.log(`  ⚠️ Storyboard Screen skipped (${e.message})`);
                     }
                 }
 
@@ -5689,6 +6089,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             });
                         }
                         results = tv.kept;
+                        preDownloadLookApplied = true;
                     } catch (e) {
                         console.log(`  Warning: Storyblocks Thumbnail Vision skipped (${e.message})`);
                     }
@@ -5725,6 +6126,66 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
             });
             results = _rankResultsByProtectedTerms(results, scene, provider.name);
             results = rankResultsForHunter(results, hunterProfile, provider.name);
+
+            // Thumbnail Screen — LOOK at the free preview pictures before
+            // committing to any download.
+            //
+            // Everything above this line ordered the candidates from TEXT: the
+            // title an uploader typed, the tags a stock library assigned. That
+            // is how a build downloads and vision-scores hundreds of clips it
+            // was never going to keep — the scene only races the top few, so a
+            // list ordered by text is a list that downloads the wrong ones
+            // first.
+            //
+            // Every provider hands back a preview picture for free. Twenty-five
+            // of them pack into ONE grid and cost ONE vision call, which is the
+            // same trick the Storyboard Screen uses on YouTube, applied to the
+            // lanes that actually carry the volume.
+            //
+            // RANKING, NOT A GATE — see screenThumbnailGrid(). Nothing is ever
+            // dropped here, and a screen that names no winner changes nothing
+            // at all, so the worst case is the order we would have raced anyway.
+            if (results.length > 1
+                && !preDownloadLookApplied
+                && visualContract?.enabled
+                && results.some(r => r && (r._thumbUrl || r.thumbUrl))
+                && hasSceneBudget(THUMBNAIL_SCREEN_MIN_BUDGET_MS, `${provider.name} thumbnail screen`)) {
+                try {
+                    const screen = await _thumbnailScreen(results, visualContract, scene, {
+                        providerName: provider.name,
+                        niche: nicheId || '',
+                        getThumbUrl: (result) => result?._thumbUrl || result?.thumbUrl || '',
+                    });
+                    if (screen.log) console.log(screen.log);
+                    if (screen.saw > 0) {
+                        // Same meaning as every other pre-download look in this
+                        // file — a cheap glance confirmed the subject — so it
+                        // feeds the race's existing evidence bonus rather than
+                        // inventing a parallel signal. Only ever set to true:
+                        // a `no` here is a demotion, and writing `false` would
+                        // turn this ranking into the rejection it must not be.
+                        for (const result of screen.confirmed) {
+                            if (result && typeof result === 'object') result._thumbnailVisionPassed = true;
+                        }
+                        _recordMediaProvider(scene, {
+                            provider: provider.name,
+                            key: providerKey,
+                            mediaType,
+                            query: searchQuery,
+                            status: 'info',
+                            reason: `thumbnail screen promoted ${screen.saw} visually-confirmed candidate(s) ahead of ${screen.missed} mismatch(es)`,
+                            resultCount: screen.ranked.length,
+                            candidates: screen.ranked.slice(0, 12),
+                        });
+                    }
+                    results = screen.ranked;
+                } catch (e) {
+                    console.log(`  Thumbnail Screen skipped (${e.message})`);
+                }
+            }
+
+            // Last word on ordering for images: big beats small, everything else equal.
+            results = _reserveUndersizedTail(results, provider.name);
             if (mediaType === 'video'
                 && results.length > 2
                 && visualContract?.enabled
@@ -5922,8 +6383,23 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     continue;
                 }
 
-                const raceProcessOne = async (selected, raceAttempt) => {
+                const raceProcessOne = async (selected, raceAttempt, raceControl = {}) => {
                     if (!selected) return { accepted: false };
+                    // The race hands each soldier its own abort signal. Once it
+                    // fires, this soldier's result is thrown away no matter what
+                    // it returns — so every euro spent past that point (a vision
+                    // call, a deep clip analysis, the rest of a download) is pure
+                    // waste that also slows down the soldiers still being listened
+                    // to. `_abandoned()` is the checkpoint before each of them.
+                    const soldierSignal = _isAbortSignalLike(raceControl?.signal) ? raceControl.signal : null;
+                    const _abandoned = () => !!soldierSignal?.aborted;
+                    const soldierSignals = _combineAbortSignals(abortSignal, soldierSignal);
+                    // Nobody is listening for this soldier's return value once it
+                    // is abandoned, so the orchestrator's loser cleanup can never
+                    // see its file. It has to clean up after itself.
+                    const _dropOwnFile = (p) => {
+                        try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
+                    };
                     const reusableMemoryAssetPath = _getReusableMediaMemoryAsset(selected);
                     const dlUrl = selected.url || selected._cachedMeta?.url || selected._meta?.url || selected._directVideoUrl || selected._fallbackUrl || reusableMemoryAssetPath || '';
                     if (!dlUrl) return { accepted: false };
@@ -5969,6 +6445,12 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     const raceInFlightOpts = mediaType === 'video'
                         ? { minRemainingMs: RACE_INFLIGHT_GRACE_MS, extraCapMs: RACE_INFLIGHT_MAX_EXTENSION_MS }
                         : { minRemainingMs: Math.min(45_000, RACE_INFLIGHT_GRACE_MS), extraCapMs: Math.min(90_000, RACE_INFLIGHT_MAX_EXTENSION_MS) };
+                    // The WHOLE candidate stopwatch: download AND judging. The
+                    // per-candidate budget is spent on both, so both have to be
+                    // measured, or the budget shrinks to the size of half the job
+                    // and nothing can ever finish inside it.
+                    const _soldierStartedAt = Date.now();
+                    let _reachedVerdict = false;
                     _beginInFlight(scene, raceInFlightReason, raceInFlightOpts);
                     try {
                     const memoryAssetExt = reusableMemoryAssetPath ? path.extname(reusableMemoryAssetPath) : '';
@@ -5978,6 +6460,9 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                         `${filenameBase}.race-${raceAttempt + 1}-${Date.now().toString(36)}${providerExt}`
                     );
                     let finalPath = null;
+                    // Measured so patience tunes itself to what this provider
+                    // really costs on this machine/network, instead of a guess.
+                    const _dlStartedAt = Date.now();
                     try {
                         const downloadOptions = {
                             duration: sceneDuration,
@@ -5996,7 +6481,13 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             sourceTitle: String(selected.title || '').slice(0, 200),
                             sourceUrl: dlUrl,
                             sourceDuration: Number(selected.duration) > 0 ? Number(selected.duration) : null,
-                            abortSignal,
+                            // Scene deadline OR this soldier's own timeout —
+                            // whichever gives up first actually stops the bytes.
+                            abortSignal: soldierSignals,
+                            // The scene's wall-clock, so in-download look-inside work
+                            // (the storyboard deep scout) stops when the scene's time
+                            // does instead of running on and starving later providers.
+                            deadlineAt: scene?._deadlineAt || 0,
                         };
                         if (reusableMemoryAssetPath) {
                             finalPath = _copyReusableMediaMemoryAsset(selected, outputPath, provider.mediaType || mediaType);
@@ -6006,12 +6497,34 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             finalPath = await provider.download(selected.url, outputPath, downloadOptions);
                         }
                         _assertDownloadedFile(finalPath, provider.mediaType || mediaType, provider.name);
+                        // Only successful downloads are sampled. A download that
+                        // stalled tells us nothing about how long a working one
+                        // needs, and feeding stalls back would inflate patience
+                        // without bound.
+                        if (!reusableMemoryAssetPath) {
+                            downloadPatience.recordDownload({
+                                mediaType,
+                                providerKey,
+                                ms: Date.now() - _dlStartedAt,
+                            });
+                        }
                     } catch (e) {
                         console.log(`  [Race] download failed (${provider.name}): ${e.message?.slice(0, 100)}`);
                         try { if (finalPath && fs.existsSync(finalPath)) fs.unlinkSync(finalPath); } catch (_) {}
                         recordRaceAttempt('failed', `download failed: ${e.message}`, { path: finalPath || outputPath });
                         return { accepted: false, reason: `download failed: ${e.message}` };
                     }
+                    // Checkpoint 1 — the download finished, but did anyone still
+                    // want it? If this soldier was abandoned mid-download, the
+                    // file is already unreachable by the orchestrator, so bin it
+                    // here and stop before paying the AI to judge a clip whose
+                    // verdict will be discarded.
+                    if (_abandoned()) {
+                        _dropOwnFile(finalPath);
+                        recordRaceAttempt('rejected', 'race candidate abandoned (per-candidate timeout) — stopped before judging');
+                        return { accepted: false, reason: 'abandoned before judging', _abandoned: true };
+                    }
+
                     const finalExt = path.extname(finalPath);
 
                     // Vertical reject. Reddit is exempted as a provider (its
@@ -6062,6 +6575,11 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                         return { accepted: false, path: finalPath, reason: 'duplicate' };
                     }
 
+                    // The judging stopwatch. Everything from here to the verdict
+                    // is the half of a candidate's cost that used to be invisible
+                    // to the budget that pays for it.
+                    const _judgeStartedAt = Date.now();
+
                     // ffmpeg structural pre-screen (freeze/black detect)
                     if (['.mp4', '.webm', '.mkv', '.mov'].includes(finalExt.toLowerCase())) {
                         try {
@@ -6075,12 +6593,26 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                         } catch (_) { /* pre-screen failure non-fatal */ }
                     }
 
+                    // Checkpoint 2 — the AI judgement is the single most expensive
+                    // thing a soldier does, and the rented GPU has a fixed number
+                    // of lanes. An abandoned soldier queueing here is literally
+                    // taking a lane away from a soldier the race is still waiting
+                    // on, which is how one slow batch turned into six.
+                    if (_abandoned()) {
+                        _dropOwnFile(finalPath);
+                        recordRaceAttempt('rejected', 'race candidate abandoned (per-candidate timeout) — stopped before the AI judgement');
+                        return { accepted: false, reason: 'abandoned before judging', _abandoned: true };
+                    }
+
                     // Post-download vision scoring. Videos use the lightweight
                     // segment scorer; images use the normal image scorer so web
                     // text/banner/mismatch guards stay identical to serial mode.
                     let postScore = 0;
                     let postDesc = '';
                     let postApiError = false;
+                    // "The model answered, we just couldn't read a number out of it."
+                    // Deliberately NOT postApiError: that flag aborts the whole race.
+                    let postUnparsed = false;
                     let postApiErrorMsg = '';
                     let visionContext = null;
                     try {
@@ -6101,6 +6633,9 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                                 mediaType,
                                 sourceHint,
                                 keyword,
+                                // The full request, before shortening. The judge grades
+                                // against this, not against the provider-sized query.
+                                visualIntent: fullVisualIntent,
                         };
                         const visionResult = mediaType === 'image'
                             ? await _scoreDownloadedMedia(finalPath, finalExt, keyword, visionContext)
@@ -6130,13 +6665,15 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                                     keyword,
                                     visionContext,
                                     {
+                                        // Only reachable when the judge answered but the
+                                        // answer carried no readable number — the race gate
+                                        // below is a hard `< raceMinScore` compare, so an
+                                        // unjudged-but-strongly-matching candidate either
+                                        // clears the line or is skipped entirely. A readable
+                                        // score is never touched; the widened trigger that
+                                        // used to sit here promoted 27 real 1-5/10 verdicts
+                                        // straight onto the pass mark in a single build.
                                         floor: raceMinScore,
-                                        // Let strong borderline matches (usually 5/10 when
-                                        // the race needs 6/10) reach deep analysis/referee.
-                                        // This is still evidence-based: the shared helper
-                                        // requires scene-anchor coverage and blocks hard
-                                        // negatives such as slideshow/presenter/wrong subject.
-                                        triggerScore: Math.max(2, raceMinScore - 1),
                                     }
                                 );
                                 if (sanity?.scoreSanity?.adjusted) {
@@ -6144,12 +6681,16 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                                     postScore = Number(sanity.score || postScore);
                                     postDesc = String(sanity.description || postDesc);
                                 } else if (visionResult?.parseError && postScore <= 0) {
-                                    postApiError = true;
+                                    // Was `postApiError = true` — which made a working
+                                    // vision model that simply formatted its answer
+                                    // oddly look identical to a dead API, and 59 of
+                                    // these in one build tripped 9 race aborts.
+                                    postUnparsed = true;
                                     postApiErrorMsg = postApiErrorMsg || 'vision response missing numeric score';
                                 }
                             }
                         }
-                        if (!postApiError && postScore <= 0 && /\b(vision ai error|api error|timeout|timed out|unavailable|quota|rate limit|network)\b/i.test(`${postDesc} ${postApiErrorMsg}`)) {
+                        if (!postApiError && !postUnparsed && postScore <= 0 && /\b(vision ai error|api error|timeout|timed out|unavailable|quota|rate limit|network)\b/i.test(`${postDesc} ${postApiErrorMsg}`)) {
                             postApiError = true;
                             postApiErrorMsg = postApiErrorMsg || postDesc || 'vision scoring unavailable';
                         }
@@ -6168,6 +6709,25 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                         recordRaceAttempt('failed', `vision API unavailable: ${postApiErrorMsg.slice(0, 120)}`, { path: finalPath });
                         return { accepted: false, path: finalPath, reason: 'vision API unavailable', _visionApiFailed: true };
                     }
+
+                    // Unreadable scorecard: the service is fine, the answer just
+                    // didn't contain a number we could parse. Skip this candidate
+                    // without blacklisting it (it was never actually judged), and
+                    // WITHOUT counting toward the "vision is dead → abort the whole
+                    // race" tally — that conflation is what made a healthy model
+                    // shut the search down and fall back to placeholder scenes.
+                    if (postUnparsed) {
+                        console.log(`  [Race] ⚠️ vision score unreadable — candidate left unjudged (${postApiErrorMsg.slice(0, 80)})`);
+                        recordRaceAttempt('failed', `vision score unreadable: ${postApiErrorMsg.slice(0, 120)}`, { path: finalPath });
+                        return { accepted: false, path: finalPath, reason: 'vision score unreadable', _visionUnparsed: true };
+                    }
+
+                    // A real verdict exists. Sample how long judging cost, so the
+                    // next candidate's budget is sized against measurement instead
+                    // of a guess — and mark this soldier as one whose whole-span
+                    // timing is worth keeping (see the `finally` below).
+                    _reachedVerdict = true;
+                    downloadPatience.recordJudging({ mediaType, ms: Date.now() - _judgeStartedAt });
 
                     const raceTopicMapCandidate = providerKey === 'storyblocks'
                         && (
@@ -6212,6 +6772,14 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     // ONE_VISION_LAYER: skip the extra multi-frame deep analysis — the
                     // post-download vision score is the single verdict (downstream already
                     // "trusts post-vision" when this is absent).
+                    // Checkpoint 3 — a second, even more expensive multi-frame AI
+                    // pass. If the race already stopped listening, this candidate
+                    // cannot win, so there is nothing to learn by paying for it.
+                    if (_abandoned()) {
+                        _dropOwnFile(finalPath);
+                        recordRaceAttempt('rejected', 'race candidate abandoned (per-candidate timeout) — judged, but too late to be used');
+                        return { accepted: false, reason: 'abandoned after judging', _abandoned: true };
+                    }
                     if (!ONE_VISION_LAYER && isVideoRaceCandidate && hasSceneBudget(18_000, `race deep analysis ${provider.name}`)) {
                         try {
                             const clipDur = Number(selected.duration || selected._cachedMeta?.duration || 0) || sceneDuration;
@@ -6226,6 +6794,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                                 sourceTitle: String(selected.title || '').slice(0, 200),
                                 sourceUrl: dlUrl,
                                 sourceProvider: provider.name,
+                                visualIntent: fullVisualIntent,
                             });
                         } catch (e) {
                             console.log(`  [Race] deep analysis errored (${e.message?.slice(0, 80)}) — trusting post-vision ${postScore}/10`);
@@ -6338,28 +6907,57 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     };
                     } finally {
                         _endInFlight(scene, raceInFlightReason);
+                        // The whole-candidate sample. Gated on a real verdict:
+                        // a download failure or an early reject says nothing about
+                        // how long a WORKING candidate needs, and feeding those
+                        // short spans back is precisely how the budget shrank to
+                        // half a job and stopped fitting a whole one.
+                        downloadPatience.recordCandidate({
+                            mediaType,
+                            providerKey,
+                            ms: Date.now() - _soldierStartedAt,
+                            reachedVerdict: _reachedVerdict,
+                        });
                     }
                 };
 
-                const imageRaceTimeoutRaw = parseInt(process.env.IMAGE_RACE_CANDIDATE_TIMEOUT_MS || '45000', 10);
-                const footageRaceTimeoutRaw = parseInt(process.env.FOOTAGE_RACE_CANDIDATE_TIMEOUT_MS || '75000', 10);
-                let racePerCandidateTimeoutMs = mediaType === 'image'
-                    ? Number.isFinite(imageRaceTimeoutRaw) && imageRaceTimeoutRaw <= 0
-                    ? 0
-                    : Math.max(10_000, Math.min(300_000, Number.isFinite(imageRaceTimeoutRaw) ? imageRaceTimeoutRaw : 45_000))
-                    : Number.isFinite(footageRaceTimeoutRaw) && footageRaceTimeoutRaw <= 0
-                    ? 0
-                    : Math.max(20_000, Math.min(600_000, Number.isFinite(footageRaceTimeoutRaw) ? footageRaceTimeoutRaw : 75_000));
-                if (mediaType === 'video' && providerKey === 'storyblocks') {
-                    const storyblocksTimeout = parseInt(process.env.STORYBLOCKS_RACE_CANDIDATE_TIMEOUT_MS || '0', 10);
-                    racePerCandidateTimeoutMs = Number.isFinite(storyblocksTimeout) && storyblocksTimeout > 0
-                        ? Math.max(30_000, Math.min(600_000, storyblocksTimeout))
-                        : racePerCandidateTimeoutMs;
+                // Per-candidate patience is resolved per (topic, provider, media
+                // type, time left in this scene) and tunes itself against what
+                // downloads actually cost in this run — see download-patience.js.
+                // The scene-share clamp inside it is what keeps the retry and
+                // fallback steps behind this race reachable instead of decorative.
+                const patience = downloadPatience.resolveCandidatePatienceMs({
+                    mediaType,
+                    providerKey,
+                    nicheId: scriptContextRef?.nicheId,
+                    remainingSceneMs: remainingMs(),
+                    log: (msg) => console.log(msg),
+                });
+                const racePerCandidateTimeoutMs = patience.ms;
+                if (mediaType === 'video' || mediaType === 'image') {
+                    const label = mediaType === 'image' ? 'image soldier timeout' : 'soldier timeout';
+                    console.log(`  [Race] ${provider.name} ${label} ${racePerCandidateTimeoutMs > 0 ? `${Math.round(racePerCandidateTimeoutMs / 1000)}s` : 'disabled'}`
+                        + ` — ${patience.explain}; scene deadline remains the outer guard`);
                 }
-                if (mediaType === 'video') {
-                    console.log(`  [Race] ${provider.name} soldier timeout ${racePerCandidateTimeoutMs > 0 ? `${Math.round(racePerCandidateTimeoutMs / 1000)}s` : 'disabled'}; scene deadline remains the outer guard`);
-                } else if (mediaType === 'image') {
-                    console.log(`  [Race] ${provider.name} image soldier timeout ${racePerCandidateTimeoutMs > 0 ? `${Math.round(racePerCandidateTimeoutMs / 1000)}s` : 'disabled'}; scene deadline remains the outer guard`);
+                // Don't start work that cannot finish. If the scene has less time
+                // left than ONE candidate needs to download AND be judged, this
+                // race can only ever produce timed-out soldiers: it burns the last
+                // of the scene's clock, spends AI money on verdicts that arrive
+                // after the door closed, and still ends in a placeholder card.
+                // Stepping to the next provider is not giving up — a cheaper
+                // provider (a still instead of a clip) may well fit in what's left.
+                if (patience.viable === false) {
+                    console.log(`  ⏭️  [Race] skipping ${provider.name}: ${patience.explain.split(', ').pop()}`);
+                    _recordMediaProvider(scene, {
+                        provider: provider.name,
+                        key: providerKey,
+                        mediaType,
+                        query: searchQuery,
+                        status: 'skipped',
+                        reason: `not enough scene time for one full candidate (needs ~${Math.round(patience.minViableMs / 1000)}s incl. judging)`,
+                        race: true,
+                    });
+                    continue;
                 }
                 const raceWinner = await runCandidateRace({
                     candidates: racePool,
@@ -6471,6 +7069,10 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     if (removedRaceScratch > 0) {
                         console.log(`  [Temp Cleanup] kept race winner; removed ${removedRaceScratch} loser/stale race scratch file(s) for ${filenameBase}`);
                     }
+                    providerScoreboard.recordWin(mediaType, providerKey);
+                    // The wording that actually produced footage is proven
+                    // vocabulary for this video — protect its phrases from now on.
+                    try { rememberPhraseWin(searchQuery); } catch (_) {}
                     return {
                         path: raceWinner.path,
                         ext: raceWinner.ext,
@@ -6489,6 +7091,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                 const lockedProviders = new Set((mediaAgentProviderLock?.providers || []).map(k => String(k || '').toLowerCase()));
                 const providerIsLocked = (lockStrength === 'hard' || lockStrength === 'reference')
                     && (lockedProviders.size === 0 || lockedProviders.has(providerKey));
+                providerScoreboard.recordLoss(mediaType, providerKey, 'race exhausted, no winner');
                 if (providerIsLocked) {
                     console.log(`  [Race] no winner - ${provider.name} exhausted in army mode; staying inside locked provider family only`);
                 } else {
@@ -7019,7 +7622,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             : {}
                     ));
                     console.log(`  ⬇️  [${provider.name}] Downloading${attempt > 0 ? ` (attempt ${attempt + 1})` : ''}...`);
-                    const downloadOptions = { duration: sceneDuration, keyword: keyword, _directVideoUrl: selected._directVideoUrl || null, _cachedMeta: selected._cachedMeta || selected._meta || null, _fallbackUrl: selected._fallbackUrl || null, _smartStartTime: smartStartTime, sceneText: scene?.text || '', niche: nicheId || '', videoTopic: scriptContextRef?.summary || '', theme: scriptContextRef?.themeId || scriptContextRef?.theme || '', entities: entityContext.length ? entityContext : (scriptContextRef?.entities || []), mediaAgent: mediaAgentPlan, mediaHunter: hunterProfile, sourceTitle: selectedTitle, sourceUrl: selectedSourceUrl, sourceDuration: Number(selected.duration) > 0 ? Number(selected.duration) : null, abortSignal };
+                    const downloadOptions = { duration: sceneDuration, keyword: keyword, _directVideoUrl: selected._directVideoUrl || null, _cachedMeta: selected._cachedMeta || selected._meta || null, _fallbackUrl: selected._fallbackUrl || null, _smartStartTime: smartStartTime, sceneText: scene?.text || '', niche: nicheId || '', videoTopic: scriptContextRef?.summary || '', theme: scriptContextRef?.themeId || scriptContextRef?.theme || '', entities: entityContext.length ? entityContext : (scriptContextRef?.entities || []), mediaAgent: mediaAgentPlan, mediaHunter: hunterProfile, sourceTitle: selectedTitle, sourceUrl: selectedSourceUrl, sourceDuration: Number(selected.duration) > 0 ? Number(selected.duration) : null, abortSignal, deadlineAt: scene?._deadlineAt || 0 };
                     let finalPath = null;
                     if (reusableMemoryAssetPath) {
                         finalPath = _copyReusableMediaMemoryAsset(selected, outputPath, provider.mediaType || mediaType);
@@ -7069,12 +7672,19 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     const _isTemplateBackgroundSerial = mediaAgentPlan?.role === 'template-background'
                         || hunterProfile?.templateBackground === true;
                     const _allowVerticalForProvider = providerKey === 'reddit' && !_isTemplateBackgroundSerial;
-                    if (_videoExtsForProbe.has(finalExt.toLowerCase()) && fs.existsSync(finalPath)) {
+                    // Measure EVERY downloaded file, image included. The race path
+                    // already did this; the serial path used to probe video only, so a
+                    // still's size stayed whatever the site claimed — and the two stock
+                    // APIs claim the ORIGINAL's size while serving a smaller rendition.
+                    // The vertical REJECT below stays video-only: portrait stills are
+                    // deliberately kept (framing crops/floats them).
+                    const _isVideoFileForProbe = _videoExtsForProbe.has(finalExt.toLowerCase());
+                    if (fs.existsSync(finalPath)) {
                         try {
                             const { probeDimensions: _probeDims } = require('../agents/smart-segment');
                             const _ffmpegPath = config.paths?.ffmpeg || (process.platform === 'win32' ? 'C:\\ffmg\\bin\\ffmpeg.exe' : 'ffmpeg');
                             const dims = await _probeDims(_ffmpegPath, finalPath);
-                            if (!_allowVerticalForProvider && dims && dims.width > 0 && dims.height > 0 && dims.height > dims.width) {
+                            if (_isVideoFileForProbe && !_allowVerticalForProvider && dims && dims.width > 0 && dims.height > 0 && dims.height > dims.width) {
                                 const _tplTag = _isTemplateBackgroundSerial ? ' [template-background]' : '';
                                 console.log(`  ⛔ Vertical video rejected${_tplTag} (${dims.width}x${dims.height}) — unusable on 16:9 canvas`);
                                 _blacklistUrl(dlUrl, 1, `vertical ${dims.width}x${dims.height}`);
@@ -7343,6 +7953,8 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                                 mediaType,
                                 sourceHint,
                                 keyword,
+                                // Judge against the full request, not the shortened query.
+                                visualIntent: fullVisualIntent,
                             });
                             if (visionResult) {
                                 visionCache.set('vision', dlUrl, _cacheStart, {
@@ -7545,6 +8157,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                                     sourceTitle: selectedTitle,
                                     sourceUrl: selectedSourceUrl,
                                     sourceProvider: provider?.name || '',
+                                    visualIntent: fullVisualIntent,
                                 });
                                 if (clipAnalysis) {
                                     visionCache.set('deep', dlUrl, _deepCacheStart, {
@@ -8016,6 +8629,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                         try { fs.unlinkSync(deferredAccept.savedPath); } catch {}
                         deferredAccept = null;
                     }
+                    try { rememberPhraseWin(searchQuery); } catch (_) {}
                     const rememberedAcceptedSource = rememberMediaSource(selected, scene, scriptContextRef || {}, {
                         providerKey,
                         providerName: provider.name,
@@ -8279,6 +8893,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                                 candidates: filtered,
                             });
                             filtered = rankResultsForHunter(filtered, hunterProfile, retryProvider.name);
+                            filtered = _reserveUndersizedTail(filtered, retryProvider.name);
                             if (retryType === 'video') {
                                 const previewScout = await _previewScoutResults(filtered, {
                                     provider: retryProvider,
@@ -8330,7 +8945,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             if (!hasSceneBudget(18_000, `${retryProvider.name} AI retry download`)) break;
                             _beginInFlight(scene, `${retryProvider.name} AI-retry candidate (download+scoring)`);
                             console.log(`  ⬇️  [${retryProvider.name}] Retry with AI keyword...`);
-                            const retryDownloadOptions = { duration: sceneDuration, keyword: suggestion.keyword, _directVideoUrl: picked._directVideoUrl || null, _cachedMeta: picked._cachedMeta || picked._meta || null, _fallbackUrl: picked._fallbackUrl || null, _smartStartTime: picked._smartStartTime || null, sceneText: scene?.text || '', niche: nicheId || '', videoTopic: scriptContextRef?.summary || '', theme: scriptContextRef?.themeId || scriptContextRef?.theme || '', entities: entityContext.length ? entityContext : (scriptContextRef?.entities || []), mediaAgent: mediaAgentPlan, mediaHunter: hunterProfile, sourceTitle: pickedTitle, sourceUrl: pickedSourceUrl, sourceDuration: Number(picked.duration) > 0 ? Number(picked.duration) : null, abortSignal };
+                            const retryDownloadOptions = { duration: sceneDuration, keyword: suggestion.keyword, _directVideoUrl: picked._directVideoUrl || null, _cachedMeta: picked._cachedMeta || picked._meta || null, _fallbackUrl: picked._fallbackUrl || null, _smartStartTime: picked._smartStartTime || null, sceneText: scene?.text || '', niche: nicheId || '', videoTopic: scriptContextRef?.summary || '', theme: scriptContextRef?.themeId || scriptContextRef?.theme || '', entities: entityContext.length ? entityContext : (scriptContextRef?.entities || []), mediaAgent: mediaAgentPlan, mediaHunter: hunterProfile, sourceTitle: pickedTitle, sourceUrl: pickedSourceUrl, sourceDuration: Number(picked.duration) > 0 ? Number(picked.duration) : null, abortSignal, deadlineAt: scene?._deadlineAt || 0 };
                             let finalPath = await retryProvider.download(picked.url, outputPath, retryDownloadOptions);
                             _assertDownloadedFile(finalPath, retryProvider.mediaType || retryType, retryProvider.name);
                             let finalExt = path.extname(finalPath);
@@ -8364,6 +8979,8 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                                 mediaType: retryType,
                                 sourceHint,
                                 keyword: suggestion.keyword,
+                                // Judge against the full request, not the retry query.
+                                visualIntent: fullVisualIntent,
                             };
                             if (retryIsPreviewClip) {
                                 console.log(`  🩹 Preview clip (${retryProvider.name}) retry — bypassing vision/deep checks`);
@@ -8485,6 +9102,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                                         sourceProvider: retryProvider?.name || '',
                                         sourceTitle: pickedTitle,
                                         sourceUrl: pickedSourceUrl,
+                                        visualIntent: fullVisualIntent,
                                     });
                                     if (retryClipAnalysis) {
                                         console.log(`  🎬 Clip Analysis (retry): ${retryClipAnalysis.score}/10 | ${retryClipAnalysis.motion} motion | ${retryClipAnalysis.issues.length ? 'Issues: ' + retryClipAnalysis.issues.join(', ') : 'Clean'}`);
@@ -8739,6 +9357,16 @@ async function downloadAllMedia(scenes, scriptContext, options = {}) {
 
     // Initialize fresh provider instances with script context
     initProviders(scriptContext);
+
+    // Phrase memory: learn this script's own multi-word terms ("root cellar",
+    // "barn raising", "Gulf of Aden") BEFORE the first query is shortened, so
+    // scene 1 is treated as intelligently as scene 50. Read-only pass.
+    try {
+        const _phraseStats = observePhraseScenes(scenes);
+        if (_phraseStats && _phraseStats.learned > 0) {
+            console.log(`  [Phrases] ${_phraseStats.learned} multi-word term(s) protected from mid-phrase trimming this run`);
+        }
+    } catch (_) {}
     if (process.env.MEDIA_MEMORY_BANK !== '0') {
         initMediaMemoryBank(scriptContext || {}, { tempDir: config.paths.temp });
         const memorySummary = summarizeMediaMemoryBank();
@@ -9577,11 +10205,16 @@ async function downloadAllMedia(scenes, scriptContext, options = {}) {
                         key: 'agentic-visual-fallback',
                         mediaType: 'image',
                         query: keyword,
-                        status: 'accepted',
+                        // NOT 'accepted'. This card is what we draw when every
+                        // provider failed; recording it as a success is how a
+                        // build reported "0 missing" while shipping blanks.
+                        // `scene-coverage.js` treats it as uncovered and the
+                        // late rescue sweep comes back for it.
+                        status: 'placeholder',
                         reason: agenticFallback.reason,
                         path: agenticFallback.path,
                     });
-                    console.log(`  ✅ Scene ${si}: Agentic visual fallback created (no continuity reuse): ${path.basename(agenticFallback.path)}`);
+                    console.log(`  ⚠️ Scene ${si}: NO real footage found — placeholder card stands in (${agenticFallback.reason}); flagged for rescue`);
                 }
             }
 
@@ -9729,7 +10362,7 @@ async function downloadAllMedia(scenes, scriptContext, options = {}) {
                     key: 'agentic-visual-fallback',
                     mediaType: 'image',
                     query: scene.searchKeyword || scene.keyword || '',
-                    status: 'accepted',
+                    status: 'placeholder', // a timeout is a failure — see the twin above
                     reason: timeoutFallback.reason,
                     path: timeoutFallback.path,
                 });
@@ -9740,8 +10373,8 @@ async function downloadAllMedia(scenes, scriptContext, options = {}) {
                     mediaType: 'image',
                     reason: timeoutFallback.reason,
                 });
-                _originalConsoleLog(`  ✅ [Scene ${si}] timeout recovered with agentic visual fallback: ${path.basename(timeoutFallback.path)}`);
-                uiLog.sceneEvt('download', si, 'ok', 'Agentic Visual Fallback timeout recovery', path.basename(timeoutFallback.path));
+                _originalConsoleLog(`  ⚠️ [Scene ${si}] TIMED OUT with no footage — placeholder card stands in; flagged for rescue`);
+                uiLog.sceneEvt('download', si, 'timeout', 'no footage — placeholder stands in', path.basename(timeoutFallback.path));
             } else {
                 uiLog.sceneEvt('download', si, 'timeout', 'timed out', err.message);
                 scene.mediaFile = null;
@@ -9765,20 +10398,33 @@ async function downloadAllMedia(scenes, scriptContext, options = {}) {
     // hijack installation — aborted scene tasks can keep emitting logs for
     // minutes after we return, and the hijack is what silences them.
 
-    // Post-download: Probe dimensions for scenes missing them (YouTube, some web-image providers)
+    // Post-download: measure the REAL dimensions of every downloaded file.
+    //
+    // This used to run only when width/height were missing, which meant a wrong
+    // number was trusted forever. Stock APIs report the ORIGINAL photo's size
+    // while serving a smaller rendition, and explainer-image-provider invents a
+    // 1280x720 when the provider reports nothing — both survive a "fill the
+    // blanks" sweep untouched. Framing (Step 5.1) branches on this ratio, so a
+    // fabricated size is a fabricated crop. The file on disk is the only
+    // trustworthy source; measure it and let it win.
     let probeCount = 0;
-    for (const scene of scenes) {
-        if (scene.mediaFile && (!scene.mediaWidth || !scene.mediaHeight)) {
-            const dims = probeMediaDimensions(scene.mediaFile);
-            if (dims) {
-                scene.mediaWidth = dims.width;
-                scene.mediaHeight = dims.height;
-                probeCount++;
-            }
+    let correctedCount = 0;
+    for (let sIdx = 0; sIdx < scenes.length; sIdx++) {
+        const scene = scenes[sIdx];
+        if (!scene?.mediaFile) continue;
+        const dims = probeMediaDimensions(scene.mediaFile);
+        if (!dims || !(dims.width > 0) || !(dims.height > 0)) continue;
+        if (!scene.mediaWidth || !scene.mediaHeight) {
+            probeCount++;
+        } else if (scene.mediaWidth !== dims.width || scene.mediaHeight !== dims.height) {
+            console.log(`  📐 Scene ${sIdx + 1}: real size ${dims.width}x${dims.height} (was recorded as ${scene.mediaWidth}x${scene.mediaHeight})`);
+            correctedCount++;
         }
+        scene.mediaWidth = dims.width;
+        scene.mediaHeight = dims.height;
     }
-    if (probeCount > 0) {
-        console.log(`  🔍 Probed dimensions for ${probeCount} file(s)`);
+    if (probeCount > 0 || correctedCount > 0) {
+        console.log(`  🔍 Measured dimensions: ${probeCount} filled in, ${correctedCount} corrected`);
     }
 
     // ── Visual-diversity MMR (OPENMONTAGE-BORROW-PLAN #20) — OPT-IN. Break up
@@ -9839,15 +10485,22 @@ async function downloadAllMedia(scenes, scriptContext, options = {}) {
         }
     }
     const hitsSummary = Object.entries(providerHits).sort((a, b) => b[1] - a[1]).map(([p, c]) => `${p}(${c})`).join(', ');
+    // Placeholders are NOT ready. They used to be added in here, which is how a
+    // build could report full readiness while several scenes held nothing but a
+    // generated apology card. They are counted and named separately so the
+    // number on this line is the number of scenes that actually found footage.
     const readyBeforeContinuity = downloadStats.directAccepted
         + downloadStats.providerFallbackAccepted
         + downloadStats.typeFallbackAccepted
         + downloadStats.cached
         + downloadStats.resumed
-        + downloadStats.skipped
-        + downloadStats.agenticGraphicFallback;
-    console.log(`\n✅ Media download pass complete`);
-    console.log(`  Media readiness: ${readyBeforeContinuity}/${downloadStats.total} | accepted=${downloadStats.directAccepted} providerFallback=${downloadStats.providerFallbackAccepted} typeFallback=${downloadStats.typeFallbackAccepted} cached=${downloadStats.cached} resumed=${downloadStats.resumed} skipped=${downloadStats.skipped} agenticFallback=${downloadStats.agenticGraphicFallback} missing=${downloadStats.failed}`);
+        + downloadStats.skipped;
+    const notReal = downloadStats.agenticGraphicFallback + downloadStats.failed;
+    console.log(`\n${notReal > 0 ? '⚠️' : '✅'} Media download pass complete`);
+    console.log(`  Media readiness: ${readyBeforeContinuity}/${downloadStats.total} with real footage | accepted=${downloadStats.directAccepted} providerFallback=${downloadStats.providerFallbackAccepted} typeFallback=${downloadStats.typeFallbackAccepted} cached=${downloadStats.cached} resumed=${downloadStats.resumed} skipped=${downloadStats.skipped} placeholder=${downloadStats.agenticGraphicFallback} missing=${downloadStats.failed}`);
+    if (notReal > 0) {
+        console.log(`  ⚠️ ${notReal} scene(s) have NO real footage (${downloadStats.agenticGraphicFallback} placeholder, ${downloadStats.failed} empty) — the coverage sweep will try to rescue them`);
+    }
     console.log(`  Sources: ${hitsSummary || 'none'}\n`);
     return { scenes, stats: downloadStats };
 }
@@ -9945,4 +10598,4 @@ async function downloadBackgroundCanvas(themeId) {
     }
 }
 
-module.exports = { downloadMedia, downloadAllMedia, initProviders, scoreDownloadedMedia: _scoreDownloadedMedia, enableInlineVision, setLogSink, cleanupSceneTempMedia, cleanupSceneRaceTempMedia };
+module.exports = { downloadMedia, downloadAllMedia, initProviders, scoreDownloadedMedia: _scoreDownloadedMedia, enableInlineVision, setLogSink, cleanupSceneTempMedia, cleanupSceneRaceTempMedia, _getSmartPriority: getSmartPriority };

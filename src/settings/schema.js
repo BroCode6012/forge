@@ -42,11 +42,15 @@
         { key: 'buildNiche', el: 'build-niche', env: 'BUILD_NICHE', build: 'if', def: 'auto', persist: ['ls', 'fvp'], projEnv: true, group: 'Build' },
         { key: 'buildTheme', el: 'build-theme', env: 'BUILD_THEME', build: 'if', def: 'auto', persist: ['ls', 'fvp'], projEnv: true, group: 'Build' },
         { key: 'buildMapStylePack', el: 'build-map-style-pack', env: 'BUILD_MAP_STYLE_PACK', build: 'if', def: 'auto', persist: ['ls', 'fvp'], projEnv: true, group: 'Build' },
-        // buildProductionMode = the CATEGORY axis (faceless / talking-head / ai-stories). P4 adds allowedFormats.
+        // buildProductionMode = the CATEGORY axis (faceless / talking-head).
         { key: 'buildProductionMode', el: 'build-production-mode', env: 'BUILD_PRODUCTION_MODE', build: 'if', def: 'faceless', persist: ['ls', 'fvp'], projEnv: true, group: 'Category' },
         { key: 'buildLanguage', el: 'build-language', env: 'BUILD_LANGUAGE', build: 'if', def: 'auto', persist: ['ls', 'fvp'], group: 'Build' },
         { key: 'buildStyleProfile', el: 'build-style-profile', env: 'BUILD_STYLE_PROFILE', build: 'style', def: 'none', persist: ['ls', 'fvp'], projEnv: true, special: true, group: 'Build' },
-        { key: 'visionBackend', el: 'build-vision-backend', env: null, build: null, def: 'aws', persist: ['ls', 'fvp'], group: 'Vision' },
+        // WHERE footage gets scored. This MUST reach the build child: it decides which
+        // judge every candidate clip is shown to, and picking the wrong one is invisible
+        // (footage still gets scored, just by another model). It was env:null/build:null
+        // until 2026-08-04, so the dropdown only ever changed the app, never the build.
+        { key: 'visionBackend', el: 'build-vision-backend', env: 'VISION_BACKEND', build: 'if', def: 'aws', persist: ['ls', 'fvp'], group: 'Vision' },
 
         // ── Presenter (talking-head category) ──
         { key: 'presenterImage', el: null, env: 'BUILD_PRESENTER_IMAGE', build: 'if', def: '', persist: ['ls', 'fvp'], projEnv: true, group: 'Presenter' },

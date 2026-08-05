@@ -20,6 +20,12 @@ import sys
 import json
 import time
 import base64
+import socket
+
+from lightning_compat import (
+    friendly_start_error,
+    start_studio_compat,
+)
 
 # Force UTF-8 stdio (Windows cp1252 crashes on Unicode like '→' from tool output).
 try:
@@ -69,25 +75,90 @@ def is_running(studio):
 
 def ensure_gpu_machine(studio):
     """Make sure the Studio is on the GPU machine (programmatic start can land on CPU, which
-    makes vLLM crash with 'Failed to infer device type'). Switches to LIGHTNING_MACHINE (L4)
+    makes vLLM crash with 'Failed to infer device type'). Switches to LIGHTNING_MACHINE (T4)
     if the current machine isn't it. The persistent drive (incl. the model cache) survives the
     switch, so no re-download."""
-    desired = os.environ.get("LIGHTNING_MACHINE", "L4")
+    desired = os.environ.get("LIGHTNING_MACHINE", "T4")
     try:
         from lightning_sdk import Machine
         target = getattr(Machine, desired, None)
         if target is None:
-            log("Unknown machine '{}' — leaving as is".format(desired))
-            return
+            raise RuntimeError("Unknown LIGHTNING_MACHINE '{}'; expected an SDK machine such as T4 or L4".format(desired))
         current = str(getattr(studio, "machine", ""))
         if desired.lower() in current.lower():
             log("On GPU machine {} ✓".format(current))
-            return
+            return False
         log("On {} — switching to GPU machine {}…".format(current or "?", desired))
         studio.switch_machine(target)
-        log("Now on {}".format(getattr(studio, "machine", desired)))
+        switched = str(getattr(studio, "machine", ""))
+        if desired.lower() not in switched.lower():
+            raise RuntimeError(
+                "Lightning reported a machine switch, but the Studio is still on '{}' instead of '{}'.".format(
+                    switched or "unknown", desired
+                )
+            )
+        log("Now on {}".format(switched))
+        return True
     except Exception as e:
-        log("machine switch warning: {}".format(e))
+        message = friendly_start_error(e)
+        log("machine switch failed: {}".format(message))
+        raise RuntimeError(message) from e
+
+
+# Lightning's own port hostnames. These belong to exactly one Studio, so one must never be
+# reused for another account in the rotation pool.
+LITNG_HOST_RE = re.compile(r"\.cloudspaces\.litng\.ai\b", re.I)
+
+
+def same_endpoint(a, b):
+    """Compare two endpoints ignoring a trailing /v1 and trailing slashes."""
+    def norm(u):
+        u = (u or "").strip().rstrip("/")
+        return u[:-3].rstrip("/") if u.lower().endswith("/v1") else u
+    return norm(a) == norm(b)
+
+
+def host_resolves(url):
+    """Does this URL's hostname resolve to anything at all?
+
+    A hostname that does not resolve is DEAD — not slow, not booting. Checking it costs
+    milliseconds and is the difference between switching to a backup address immediately
+    and burning a paid GPU for 15 minutes waiting on a name that will never answer.
+    """
+    try:
+        host = url.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0].strip()
+        if not host:
+            return False
+        socket.getaddrinfo(host, None)
+        return True
+    except Exception:
+        return False
+
+
+def native_port_url(studio, port=8000):
+    """Lightning's OWN public address for a port on this Studio.
+
+    Needs no domain, no DNS record, no Cloudflare and no third party: the URL embeds the
+    studio id, so it is stable for the life of the studio. Returns "" when the installed
+    SDK is too old to expose ports (the caller then falls back to a tunnel).
+    """
+    want = str(port)
+    try:
+        for e in (studio.list_ports() or []):
+            ports = [str(p) for p in (getattr(e, "ports", None) or [])]
+            urls = [u for u in (getattr(e, "urls", None) or []) if u]
+            if want in ports and urls:
+                return urls[0].rstrip("/")
+    except Exception:
+        pass  # older SDK, or no ports yet — fall through and try to create one
+    try:
+        for e in (studio.add_ports({"vision": port}) or []):
+            urls = [u for u in (getattr(e, "urls", None) or []) if u]
+            if urls:
+                return urls[0].rstrip("/")
+    except Exception as e:
+        log("Lightning native port unavailable: {}".format(e))
+    return ""
 
 
 def cmd_status():
@@ -108,28 +179,45 @@ def cmd_start():
     # public tunnel URL DIRECTLY (fast HTTP), which is far more efficient for the long model load.
     url_timeout = float(os.environ.get("LIGHTNING_URL_TIMEOUT", "150"))
     s = get_studio()
+    start_info = {
+        "started": False,
+        "already_running": is_running(s),
+        "method": "existing",
+    }
 
-    if not is_running(s):
-        # Start DIRECTLY on the GPU machine (start() defaults to CPU-4, which makes vLLM crash
-        # and forces a slow CPU→L4 switch). Passing machine= avoids that ~3 min switch entirely.
-        desired = os.environ.get("LIGHTNING_MACHINE", "L4")
+    if not start_info["already_running"]:
+        # Start DIRECTLY on the configured GPU (start() can otherwise land on CPU-4, which makes
+        # vLLM crash and forces a slow CPU→GPU switch). Passing machine= avoids that switch.
+        desired = os.environ.get("LIGHTNING_MACHINE", "T4")
         interruptible = os.environ.get("LIGHTNING_INTERRUPTIBLE", "").lower() in ("1", "true", "yes")
         log("Studio stopped — starting on {}{}…".format(desired, " (interruptible)" if interruptible else ""))
-        try:
-            from lightning_sdk import Machine
-            target = getattr(Machine, desired, None)
-            if target is not None:
-                s.start(machine=target, interruptible=interruptible) if interruptible else s.start(machine=target)
-            else:
-                s.start()
-        except TypeError:
-            s.start()  # older SDK without machine arg → fall back, ensure_gpu_machine fixes it
-        log("Machine started.")
+        from lightning_sdk import Machine
+        target = getattr(Machine, desired, None)
+        if target is None:
+            raise RuntimeError("Unknown LIGHTNING_MACHINE '{}'; expected an SDK machine such as T4 or L4".format(desired))
+        start_info = start_studio_compat(
+            s,
+            target,
+            timeout=float(os.environ.get("LIGHTNING_START_TIMEOUT", "300")),
+            interruptible=interruptible,
+            max_runtime=(
+                int(os.environ["LIGHTNING_MAX_RUNTIME"])
+                if os.environ.get("LIGHTNING_MAX_RUNTIME")
+                else None
+            ),
+            log=log,
+        )
+        log("Machine started via {}.".format(start_info.get("method", "Lightning")))
     else:
         log("Studio already running.")
 
     # Safety net: if it somehow isn't on the GPU machine, switch (usually a no-op now).
-    ensure_gpu_machine(s)
+    switched_by_app = ensure_gpu_machine(s)
+    if switched_by_app:
+        # Even when the Studio was already running on CPU, the app now owns the
+        # paid GPU upgrade and must stop it after the build to prevent a billing leak.
+        start_info["started"] = True
+        start_info["method"] = "machine-switch"
 
     # Self-update the studio every start: push the latest serve script + (if configured) the
     # Cloudflare NAMED-tunnel token, so existing studios switch to the named tunnel automatically
@@ -160,12 +248,55 @@ def cmd_start():
     except Exception as e:
         log("serve launch warning: {}".format(e))
 
+    # Lightning's own public address for port 8000. Free, needs no domain and no DNS record,
+    # and stays valid for the life of the studio — so it is always worth having in hand as the
+    # automatic backup, whatever the configured tunnel is doing.
+    native = native_port_url(s)
+    if native:
+        log("Lightning direct address: {}".format(native))
+
     # NAMED tunnel → the public URL is FIXED (vision.<domain>), no log scraping needed.
     if token:
         fixed = os.environ.get("LIGHTNING_VISION_URL", "").strip()
-        log("Named tunnel — endpoint: {}".format(fixed or "(LIGHTNING_VISION_URL unset!)"))
-        emit({"ok": True, "url": fixed, "ready": False})
-        return
+        # A Lightning direct address belongs to ONE studio. The app persists whichever address
+        # last worked, so a direct address left over from another account in the pool would
+        # resolve perfectly and point at the wrong machine — answering 404 forever. Only ever
+        # trust a direct address that this studio just told us is its own.
+        if fixed and LITNG_HOST_RE.search(fixed) and same_endpoint(fixed, native) is False:
+            log("Ignoring a direct address that belongs to a different Studio.")
+            fixed = ""
+        # CONFIGURED IS NOT WORKING. A named tunnel only has a public hostname while the DNS
+        # record for it exists; move the domain off Cloudflare (or delete the record) and the
+        # tunnel stays connected and healthy while the address resolves to nothing. Detect that
+        # here — it costs milliseconds — instead of paying for a GPU nobody can reach.
+        if fixed and not host_resolves(fixed):
+            log("Configured address {} does not resolve — its DNS record is gone.".format(fixed))
+            fixed = ""
+        if not fixed and native:
+            fixed = native
+            log("Falling back to Lightning's direct address (no domain needed).")
+        if fixed:
+            log("Endpoint: {}".format(fixed))
+            emit({
+                "ok": True,
+                "url": fixed,
+                "altUrls": [u for u in [native] if u and u != fixed],
+                "ready": False,
+                "startedByApp": bool(start_info.get("started")),
+                "startMethod": start_info.get("method"),
+            })
+            return
+        # Last resort: neither the configured hostname nor Lightning's direct address works.
+        # The serve script started a NAMED tunnel (the token file is on the studio), so no
+        # trycloudflare URL can ever appear — drop the token and relaunch so it comes up in
+        # no-domain mode, then scrape as usual. The token is re-pushed on the next start, so
+        # this self-heals the moment the domain works again.
+        log("No usable address — restarting the tunnel in no-domain mode.")
+        try:
+            s.run("rm -f $HOME/.cf-tunnel-token; pkill -f 'cloudflared tunnel run' 2>/dev/null; true")
+            s.run("bash {} >/tmp/serve-launch.log 2>&1".format(serve_script))
+        except Exception as e:
+            log("no-domain relaunch warning: {}".format(e))
 
     # QUICK tunnel → scrape the random trycloudflare URL from the log (comes up in seconds).
     url = ""
@@ -187,9 +318,39 @@ def cmd_start():
     if url:
         # Hand the URL back immediately; Node waits for the model to finish loading by polling
         # this public URL directly (the model can take several minutes on a cold start).
-        emit({"ok": True, "url": url, "ready": False})
+        emit({
+            "ok": True,
+            "url": url,
+            "altUrls": [u for u in [native] if u and u != url],
+            "ready": False,
+            "startedByApp": bool(start_info.get("started")),
+            "startMethod": start_info.get("method"),
+        })
+    elif native:
+        # No tunnel came up, but Lightning's own address works without one.
+        log("No tunnel appeared — using Lightning's direct address instead.")
+        emit({
+            "ok": True,
+            "url": native,
+            "ready": False,
+            "startedByApp": bool(start_info.get("started")),
+            "startMethod": start_info.get("method"),
+        })
     else:
-        emit({"ok": False, "error": "no tunnel URL appeared within {}s".format(int(url_timeout))})
+        if start_info.get("started"):
+            log("No tunnel URL appeared; stopping the Studio to prevent billing.")
+            try:
+                s.stop()
+            except Exception as e:
+                log("automatic stop warning: {}".format(e))
+        # Every address route failed. That is the machine's environment, not this account's
+        # balance — rotating to another account would hit exactly the same wall, so say so.
+        emit({
+            "ok": False,
+            "error": "no reachable address for the GPU (tunnel gave none within {}s and Lightning's direct port is unavailable)".format(int(url_timeout)),
+            "retryable": False,
+            "globalFailure": True,
+        })
 
 
 def main():
@@ -204,7 +365,13 @@ def main():
         else:
             emit({"ok": False, "error": "unknown command: {}".format(cmd)})
     except Exception as e:
-        emit({"ok": False, "error": "{}: {}".format(type(e).__name__, e)})
+        if cmd == "start":
+            result = {"ok": False, "error": friendly_start_error(e)}
+            if hasattr(e, "retryable"):
+                result["retryable"] = bool(e.retryable)
+        else:
+            result = {"ok": False, "error": "{}: {}".format(type(e).__name__, e)}
+        emit(result)
 
 
 if __name__ == "__main__":

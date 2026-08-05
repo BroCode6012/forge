@@ -203,6 +203,114 @@ function _populateMgAnimationDropdown(mgType, currentAnimation) {
     row.style.display = '';
 }
 
+function _populateMgShellDropdown(mg) {
+    const row = document.getElementById('mg-shell-row');
+    const select = document.getElementById('mg-shell');
+    const registry = window._graphicShells;
+    if (!row || !select || !registry?.getGraphicShellRecipes) {
+        if (row) row.style.display = 'none';
+        return;
+    }
+    const recipes = registry.getGraphicShellRecipes();
+    select.innerHTML = '';
+    for (const recipe of recipes) {
+        const option = document.createElement('option');
+        option.value = recipe.id;
+        option.textContent = recipe.label;
+        option.title = recipe.description || '';
+        select.appendChild(option);
+    }
+    const currentPreset = mg?.graphicShellManual === true
+        ? String(mg?.graphicShell?.preset || '')
+        : 'auto';
+    if (currentPreset && recipes.some((recipe) => recipe.id === currentPreset)) {
+        select.value = currentPreset;
+    } else if (mg?.graphicShellManual === true) {
+        const custom = document.createElement('option');
+        custom.value = 'custom';
+        custom.textContent = 'Custom (Agent/API)';
+        custom.disabled = true;
+        select.appendChild(custom);
+        select.value = 'custom';
+    } else {
+        select.value = 'auto';
+    }
+    row.style.display = '';
+}
+
+function _applyManualGraphicShell(active, presetId) {
+    const registry = window._graphicShells;
+    if (!active || !registry?.getGraphicShellRecipes) return;
+    if (presetId === 'auto') {
+        _deleteMgField(active, 'graphicShell');
+        _deleteMgField(active, 'graphicShellManual');
+        if (active.mg.agenticComposition && typeof active.mg.agenticComposition === 'object') {
+            delete active.mg.agenticComposition.shell;
+            if (active.mg.agenticComposition.style) delete active.mg.agenticComposition.style.shell;
+        }
+        if (active.mg.mgData?.agenticComposition) {
+            delete active.mg.mgData.agenticComposition.shell;
+            if (active.mg.mgData.agenticComposition.style) {
+                delete active.mg.mgData.agenticComposition.style.shell;
+            }
+        }
+        return;
+    }
+    const recipe = registry.getGraphicShellRecipes().find((entry) => entry.id === presetId);
+    if (!recipe?.shell) return;
+    const shell = registry.normalizeGraphicShell({
+        ...recipe.shell,
+        preset: presetId,
+        source: 'manual',
+    }, {
+        id: active.mg.id || active.mg.clipId,
+        role: active.isScene ? 'fullscreen' : 'overlay',
+        type: active.mg.type,
+        text: active.mg.text,
+        subtext: active.mg.subtext,
+        items: active.mg.items || active.mg.mgData?.items || [],
+        safeZone: active.mg.safeZone || active.mg.position,
+        layout: active.mg.agenticComposition?.layout,
+        textStrategy: active.mg.agenticComposition?.textStrategy,
+        density: active.mg.agenticComposition?.density,
+        manual: true,
+    });
+    _setMgField(active, 'graphicShell', shell);
+    _setMgField(active, 'graphicShellManual', true);
+    if (shell.surface !== 'none') {
+        _setMgField(active, 'transparentBackground', false);
+        if (
+            active.mg.cardStyle === 'transparent'
+            || active.mg.mgData?.cardStyle === 'transparent'
+        ) {
+            _setMgField(
+                active,
+                'cardStyle',
+                shell.surface === 'outline'
+                    ? 'outline'
+                    : (shell.surface === 'soft' ? 'glass' : 'filled')
+            );
+        }
+    }
+    _setMgField(active, 'accentRuleVisible', shell.accent !== 'none');
+    if (active.mg.agenticComposition && typeof active.mg.agenticComposition === 'object') {
+        active.mg.agenticComposition.shell = { ...shell };
+        active.mg.agenticComposition.style = {
+            ...(active.mg.agenticComposition.style || {}),
+            shell: { ...shell },
+            accentRule: shell.accent !== 'none',
+        };
+    }
+    if (active.mg.mgData?.agenticComposition) {
+        active.mg.mgData.agenticComposition.shell = { ...shell };
+        active.mg.mgData.agenticComposition.style = {
+            ...(active.mg.mgData.agenticComposition.style || {}),
+            shell: { ...shell },
+            accentRule: shell.accent !== 'none',
+        };
+    }
+}
+
 // Show/hide listicle template settings and populate dropdowns
 function _showListicleControls(mgType, mg) {
     const section = document.getElementById('mg-listicle-section');
@@ -419,9 +527,6 @@ const state = {
     projectPlanHash: null,
     projectHydrating: false, // Suppress settings-driven saves while loading/reconciling the authoritative plan.
     hasProject: false, // True when this window booted with a real project (not the default workspace). Audio import is gated on it.
-    aiVideosScript: '', // AI Videos mode: portable story text (paste/file/URL all normalize here).
-    aiVideosInputMode: 'auto', // auto | audio | script
-    aiVideosScriptSource: { type: 'paste', label: '' },
     currentSceneIndex: 0,
     activeSceneIndices: [], // Active media scene indices (non-overlay, non-MG)
     activeOverlaySceneIndices: [], // Active overlay scene indices
@@ -1266,18 +1371,6 @@ const elements = {
     buildTheme: document.getElementById('build-theme'),
     buildMapStylePack: document.getElementById('build-map-style-pack'),
     buildProductionMode: document.getElementById('build-production-mode'),
-    aiVideosScript: document.getElementById('ai-videos-script'),
-    aiVideosInputMode: document.getElementById('ai-videos-input-mode'),
-    aiVideosSourceBadge: document.getElementById('ai-videos-source-badge'),
-    aiVideosRoutingStatus: document.getElementById('ai-videos-routing-status'),
-    aiVideosScriptCount: document.getElementById('ai-videos-script-count'),
-    aiVideosScriptSourceStatus: document.getElementById('ai-videos-script-source-status'),
-    aiVideosScriptUrl: document.getElementById('ai-videos-script-url'),
-    aiVideosUrlRow: document.getElementById('ai-videos-url-row'),
-    btnImportAiScript: document.getElementById('btn-import-ai-script'),
-    btnToggleAiScriptUrl: document.getElementById('btn-toggle-ai-script-url'),
-    btnLoadAiScriptUrl: document.getElementById('btn-load-ai-script-url'),
-    btnClearAiScript: document.getElementById('btn-clear-ai-script'),
     productionModeSummaryTitle: document.getElementById('production-mode-summary-title'),
     productionModeSummaryBadge: document.getElementById('production-mode-summary-badge'),
     productionModeSummaryDescription: document.getElementById('production-mode-summary-description'),
@@ -1709,6 +1802,7 @@ async function init() {
     setupPreviewZoom();
     setupNotifCenter();
     loadSettings();
+    _syncRepeatStepUI();
     syncFootageResourcesToMainProcess();
     // Push initial project context to Style Studio agent so it knows the video
     // title / niche / instructions immediately, without waiting for an edit.
@@ -1825,7 +1919,10 @@ function setupEventListeners() {
         elements.fastMediaToggle.addEventListener('change', _syncFastMediaUI);
     }
     if (elements.repeatFromStep) {
-        elements.repeatFromStep.addEventListener('change', () => saveSettings());
+        elements.repeatFromStep.addEventListener('change', () => {
+            _syncRepeatStepUI();
+            saveSettings();
+        });
     }
     if (elements.forceFreshFootage) {
         elements.forceFreshFootage.addEventListener('change', () => saveSettings());
@@ -2278,54 +2375,6 @@ function setupEventListeners() {
             saveSettings();
         });
     }
-    if (elements.aiVideosScript) {
-        elements.aiVideosScript.addEventListener('input', () => {
-            state.aiVideosScript = elements.aiVideosScript.value;
-            state.aiVideosScriptSource = { type: 'paste', label: '' };
-            _setAiScriptSourceStatus(state.aiVideosScript.trim()
-                ? `Using pasted text · ${_scriptWordCount(state.aiVideosScript)} words`
-                : 'Paste text, import a story file, or load a public URL.');
-            _syncAiVideosSourceUI();
-            saveSettings();
-        });
-    }
-    if (elements.aiVideosInputMode) {
-        elements.aiVideosInputMode.addEventListener('change', () => {
-            state.aiVideosInputMode = elements.aiVideosInputMode.value || 'auto';
-            _syncProductionModeUI();
-            saveSettings();
-        });
-    }
-    if (elements.btnImportAiScript) {
-        elements.btnImportAiScript.addEventListener('click', importAiVideosScriptFile);
-    }
-    if (elements.btnToggleAiScriptUrl) {
-        elements.btnToggleAiScriptUrl.addEventListener('click', () => {
-            elements.aiVideosUrlRow?.classList.toggle('hidden');
-            if (!elements.aiVideosUrlRow?.classList.contains('hidden')) elements.aiVideosScriptUrl?.focus();
-        });
-    }
-    if (elements.btnLoadAiScriptUrl) {
-        elements.btnLoadAiScriptUrl.addEventListener('click', loadAiVideosScriptUrl);
-    }
-    if (elements.aiVideosScriptUrl) {
-        elements.aiVideosScriptUrl.addEventListener('keydown', (event) => {
-            if (event.key === 'Enter') {
-                event.preventDefault();
-                loadAiVideosScriptUrl();
-            }
-        });
-    }
-    if (elements.btnClearAiScript) {
-        elements.btnClearAiScript.addEventListener('click', () => {
-            state.aiVideosScript = '';
-            state.aiVideosScriptSource = { type: 'paste', label: '' };
-            if (elements.aiVideosScript) elements.aiVideosScript.value = '';
-            _setAiScriptSourceStatus('Paste text, import a story file, or load a public URL.');
-            _syncProductionModeUI();
-            saveSettings();
-        });
-    }
     // Presenter image picker (talking-head): pick a photo → copy into the project's assets/
     // (never input/, which wipes narration audio) → remember the path for the build.
     if (elements.btnPickPresenter) {
@@ -2429,7 +2478,7 @@ function setupLightningAccountsUI() {
         const account = {
             label: val('la-label'), userId: val('la-userId'), apiKey: val('la-apiKey'),
             studioName: val('la-studioName'), teamspace: val('la-teamspace'), user: val('la-user'),
-            machine: val('la-machine') || 'L4', monthlyBudgetHours: Number(val('la-budget')) || 18,
+            machine: val('la-machine') || 'T4', monthlyBudgetHours: Number(val('la-budget')) || 18,
         };
         const showErr = (msg) => { if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; } };
         if (!account.userId || !account.apiKey || !account.studioName) {
@@ -2563,7 +2612,10 @@ async function renderLightningAccounts() {
         try {
             const r = await electronAPI.lightningCheck(id);
             const ok = r && r.ok;
-            _provAppend(id, (ok ? '✅ CHECK PASSED' : '⚠️ CHECK FAILED') + ' — ' + JSON.stringify((r && r.steps) || r));
+            const summary = ok
+                ? ((r && r.steps) || r)
+                : { error: (r && r.error) || 'check failed', steps: (r && r.steps) || {} };
+            _provAppend(id, (ok ? '✅ CHECK PASSED' : '⚠️ CHECK FAILED') + ' — ' + JSON.stringify(summary));
             if (ok) showToast(`✅ ${(r && r.label) || id}: vision works — “${(r.steps && r.steps.visionReply) || 'ok'}”`, 'success');
             else showToast(`⚠️ ${(r && (r.error || (r.steps && r.steps.visionReply))) || 'check failed'}`, 'error');
         } catch (e) { _provAppend(id, '❌ Check error: ' + e.message); showToast('Check error: ' + e.message, 'error'); }
@@ -2738,11 +2790,11 @@ function setupElectronListeners() {
 
         // Menu commands (Ctrl+Z/C/V/S routed through Electron menu)
         window.electronAPI.onMenuUndo?.(() => undo());
-        window.electronAPI.onMenuCopy?.(() => copySelectedClip());
-        window.electronAPI.onMenuPaste?.(() => pasteClip());
+        window.electronAPI.onMenuCopy?.(() => { void handleCopyCommand(); });
+        window.electronAPI.onMenuPaste?.(() => { void handlePasteCommand(); });
         window.electronAPI.onMenuSave?.(() => saveProject());
         window.electronAPI.onMenuDelete?.(() => deleteSelectedClips());
-        window.electronAPI.onMenuSelectAll?.(() => selectAllClips());
+        window.electronAPI.onMenuSelectAll?.(() => handleSelectAllCommand());
         window.electronAPI.onMenuNew?.(() => newProject());
         window.electronAPI.onFootageResourcesUpdated?.((settings) => {
             applyFootageResourceSettings(settings, { save: true });
@@ -3033,19 +3085,22 @@ function snapToClipEdge(direction) {
 
 function setupKeyboardShortcuts() {
     document.addEventListener('keydown', (e) => {
-        if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+        const textEditor = _editableTextTarget(e.target);
 
         // Ctrl shortcuts
         if (e.ctrlKey || e.metaKey) {
+            if (e.code === 'KeyC') { e.preventDefault(); void handleCopyCommand(); return; }
+            if (e.code === 'KeyV') { e.preventDefault(); void handlePasteCommand(); return; }
+            if (e.code === 'KeyA') { e.preventDefault(); handleSelectAllCommand(); return; }
+            if (textEditor) return;
             if (e.shiftKey && e.code === 'KeyZ') { e.preventDefault(); redo(); return; }
             if (e.code === 'KeyZ') { e.preventDefault(); undo(); return; }
             if (e.code === 'KeyY') { e.preventDefault(); redo(); return; }
-            if (e.code === 'KeyC') { e.preventDefault(); copySelectedClip(); return; }
-            if (e.code === 'KeyV') { e.preventDefault(); pasteClip(); return; }
             if (e.code === 'KeyS') { e.preventDefault(); saveProject(); return; }
-            if (e.code === 'KeyA') { e.preventDefault(); selectAllClips(); return; }
             if (e.code === 'KeyR') { e.preventDefault(); refreshApp(); return; }
         }
+
+        if (textEditor || e.target.tagName === 'SELECT') return;
 
         // F5 to refresh app
         if (e.code === 'F5') { e.preventDefault(); refreshApp(); return; }
@@ -3323,6 +3378,144 @@ function redo() {
 // ========================================
 // Clipboard (Copy / Paste / Delete)
 // ========================================
+function _editableTextTarget(node = document.activeElement) {
+    const element = node?.nodeType === Node.ELEMENT_NODE
+        ? node
+        : node?.parentElement;
+    const editor = element?.closest?.(
+        'textarea, input, [contenteditable="true"], [contenteditable="plaintext-only"]'
+    );
+    if (!editor || editor.disabled || editor.readOnly) return null;
+    if (editor.tagName !== 'INPUT') return editor;
+    const type = String(editor.type || 'text').toLowerCase();
+    return [
+        'text', 'search', 'email', 'url', 'tel', 'password', 'number',
+    ].includes(type) ? editor : null;
+}
+
+function _textClipboardContext() {
+    const editor = _editableTextTarget();
+    if (
+        editor
+        && (editor.tagName === 'INPUT' || editor.tagName === 'TEXTAREA')
+        && Number.isInteger(editor.selectionStart)
+        && Number.isInteger(editor.selectionEnd)
+    ) {
+        const start = Math.min(editor.selectionStart, editor.selectionEnd);
+        const end = Math.max(editor.selectionStart, editor.selectionEnd);
+        return {
+            editor,
+            text: end > start ? editor.value.slice(start, end) : '',
+            isTextContext: true,
+        };
+    }
+    const selection = window.getSelection?.();
+    const text = selection && !selection.isCollapsed ? selection.toString() : '';
+    return {
+        editor,
+        text,
+        isTextContext: Boolean(editor || text),
+    };
+}
+
+async function _writeTextClipboard(text) {
+    if (window.electronAPI?.writeClipboardText) {
+        return window.electronAPI.writeClipboardText(text);
+    }
+    if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return { success: true };
+    }
+    return { success: false, error: 'Clipboard API is unavailable' };
+}
+
+async function _readTextClipboard() {
+    if (window.electronAPI?.readClipboardText) {
+        return window.electronAPI.readClipboardText();
+    }
+    if (navigator.clipboard?.readText) {
+        return { success: true, text: await navigator.clipboard.readText() };
+    }
+    return { success: false, error: 'Clipboard API is unavailable', text: '' };
+}
+
+async function handleCopyCommand() {
+    const context = _textClipboardContext();
+    if (!context.isTextContext) {
+        copySelectedClip();
+        return false;
+    }
+    if (!context.text) return true;
+    const result = await _writeTextClipboard(context.text);
+    if (!result?.success) {
+        showToast(result?.error || 'Could not copy text', 'error');
+    }
+    return true;
+}
+
+function _replaceEditorSelection(editor, text) {
+    editor.focus();
+    if (editor.tagName === 'INPUT' || editor.tagName === 'TEXTAREA') {
+        const start = Number.isInteger(editor.selectionStart)
+            ? editor.selectionStart
+            : editor.value.length;
+        const end = Number.isInteger(editor.selectionEnd)
+            ? editor.selectionEnd
+            : start;
+        editor.setRangeText(text, start, end, 'end');
+    } else {
+        const selection = window.getSelection();
+        let range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+        if (!range || !editor.contains(range.commonAncestorContainer)) {
+            range = document.createRange();
+            range.selectNodeContents(editor);
+            range.collapse(false);
+        }
+        range.deleteContents();
+        const textNode = document.createTextNode(text);
+        range.insertNode(textNode);
+        range.setStartAfter(textNode);
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+    }
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+async function handlePasteCommand() {
+    const editor = _editableTextTarget();
+    if (!editor) {
+        pasteClip();
+        return false;
+    }
+    const result = await _readTextClipboard();
+    if (!result?.success) {
+        showToast(result?.error || 'Could not read the clipboard', 'error');
+        return true;
+    }
+    _replaceEditorSelection(editor, String(result.text || ''));
+    return true;
+}
+
+function handleSelectAllCommand() {
+    const editor = _editableTextTarget();
+    if (!editor) {
+        selectAllClips();
+        return false;
+    }
+    editor.focus();
+    if (editor.tagName === 'INPUT' || editor.tagName === 'TEXTAREA') {
+        editor.select();
+    } else {
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+    }
+    return true;
+}
+
 function selectClip(index, ctrlKey = false) {
     if (ctrlKey) {
         // Multi-select: toggle this clip in the selection
@@ -4043,6 +4236,7 @@ function updateMgProperties() {
     // Populate variant and animation dropdowns from registry
     _populateMgVariantDropdown(mg.type, mg.subType);
     _populateMgAnimationDropdown(mg.type, mg.animation);
+    _populateMgShellDropdown(mg);
 
     // Show listicle template controls if applicable
     _showListicleControls(mg.type, mg);
@@ -4099,6 +4293,7 @@ function updateMgPropertiesForScene(scene) {
     // Populate variant and animation dropdowns from registry
     _populateMgVariantDropdown(sceneType, mg.subType || scene.subType);
     _populateMgAnimationDropdown(sceneType, mg.animation || scene.animation);
+    _populateMgShellDropdown(mg);
 
     // Show listicle template controls if applicable
     _showListicleControls(sceneType, mg);
@@ -4838,6 +5033,7 @@ function setupMgPropertyListeners() {
     const durEl = document.getElementById('mg-duration');
     const typeEl = document.getElementById('mg-type');
     const styleEl = document.getElementById('mg-style');
+    const shellEl = document.getElementById('mg-shell');
 
     // Helper: get the MG object being edited (overlay MG or V3 fullscreen MG scene)
     function getActiveMG() {
@@ -4945,6 +5141,15 @@ function setupMgPropertyListeners() {
             const active = getActiveMG();
             if (!active) return;
             _applyManualMgStyle(active, e.target.value);
+            if (active.isScene) loadActiveScenes(); else updateMGOverlay();
+            refreshCompositorMGs();
+        });
+    }
+    if (shellEl) {
+        shellEl.addEventListener('change', (e) => {
+            const active = getActiveMG();
+            if (!active || e.target.value === 'custom') return;
+            _applyManualGraphicShell(active, e.target.value);
             if (active.isScene) loadActiveScenes(); else updateMGOverlay();
             refreshCompositorMGs();
         });
@@ -5972,7 +6177,11 @@ function syncVideoPlanFromEditor() {
     if (!state.videoPlan.scriptContext) state.videoPlan.scriptContext = {};
     state.videoPlan.scriptContext.mgAnimationSpeed = globalAnimSpeed;
     state.videoPlan.scriptContext.mgOverlayShadow = state.mgOverlayShadow;
-    state.videoPlan.timelineContractVersion = timelineContract?.VERSION || 1;
+    if (timelineContract?.normalizePlan) {
+        state.videoPlan = timelineContract.normalizePlan(state.videoPlan);
+    } else {
+        state.videoPlan.timelineContractVersion = timelineContract?.VERSION || 3;
+    }
     window._mgBridgeVideoPlan = state.videoPlan;
     return state.videoPlan;
 }
@@ -5997,9 +6206,6 @@ async function _saveProjectNow(silent = false) {
             aiInstructions: state.aiInstructions,
             videoTitle: state.videoTitle,
             presenterImage: state.presenterImage || '',
-            aiVideosScript: state.aiVideosScript || '',
-            aiVideosInputMode: state.aiVideosInputMode || 'auto',
-            aiVideosScriptSource: state.aiVideosScriptSource || { type: 'paste', label: '' },
             buildStyleProfile: elements.buildStyleProfile ? elements.buildStyleProfile.value : 'none',
             mutedTracks: state.mutedTracks
         };
@@ -6856,8 +7062,10 @@ function buildKineticTextPreviewHtml(mg, scene, styleVars, fontFamily, opacity, 
 
     return `<div class="mg-preview-element mg-kinetic ${posClass} ${extraClasses || ''}" style="${kineticStyleVars};opacity:${opacity}">
         <div class="mg-kinetic-scrim" style="opacity:${Math.min(0.3, elapsed * 2)}"></div>
-        <div class="mg-kinetic-words">${wordsHTML}</div>
-        ${subHtml}
+        <div class="mg-shell-copy">
+            <div class="mg-kinetic-words">${wordsHTML}</div>
+            ${subHtml}
+        </div>
     </div>`;
 }
 
@@ -7264,20 +7472,56 @@ function updateMGOverlay() {
             : Math.min(1, elapsed / enterDur);
         const enterDone = elapsed > enterDur;
 
-        const posClass = `mg-pos-${mg.position || 'center'}`;
+        const shellContext = {
+            id: mg.id || mg.clipId || `${mg.type}:${mg.startTime}`,
+            role: 'overlay',
+            type: mg.type,
+            text: mg.text,
+            subtext: mg.subtext,
+            items: mg.items || mg.mgData?.items || mg.agenticComposition?.items || [],
+            density: mg.agenticComposition?.density,
+            textStrategy: mg.agenticComposition?.textStrategy,
+            safeZone: mg.safeZone || mg.position,
+            layout: mg.agenticComposition?.layout,
+            mood: `${mg.style || ''} ${mg.agenticComposition?.style?.mood || ''}`,
+            manual: mg.graphicShellManual === true,
+            transparentBackground: mg.transparentBackground === true
+                || mg.cardStyle === 'transparent',
+            accentRuleVisible: mg.accentRuleVisible !== false,
+        };
+        const shellClasses = window._graphicShells?.graphicShellClassNames
+            ? window._graphicShells.graphicShellClassNames(
+                mg.graphicShell || mg.agenticComposition?.shell,
+                shellContext,
+                'mg'
+            )
+            : '';
+        const componentOwnsLayout = new Set([
+            'barChart',
+            'donutChart',
+            'rankingList',
+            'timeline',
+            'comparisonCard',
+            'bulletList',
+            'mapChart',
+            'listicleGrid',
+        ]).has(mg.type);
+        const posClass = `mg-pos-${mg.position || 'center'} ${componentOwnsLayout ? 'mg-component-layout-owned ' : ''}${shellClasses}`;
 
         switch (mg.type) {
             case 'headline':
                 return `<div class="mg-preview-element mg-headline ${posClass}" style="${styleVars};opacity:${opacity}">
-                    <div class="mg-headline-text">${escapeHTML(mg.text)}</div>
-                    <div class="mg-headline-bar" style="width:${enterDone ? 100 : Math.min(100, elapsed / enterDur * 100)}%"></div>
-                    ${mg.subtext && mg.subtext !== 'none' ? `<div class="mg-headline-sub">${escapeHTML(mg.subtext)}</div>` : ''}
+                    <div class="mg-shell-copy">
+                        <div class="mg-headline-text">${escapeHTML(mg.text)}</div>
+                        <div class="mg-headline-bar" style="width:${enterDone ? 100 : Math.min(100, elapsed / enterDur * 100)}%"></div>
+                        ${mg.subtext && mg.subtext !== 'none' ? `<div class="mg-headline-sub">${escapeHTML(mg.subtext)}</div>` : ''}
+                    </div>
                 </div>`;
 
             case 'lowerThird':
                 return `<div class="mg-preview-element mg-lower-third ${posClass}" style="${styleVars};opacity:${opacity}">
                     <div class="mg-lt-accent"></div>
-                    <div class="mg-lt-content">
+                    <div class="mg-lt-content mg-shell-copy">
                         <div class="mg-lt-text">${escapeHTML(mg.text)}</div>
                         ${mg.subtext && mg.subtext !== 'none' ? `<div class="mg-lt-sub">${escapeHTML(mg.subtext)}</div>` : ''}
                     </div>
@@ -7294,14 +7538,16 @@ function updateMGOverlay() {
                 const prefix = mg.text.substring(0, mg.text.indexOf(numMatch?.[0] || '')).trim();
                 const suffix = mg.text.substring(mg.text.indexOf(numMatch?.[0] || '') + (numMatch?.[0]?.length || 0)).trim();
                 return `<div class="mg-preview-element mg-stat ${posClass}" style="${styleVars};opacity:${opacity}">
-                    <div class="mg-stat-number">${escapeHTML(prefix)}${current}</div>
-                    <div class="mg-stat-label">${escapeHTML(suffix || mg.subtext || '')}</div>
+                    <div class="mg-shell-copy">
+                        <div class="mg-stat-number">${escapeHTML(prefix)}${current}</div>
+                        <div class="mg-stat-label">${escapeHTML(suffix || mg.subtext || '')}</div>
+                    </div>
                 </div>`;
             }
 
             case 'callout':
                 return `<div class="mg-preview-element mg-callout ${posClass}" style="${styleVars};opacity:${opacity}">
-                    <div class="mg-callout-box">
+                    <div class="mg-callout-box mg-shell-copy">
                         <span class="mg-callout-quote">\u201C</span>
                         <p class="mg-callout-text">${escapeHTML(mg.text)}</p>
                         ${mg.subtext && mg.subtext !== 'none' ? `<p class="mg-callout-attr">\u2014 ${escapeHTML(mg.subtext)}</p>` : ''}
@@ -7319,7 +7565,7 @@ function updateMGOverlay() {
                     </div>`;
                 }).join('');
                 return `<div class="mg-preview-element mg-bullets ${posClass}" style="${styleVars};opacity:${opacity}">
-                    ${bulletsHTML}
+                    <div class="mg-shell-copy">${bulletsHTML}</div>
                 </div>`;
             }
 
@@ -7328,8 +7574,10 @@ function updateMGOverlay() {
                     ? `<div class="mg-focus-sub" style="opacity:${Math.min(1, Math.max(0, (elapsed - enterDur * 0.5) / 0.3))}">${escapeHTML(mg.subtext)}</div>` : '';
                 return `<div class="mg-preview-element mg-focus-word ${posClass}" style="${styleVars};opacity:${opacity}">
                     <div class="mg-focus-scrim" style="opacity:${Math.min(1, elapsed / 0.15)}"></div>
-                    <div class="mg-focus-text">${escapeHTML(mg.text)}</div>
-                    ${subHtml}
+                    <div class="mg-shell-copy">
+                        <div class="mg-focus-text">${escapeHTML(mg.text)}</div>
+                        ${subHtml}
+                    </div>
                 </div>`;
             }
 
@@ -7341,9 +7589,11 @@ function updateMGOverlay() {
                 const fillEased = 1 - Math.pow(1 - fillProg, 3);
                 const currentPct = Math.round(targetPct * fillEased);
                 return `<div class="mg-preview-element mg-progress ${posClass}" style="${styleVars};opacity:${opacity}">
-                    ${label ? `<div class="mg-progress-label">${escapeHTML(label)}</div>` : ''}
-                    <div class="mg-progress-track"><div class="mg-progress-fill" style="width:${targetPct * fillEased}%"></div></div>
-                    <div class="mg-progress-number">${currentPct}%</div>
+                    <div class="mg-shell-copy">
+                        ${label ? `<div class="mg-progress-label">${escapeHTML(label)}</div>` : ''}
+                        <div class="mg-progress-track"><div class="mg-progress-fill" style="width:${targetPct * fillEased}%"></div></div>
+                        <div class="mg-progress-number">${currentPct}%</div>
+                    </div>
                 </div>`;
             }
 
@@ -7361,7 +7611,7 @@ function updateMGOverlay() {
                     </div>`;
                 }).join('');
                 return `<div class="mg-preview-element mg-bar-chart ${posClass}" style="${styleVars};opacity:${opacity}">
-                    <div class="mg-chart-title">${escapeHTML(mg.text)}</div>
+                    <div class="mg-chart-title mg-shell-copy">${escapeHTML(mg.text)}</div>
                     <div class="mg-bars-container">${barsHTML}</div>
                 </div>`;
             }
@@ -7389,7 +7639,7 @@ function updateMGOverlay() {
                 gradientStops.push(`transparent ${cumPct}% 100%`);
                 const conicGrad = `conic-gradient(from 0deg, ${gradientStops.join(', ')})`;
                 return `<div class="mg-preview-element mg-donut-chart ${posClass}" style="${styleVars};opacity:${opacity}">
-                    <div class="mg-chart-title">${escapeHTML(mg.text)}</div>
+                    <div class="mg-chart-title mg-shell-copy">${escapeHTML(mg.text)}</div>
                     <div class="mg-donut-row">
                         <div class="mg-donut-ring" style="background:${conicGrad}"><div class="mg-donut-hole"></div></div>
                         <div class="mg-donut-legend">${legendHTML}</div>
@@ -7404,9 +7654,11 @@ function updateMGOverlay() {
                 const slideAmt = enterDone ? 0 : (1 - elapsed / enterDur) * 30;
                 const vsProg = Math.min(1, Math.max(0, (elapsed - 0.3) / 0.3));
                 return `<div class="mg-preview-element mg-comparison ${posClass}" style="${styleVars};opacity:${opacity}">
-                    <div class="mg-comp-panel mg-comp-left" style="transform:translateX(${-slideAmt}px)">${escapeHTML(itemA)}</div>
-                    <div class="mg-comp-vs" style="transform:scale(${vsProg})">VS</div>
-                    <div class="mg-comp-panel mg-comp-right" style="transform:translateX(${slideAmt}px)">${escapeHTML(itemB)}</div>
+                    <div class="mg-shell-copy mg-shell-comparison">
+                        <div class="mg-comp-panel mg-comp-left" style="transform:translateX(${-slideAmt}px)">${escapeHTML(itemA)}</div>
+                        <div class="mg-comp-vs" style="transform:scale(${vsProg})">VS</div>
+                        <div class="mg-comp-panel mg-comp-right" style="transform:translateX(${slideAmt}px)">${escapeHTML(itemB)}</div>
+                    </div>
                 </div>`;
             }
 
@@ -7423,7 +7675,7 @@ function updateMGOverlay() {
                     </div>`;
                 }).join('');
                 return `<div class="mg-preview-element mg-timeline ${posClass}" style="${styleVars};opacity:${opacity}">
-                    <div class="mg-chart-title">${escapeHTML(mg.text)}</div>
+                    <div class="mg-chart-title mg-shell-copy">${escapeHTML(mg.text)}</div>
                     <div class="mg-tl-container">
                         <div class="mg-tl-line" style="width:${lineW}%"></div>
                         ${markersHTML}
@@ -7447,7 +7699,7 @@ function updateMGOverlay() {
                     </div>`;
                 }).join('');
                 return `<div class="mg-preview-element mg-ranking ${posClass}" style="${styleVars};opacity:${opacity}">
-                    <div class="mg-chart-title">${escapeHTML(mg.text)}</div>
+                    <div class="mg-chart-title mg-shell-copy">${escapeHTML(mg.text)}</div>
                     ${rowsHTML}
                 </div>`;
             }
@@ -7736,166 +7988,45 @@ async function cancelProcess() {
     }
 }
 
-function _scriptWordCount(value) {
-    const text = String(value || '').trim();
-    return text ? text.split(/\s+/).filter(Boolean).length : 0;
-}
-
-function _setAiScriptSourceStatus(message, tone = '') {
-    if (!elements.aiVideosScriptSourceStatus) return;
-    elements.aiVideosScriptSourceStatus.textContent = message || '';
-    elements.aiVideosScriptSourceStatus.classList.toggle('is-success', tone === 'success');
-    elements.aiVideosScriptSourceStatus.classList.toggle('is-error', tone === 'error');
-}
-
-function _setAiVideosScript(text, source = { type: 'paste', label: '' }, { selectScript = true } = {}) {
-    state.aiVideosScript = String(text || '').trim();
-    state.aiVideosScriptSource = {
-        type: source?.type || 'paste',
-        label: String(source?.label || '').slice(0, 500),
-    };
-    if (selectScript) state.aiVideosInputMode = 'script';
-    if (elements.aiVideosScript) elements.aiVideosScript.value = state.aiVideosScript;
-    if (elements.aiVideosInputMode) elements.aiVideosInputMode.value = state.aiVideosInputMode;
-    _syncProductionModeUI();
-    saveSettings();
-}
-
-async function importAiVideosScriptFile() {
-    if (!_requireProject()) return;
-    if (!window.electronAPI?.selectFile || !window.electronAPI?.readAiScriptFile) {
-        showToast('Story file import is unavailable', 'error');
-        return;
-    }
-    try {
-        const picked = await window.electronAPI.selectFile({
-            title: 'Import story or script',
-            filters: [
-                { name: 'Story files', extensions: ['txt', 'md', 'markdown', 'docx', 'odt', 'epub', 'rtf', 'srt', 'vtt', 'json', 'csv', 'html', 'htm', 'xml', 'yaml', 'yml', 'log'] },
-            ],
-        });
-        if (!picked) return;
-        if (elements.btnImportAiScript) elements.btnImportAiScript.disabled = true;
-        _setAiScriptSourceStatus('Reading story file...');
-        const result = await window.electronAPI.readAiScriptFile(picked);
-        if (!result?.success || !result.text) throw new Error(result?.error || 'No readable text found');
-        _setAiVideosScript(result.text, { type: 'file', label: result.filename || 'Imported file' });
-        _setAiScriptSourceStatus(`Imported ${result.filename || 'story file'} · ${_scriptWordCount(result.text)} words`, 'success');
-        showToast(`Story imported: ${result.filename || 'file'}`, 'success');
-    } catch (error) {
-        _setAiScriptSourceStatus(error.message || 'Could not import story file', 'error');
-        showToast(`Story import failed: ${error.message || error}`, 'error');
-    } finally {
-        if (elements.btnImportAiScript) elements.btnImportAiScript.disabled = false;
-    }
-}
-
-async function loadAiVideosScriptUrl() {
-    if (!_requireProject()) return;
-    const url = String(elements.aiVideosScriptUrl?.value || '').trim();
-    if (!/^https?:\/\//i.test(url)) {
-        _setAiScriptSourceStatus('Enter a public HTTP or HTTPS story URL.', 'error');
-        return;
-    }
-    if (!window.electronAPI?.loadAiScriptUrl) {
-        showToast('Story URL import is unavailable', 'error');
-        return;
-    }
-    try {
-        if (elements.btnLoadAiScriptUrl) elements.btnLoadAiScriptUrl.disabled = true;
-        _setAiScriptSourceStatus('Loading story URL...');
-        const result = await window.electronAPI.loadAiScriptUrl(url);
-        if (!result?.success || !result.text) throw new Error(result?.error || 'No readable text found');
-        let label = result.filename || 'Story URL';
-        try {
-            const parsed = new URL(result.sourceUrl || url);
-            label = `${parsed.hostname}${parsed.pathname && parsed.pathname !== '/' ? parsed.pathname : ''}`;
-        } catch (_) {}
-        _setAiVideosScript(result.text, { type: 'url', label });
-        elements.aiVideosUrlRow?.classList.add('hidden');
-        _setAiScriptSourceStatus(`Loaded ${label} · ${_scriptWordCount(result.text)} words`, 'success');
-        showToast('Story loaded from URL', 'success');
-    } catch (error) {
-        _setAiScriptSourceStatus(error.message || 'Could not load story URL', 'error');
-        showToast(`Story URL failed: ${error.message || error}`, 'error');
-    } finally {
-        if (elements.btnLoadAiScriptUrl) elements.btnLoadAiScriptUrl.disabled = false;
-    }
-}
-
-function _resolveAiVideosInputSource() {
-    const selected = elements.aiVideosInputMode?.value || state.aiVideosInputMode || 'auto';
-    const hasAudio = !!(state.audioFile?.path);
-    const script = String(state.aiVideosScript || '').trim();
-    const hasScript = script.length > 0;
-    if (selected === 'audio') {
-        return { selected, kind: 'audio', available: hasAudio, hasAudio, hasScript, script };
-    }
-    if (selected === 'script') {
-        return { selected, kind: 'script', available: hasScript, hasAudio, hasScript, script };
-    }
-    if (hasAudio) return { selected: 'auto', kind: 'audio', available: true, hasAudio, hasScript, script };
-    return { selected: 'auto', kind: 'script', available: hasScript, hasAudio, hasScript, script };
-}
-
-function _syncAiVideosSourceUI() {
-    if (elements.aiVideosInputMode) {
-        state.aiVideosInputMode = elements.aiVideosInputMode.value || state.aiVideosInputMode || 'auto';
-    }
-    const source = _resolveAiVideosInputSource();
-    const words = _scriptWordCount(state.aiVideosScript);
-    if (elements.aiVideosScriptCount) elements.aiVideosScriptCount.textContent = `${words.toLocaleString()} word${words === 1 ? '' : 's'}`;
-    if (elements.aiVideosSourceBadge) {
-        elements.aiVideosSourceBadge.textContent = source.kind === 'audio'
-            ? 'Audio'
-            : (state.aiVideosScriptSource?.type === 'file' ? 'File' : state.aiVideosScriptSource?.type === 'url' ? 'URL' : 'Script');
-    }
-    if (elements.aiVideosRoutingStatus) {
-        let message;
-        if (source.kind === 'audio' && source.available) {
-            message = 'Narration audio controls timing, scene boundaries, subtitles, and the full AI Director pipeline. Every eligible visual scene is AI-generated.';
-        } else if (source.kind === 'audio') {
-            message = 'Narration audio is selected. Import an MP3 or WAV file to enable the build.';
-        } else if (source.available) {
-            message = 'Written story mode creates timed visual beats without narration. Generator, quality, niche, theme, title, and AI Instructions are applied.';
-        } else {
-            message = 'Add story text, import a document, load a public URL, or switch to narration audio.';
-        }
-        elements.aiVideosRoutingStatus.textContent = message;
-        elements.aiVideosRoutingStatus.classList.toggle('is-missing', !source.available);
-    }
-    if (words && state.aiVideosScriptSource?.label) {
-        const kind = state.aiVideosScriptSource.type === 'url' ? 'URL' : 'file';
-        _setAiScriptSourceStatus(`${kind === 'URL' ? 'Loaded' : 'Imported'} ${state.aiVideosScriptSource.label} · ${words} words`, 'success');
-    }
-    return source;
-}
-
 function _syncGenerateAvailability() {
-    const mode = elements.buildProductionMode?.value || 'faceless';
-    const aiSource = mode === 'aiVideos' ? _resolveAiVideosInputSource() : null;
-    const canGenerate = !!state.hasProject
-        && !state.isProcessing
-        && (mode === 'aiVideos' ? aiSource.available : !!state.audioFile?.path);
+    const canGenerate = !!state.hasProject && !state.isProcessing && !!state.audioFile?.path;
     if (elements.btnGenerate) {
         elements.btnGenerate.disabled = !canGenerate;
         elements.btnGenerate.title = !state.hasProject
             ? 'Create or open a project first'
-            : canGenerate ? '' : (mode === 'aiVideos' ? 'Add narration audio or a story/script' : 'Import narration audio first');
+            : canGenerate ? '' : 'Import narration audio first';
     }
-    const canRepeat = !!state.hasProject && !state.isProcessing && !!state.audioFile?.path
-        && !(mode === 'aiVideos' && aiSource?.kind === 'script');
+    const canRepeat = !!state.hasProject && !state.isProcessing && !!state.audioFile?.path;
     if (elements.btnRepeatStep) elements.btnRepeatStep.disabled = !canRepeat;
+}
+
+function _syncRepeatStepUI() {
+    const mode = elements.repeatFromStep?.value || 'visual-planner';
+    const graphicsOnly = mode === 'motion-graphics';
+    const mediaOnly = mode === 'media';
+    const hint = document.getElementById('repeat-from-step-hint');
+    if (elements.btnRepeatStep) {
+        elements.btnRepeatStep.textContent = graphicsOnly
+            ? 'Rebuild Motion Graphics + Test'
+            : 'Repeat Selected Step';
+    }
+    if (hint) {
+        hint.textContent = graphicsOnly
+            ? 'Rebuilds only existing graphics and templates, proof-renders them through Motion QA, and preserves planning, footage, narration, transitions, and SFX.'
+            : mediaOnly
+                ? 'Starts at media download and reuses the saved Director and Visual Planner checkpoint.'
+                : 'Starts at the Visual Planner and keeps the existing transcription and scene split.';
+    }
+    if (elements.forceFreshFootage) {
+        elements.forceFreshFootage.disabled = !mediaOnly;
+        const row = elements.forceFreshFootage.closest('.toggle-row');
+        if (row) row.style.opacity = mediaOnly ? '1' : '0.45';
+    }
 }
 
 // ========================================
 // Video Generation
 // ========================================
-function _selectedControlLabel(control) {
-    const option = control?.selectedOptions?.[0];
-    return String(option?.textContent || '').replace(/\s+/g, ' ').trim();
-}
-
 function _collectEffectiveBuildOptions() {
     const collected = SettingsIO.collect(null);
     const mode = elements.buildProductionMode?.value || 'faceless';
@@ -7912,12 +8043,6 @@ function _collectEffectiveBuildOptions() {
         effective.presenterImage = '';
         effective.klingAvatar = false;
         effective.klingAvatarPrompt = '';
-    }
-    if (mode === 'aiVideos') {
-        effective.buildFormat = 'auto';
-        effective.veoAiVideo = true;
-        effective.veoScope = 'all';
-        effective.fastMedia = false;
     }
     return effective;
 }
@@ -7942,80 +8067,11 @@ async function _persistProjectSettingsBeforeBuild() {
     return result;
 }
 
-// Script-driven AI Videos use the selected generator directly. Narration-driven
-// AI Videos deliberately stay on the full run-build path below.
-async function generateAiVideos() {
-    if (state.isProcessing) return;
-    const script = (state.aiVideosScript || '').trim();
-    if (!script) { showToast('Add a story/script first', 'error'); return; }
-    if (!state.hasProject) { _requireProject(); return; }
-    state.isProcessing = true;
-    _syncGenerateAvailability();
-    showProgress(true);
-    startTimer();
-    buildLog.reset();
-    try {
-        const settings = _collectEffectiveBuildOptions();
-        await _persistProjectSettingsBeforeBuild();
-        updateProgress(8, 'Preparing story and generator...');
-        showToast('AI Videos: generating scenes from your story…', 'info');
-        const res = await window.electronAPI.runAiVideos({
-            script,
-            generate: true,
-            backend: settings.veoBackend,
-            resolution: settings.veoResolution,
-            qualityTier: settings.buildQuality,
-            themeId: settings.buildTheme,
-            themeLabel: _selectedControlLabel(elements.buildTheme),
-            nicheId: settings.buildNiche,
-            nicheLabel: _selectedControlLabel(elements.buildNiche),
-            videoTitle: state.videoTitle,
-            aiInstructions: state.aiInstructions,
-            scriptSource: state.aiVideosScriptSource,
-            aspectRatio: '16:9',
-        });
-        if (res && res.success) {
-            await loadVideoPlan({ freshBuild: true });
-            state.hasProjectFile = true;
-            await saveProject(true);
-            stopTimer();
-            const genTime = getElapsedString();
-            const warning = res.failedCount ? ` · ${res.failedCount} scene warning(s)` : '';
-            updateProgress(100, `AI Video ready (${genTime})${warning}`);
-            showToast(`AI Video generated: ${res.generatedCount}/${res.sceneCount} clips${warning}`, res.failedCount ? 'warning' : 'success');
-            showNotification('AI Video Complete', `${res.generatedCount}/${res.sceneCount} clips generated in ${genTime}`);
-            elements.btnRender.disabled = false;
-            if (state.scenes.length > 0) await jumpToScene(0);
-        } else {
-            throw new Error((res && res.error) || 'AI Video build failed');
-        }
-    } catch (e) {
-        stopTimer();
-        if (e?.message === 'Cancelled') {
-            updateProgress(0, 'AI Video generation cancelled');
-            showToast('AI Video generation cancelled', 'info');
-        } else {
-            showToast('AI Videos error: ' + ((e && e.message) || e), 'error');
-        }
-    } finally {
-        state.isProcessing = false;
-        _syncGenerateAvailability();
-        if (elements.btnCancel) {
-            elements.btnCancel.disabled = false;
-            elements.btnCancel.textContent = 'Cancel';
-        }
-        setTimeout(() => showProgress(false), 5000);
-    }
-}
-
 async function generateVideo(options = {}) {
     if (state.isProcessing) return;
     if (!state.hasProject) { _requireProject(); return; }
-    const mode = elements.buildProductionMode?.value || 'faceless';
-    const aiSource = mode === 'aiVideos' ? _resolveAiVideosInputSource() : null;
-    if (mode === 'aiVideos' && aiSource.kind === 'script') return generateAiVideos();
     if (!state.audioFile) {
-        showToast(mode === 'aiVideos' ? 'Import narration audio or switch to Story / script' : 'Import narration audio first', 'error');
+        showToast('Import narration audio first', 'error');
         return;
     }
     if (!state.audioFile.path) {
@@ -8029,7 +8085,12 @@ async function generateVideo(options = {}) {
     buildLog.reset();
     try {
         updateProgress(5, 'Audio ready in project input...');
-        updateProgress(10, '🎙️ Transcribing audio with Whisper...');
+        updateProgress(
+            10,
+            repeatFromStep === 'motion-graphics'
+                ? 'Rebuilding and proof-testing motion graphics...'
+                : '🎙️ Transcribing audio with Whisper...'
+        );
         const audioFileName = state.audioFile.name || state.audioFile.path?.split(/[\\/]/).pop();
         const effectiveSettings = _collectEffectiveBuildOptions();
         await _persistProjectSettingsBeforeBuild();
@@ -8053,8 +8114,25 @@ async function generateVideo(options = {}) {
             await saveProject(true); // Commit fresh build data to every project mirror
             stopTimer();
             const genTime = getElapsedString();
-            updateProgress(100, `✅ Ready to render! (${genTime})`); showToast(`Video generated in ${genTime}!`, 'success');
-            showNotification('Generation Complete', `Video generated in ${genTime}`);
+            const graphicsOnly = repeatFromStep === 'motion-graphics';
+            updateProgress(
+                100,
+                graphicsOnly
+                    ? `✅ Motion graphics rebuilt and QA-tested! (${genTime})`
+                    : `✅ Ready to render! (${genTime})`
+            );
+            showToast(
+                graphicsOnly
+                    ? `Motion graphics rebuilt and tested in ${genTime}!`
+                    : `Video generated in ${genTime}!`,
+                'success'
+            );
+            showNotification(
+                graphicsOnly ? 'Motion Graphics Ready' : 'Generation Complete',
+                graphicsOnly
+                    ? `Graphics rebuilt and QA-tested in ${genTime}; planning and media were preserved`
+                    : `Video generated in ${genTime}`
+            );
             elements.btnRender.disabled = false;
             if (state.scenes.length > 0) await jumpToScene(0);
         } else {
@@ -8165,15 +8243,6 @@ async function loadVideoPlan({ freshBuild = false, hyperframesPreviewOptions = n
                         await loadAudioFile(audioPath);
                     }
                 } catch (e) { console.warn('Audio loading failed:', e.message); }
-            } else if (plan.productionMode === 'aiVideos' || plan._generatedFrom === 'ai-videos-script') {
-                state.audioFile = null;
-                state.audioPath = null;
-                if (elements.previewAudio) {
-                    elements.previewAudio.removeAttribute('src');
-                    elements.previewAudio.load();
-                }
-                elements.audioInfo?.classList.add('hidden');
-                if (elements.dropZone) elements.dropZone.style.display = 'block';
             }
             _syncProductionModeUI();
 
@@ -8688,8 +8757,9 @@ function renderScenes() {
     displayScenes.forEach((scene) => {
         const i = state.scenes.indexOf(scene);
         const trType = scene.transitionType || (state.transition.style !== 'auto' ? state.transition.style : null) || scene.transition?.type || 'crossfade';
-        const trIcons = { cut: '✂️', crossfade: '🔀', fade: '🔀', dissolve: '🔀', blur: '🔀', crossBlur: '🔀', luma: '🌗', morph: '🔀', dreamFade: '💭', ripple: '🌊', wipe: '↔️', slide: '↔️', push: '↔️', swipe: '↔️', splitWipe: '↔️', zoom: '🔎', zoomBlur: '🔎', whip: '💨', bounce: '⬆️', shutterSlice: '📷', flash: '⚡', directionalBlur: '💨', colorFade: '🎨', spin: '🌀', cameraFlash: '📸', filmBurn: '🎞️', filmGrain: '🎞️', flare: '✨', lightLeak: '✨', shadowWipe: '🌑', vignetteBlink: '👁️', reveal: '🔀', ink: '🖋️', prismShift: '🔮', glitch: '⚡', pixelate: '🟦', mosaic: '🟦', dataMosh: '⚡', scanline: '📺', rgbSplit: '🌈', static: '📺', fade_to_black: '⬛' };
-        const keyword = scene.isMGScene ? `🎨 MG: ${scene.type || 'motion-graphic'}` : `🔍 ${scene.keyword}`;
+        const keyword = scene.isMGScene
+            ? `MG · ${scene.type || 'motion graphic'}`
+            : (scene.keyword ? `Search · ${scene.keyword}` : '');
 
         const card = document.createElement('div');
         card.className = `scene-card${scene.isMGScene ? ' scene-card-mg' : ''}${scene.flagForReplacement ? ' scene-card-qa-flagged' : ''}`;
@@ -8707,11 +8777,11 @@ function renderScenes() {
             number.appendChild(badge);
         };
         if (i > 0 && !scene.isMGScene) {
-            addBadge('scene-transition-badge', trType, `${trIcons[trType] || '🔀'} ${trType}`);
+            addBadge('scene-transition-badge', trType, trType.toUpperCase());
         }
         if (scene.isMGScene) {
             const type = scene.type || 'MG';
-            addBadge('scene-mg-badge', `Motion Graphic: ${type}`, `🎨 ${type}`);
+            addBadge('scene-mg-badge', `Motion Graphic: ${type}`, `MG · ${type}`);
         }
         if (scene.flagForReplacement) {
             addBadge('scene-qa-badge', scene.qaReason || 'Flagged by QA', '⚠ QA');
@@ -8724,6 +8794,7 @@ function renderScenes() {
         const keywordEl = document.createElement('div');
         keywordEl.className = 'scene-keyword';
         keywordEl.textContent = keyword;
+        keywordEl.classList.toggle('hidden', !keyword);
 
         card.append(number, text, keywordEl);
         card.addEventListener('click', () => jumpToScene(i));
@@ -8750,17 +8821,17 @@ function renderTimeline() {
             <div class="timeline-header-left">
                 <span>Timeline</span>
                 <button id="snap-toggle" class="snap-toggle ${state.snapEnabled ? 'active' : ''}" title="Toggle Snap to Clips">
-                    <span class="snap-icon">🧲</span>
+                    <span class="snap-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M3 2v6a5 5 0 0 0 10 0V2M3 5h3M10 5h3" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></span>
                     <span class="snap-label">Snap</span>
                 </button>
                 <button id="time-format-toggle" class="snap-toggle ${state.timeline.rulerSecondsOnly ? 'active' : ''}" title="Toggle ruler time format (M:SS ↔ seconds-only, for matching log timestamps)">
-                    <span class="snap-icon">⏱</span>
+                    <span class="snap-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><circle cx="8" cy="9" r="4.75" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 4.25V2.5M6.25 2.5h3.5M8 9V6.5M8 9l2 1.25" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span>
                     <span class="snap-label">${state.timeline.rulerSecondsOnly ? 'Sec' : 'M:SS'}</span>
                 </button>
             </div>
             <div class="timeline-info">
                 <div class="zoom-control">
-                    <span class="zoom-label">🔍</span>
+                    <span class="zoom-label" aria-hidden="true"><svg viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m10.25 10.25 3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></span>
                     <button id="zoom-fit-btn" class="zoom-fit-btn" title="Fit timeline to view (Shift+F)">Fit</button>
                     <input type="range" id="zoom-slider" class="zoom-slider" min="0" max="1000" value="${zoomToSlider(state.timeline.zoom)}" step="1">
                     <span id="timeline-zoom">${formatZoomLabel(state.timeline.zoom)}</span>
@@ -8879,6 +8950,15 @@ function renderTracks() {
     // Determine which video tracks have clips (auto-collapse empty upper tracks)
     const usedVideoTracks = new Set();
     state.scenes.forEach(s => usedVideoTracks.add(s.trackId || 'video-track-1'));
+    const continuityHolds = timelineContract?.buildContinuityHolds
+        ? timelineContract.buildContinuityHolds(
+            state.scenes.filter((scene) => !scene?.isMGScene),
+            {
+                fps: state.videoPlan?.fps || state.fps || 30,
+                totalDuration: state.totalDuration,
+            }
+        )
+        : (state.videoPlan?.continuityHolds || []);
 
     state.timeline.tracks.forEach((track, trackIndex) => {
         const canMuteTrack = track.id !== 'sfx-track';
@@ -8971,6 +9051,28 @@ function renderTracks() {
                     style="left:${left}px;width:${Math.max(w, 8)}px"
                     title="SFX: ${escapeHTML(cueName)} (${sfx.duration.toFixed(2)}s)">
                     <span class="clip-label">${icon}</span>
+                </div>`;
+            });
+        }
+
+        // Derived continuity clips make intentional previous-frame holds visible
+        // in the editor. They are non-destructive and are recomputed from the
+        // current base-track scene timing instead of mutating downloaded media.
+        if (track.id === 'video-track-1') {
+            continuityHolds.forEach((hold) => {
+                const left = Number(hold.startTime || 0) * state.timeline.zoom;
+                const width = Math.max(
+                    Number(hold.endTime || 0) - Number(hold.startTime || 0),
+                    0
+                ) * state.timeline.zoom;
+                const sourceLabel = hold.sourceSceneIndex != null
+                    ? `scene ${hold.sourceSceneIndex}`
+                    : 'previous scene';
+                html += `<div class="timeline-clip clip-continuity-hold"
+                    data-continuity-hold="${escapeHTML(String(hold.clipId || 'hold'))}"
+                    style="left:${left}px;width:${Math.max(width, 8)}px"
+                    title="Continuity hold from ${escapeHTML(sourceLabel)} [${Number(hold.startTime || 0).toFixed(2)}s → ${Number(hold.endTime || 0).toFixed(2)}s]">
+                    <span class="clip-label">HOLD</span>
                 </div>`;
             });
         }
@@ -10326,6 +10428,54 @@ async function loadActiveScenes(activeScenes) {
     }
     // Use passed-in activeScenes to avoid duplicate getActiveScenesAtTime call
     if (!activeScenes) activeScenes = getActiveScenesAtTime(state.currentTime);
+    const hasActiveBaseScene = activeScenes.some(({ scene }) => (
+        scene
+        && !scene.isMGScene
+        && !scene.disabled
+        && (scene.trackId || 'video-track-1') === 'video-track-1'
+    ));
+    if (!hasActiveBaseScene && timelineContract?.buildContinuityHolds) {
+        const holds = timelineContract.buildContinuityHolds(
+            state.scenes.filter((scene) => !scene?.isMGScene),
+            {
+                fps: state.videoPlan?.fps || state.fps || 30,
+                totalDuration: state.totalDuration,
+            }
+        );
+        const hold = holds.find((item) => (
+            state.currentTime >= Number(item.startTime || 0) - 0.001
+            && state.currentTime < Number(item.endTime || 0) + 0.001
+        ));
+        if (hold) {
+            const sourceIndex = state.scenes.findIndex((scene) => (
+                !scene?.isMGScene
+                && (
+                    String(scene.clipId || '') === String(hold.sourceClipId || '')
+                    || (
+                        !hold.sourceClipId
+                        && String(getSceneSourceIndex(scene)) === String(hold.sourceSceneIndex)
+                    )
+                )
+            ));
+            if (sourceIndex >= 0) {
+                const source = state.scenes[sourceIndex];
+                activeScenes = [
+                    ...activeScenes,
+                    {
+                        index: sourceIndex,
+                        scene: {
+                            ...source,
+                            startTime: hold.startTime,
+                            endTime: hold.endTime,
+                            duration: hold.duration,
+                            mediaOffset: hold.freezeTime,
+                            _continuityHold: true,
+                        },
+                    },
+                ];
+            }
+        }
+    }
 
     if (activeScenes.length === 0) {
         if (state.scenes.length === 0) {
@@ -10953,6 +11103,78 @@ async function setHyperframesPreviewMode(active, previewOptions = {}) {
             elements.previewPlaceholder?.classList.remove('hidden');
         }
     }
+}
+
+/**
+ * Release the live HyperFrames preview while render QA owns headless browsers.
+ */
+async function suspendHyperframesPreviewForRender() {
+    const frame = elements.hyperframesPreviewFrame;
+    const container = elements.previewContainer;
+    if (!frame || !container || !state.hyperframesPreview?.active) {
+        return async () => {};
+    }
+
+    if (state.isPlaying || state.playbackStarting) stopPlayback();
+    if (state.hyperframesPreview.refreshTimer) {
+        clearTimeout(state.hyperframesPreview.refreshTimer);
+        state.hyperframesPreview.refreshTimer = null;
+    }
+
+    const snapshot = {
+        src: frame.getAttribute('src') || '',
+        readyToken: state.hyperframesPreview.readyToken || '',
+    };
+    try {
+        frame.contentWindow?.postMessage({ type: 'hf-preview-pause' }, '*');
+    } catch (_) {}
+
+    state.hyperframesPreview.active = false;
+    state.hyperframesPreview.frameReady = false;
+    container.classList.remove('hyperframes-preview-active');
+    frame.classList.add('hidden');
+
+    // The live preview owns video decoders and a Chromium graphics context.
+    // Release both before Motion QA launches its own headless browser(s), then
+    // restore the exact preview document after the render attempt finishes.
+    await new Promise((resolve) => {
+        let settled = false;
+        const done = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            frame.removeEventListener('load', done);
+            resolve();
+        };
+        const timer = setTimeout(done, 750);
+        frame.addEventListener('load', done, { once: true });
+        frame.src = 'about:blank';
+    });
+    console.log('[HyperFrames Preview] Suspended during render preflight');
+
+    return async () => {
+        if (!frame.isConnected || !container.isConnected) return;
+        state.hyperframesPreview.active = true;
+        state.hyperframesPreview.frameReady = false;
+        state.hyperframesPreview.readyToken = snapshot.readyToken;
+        container.classList.add('hyperframes-preview-active');
+        frame.classList.remove('hidden');
+        elements.videoContainer?.classList.add('hidden');
+        elements.previewPlaceholder?.classList.add('hidden');
+        elements.videoControls?.classList.add('hidden');
+
+        if (snapshot.src && snapshot.src !== 'about:blank') {
+            frame.onload = () => {
+                if (!state.hyperframesPreview?.active) return;
+                state.hyperframesPreview.frameReady = true;
+                syncHyperframesPreview(true);
+            };
+            frame.src = snapshot.src;
+        } else {
+            await refreshHyperframesPreview({ force: true });
+        }
+        console.log('[HyperFrames Preview] Restored after render preflight');
+    };
 }
 
 /**
@@ -11668,6 +11890,7 @@ async function renderVideoHyperFrames() {
 async function renderVideo() {
     if (!state.videoPlan || state.isProcessing) return;
     state.isProcessing = true; elements.btnRender.disabled = true; showProgress(true); startTimer();
+    let restoreHyperframesPreview = null;
     try {
         // Commit editor state + project settings to every persistence mirror
         // before rendering so a crash cannot reopen a stale timeline.
@@ -11679,6 +11902,9 @@ async function renderVideo() {
         updateProgress(5, isHyperFramesRender
             ? 'Starting HyperFrames HTML/MG render...'
             : 'Starting WebGL2 WYSIWYG render...');
+        if (isHyperFramesRender) {
+            restoreHyperframesPreview = await suspendHyperframesPreviewForRender();
+        }
         let result = isHyperFramesRender ? await renderVideoHyperFrames() : await renderVideoWebGL2();
         if (result.success) {
             stopTimer();
@@ -11718,6 +11944,14 @@ async function renderVideo() {
         showNotification('Render Failed', errMsg, 'error');
         updateProgress(0, `❌ ${e.message}`);
     } finally {
+        if (restoreHyperframesPreview) {
+            try {
+                await restoreHyperframesPreview();
+            } catch (error) {
+                console.warn('[HyperFrames Preview] Restore after render failed:', error);
+                setHyperframesPreviewMode(true).catch(() => {});
+            }
+        }
         state.isProcessing = false;
         elements.btnRender.disabled = false;
         elements.btnCancel.disabled = false;
@@ -12388,26 +12622,11 @@ const PRODUCTION_MODE_PROFILES = Object.freeze({
         steps: ['Narration', 'Presenter', 'Supporting B-roll', 'Graphics', 'Render'],
         generateLabel: 'Generate Talking-Head Video',
     },
-    aiVideos: {
-        title: 'AI video production',
-        badge: 'Generated footage',
-        description: 'Use narration audio for the full Director pipeline, or written story text for a generator-first production.',
-        steps: ['Audio or story', 'Visual beats', 'AI generation', 'Fallback safety', 'Render'],
-        generateLabel: 'Generate AI Video',
-    },
 });
-
-function _setModeGroup(id, visible) {
-    document.getElementById(id)?.classList.toggle('mode-hidden', !visible);
-}
-
-function _setSettingsTabVisibility(name, visible) {
-    document.querySelector(`.stab-btn[data-stab="${name}"]`)?.classList.toggle('mode-hidden', !visible);
-}
 
 function _syncFastMediaUI() {
     const mode = elements.buildProductionMode?.value || 'faceless';
-    const active = mode !== 'aiVideos' && !!elements.fastMediaToggle?.checked;
+    const active = !!elements.fastMediaToggle?.checked;
     elements.fastMediaGroup?.classList.toggle('diagnostic-active', active);
     if (elements.fastMediaGroup && active) elements.fastMediaGroup.open = true;
     if (elements.fastMediaHint) {
@@ -12415,7 +12634,7 @@ function _syncFastMediaUI() {
             ? 'TEST MODE ACTIVE: unique random footage is used. Semantic asset searches, footage relevance vision, icon/subject acquisition, and bespoke overlay authoring are skipped. Stage authoring and Motion QA remain active.'
             : 'OFF for production. One-shot mode uses unique random footage and skips semantic asset searches, footage relevance vision, icon/subject acquisition, and bespoke overlay authoring. Stage authoring and Motion QA remain active. It automatically returns to OFF after launch.';
     }
-    if (elements.btnGenerate && mode !== 'aiVideos') {
+    if (elements.btnGenerate) {
         const profile = PRODUCTION_MODE_PROFILES[mode] || PRODUCTION_MODE_PROFILES.faceless;
         elements.btnGenerate.textContent = active
             ? 'Run Pipeline Test (Random Media)'
@@ -12439,12 +12658,8 @@ function _showSettingsTab(name, { persist = true } = {}) {
 function _syncProductionModeUI() {
     const mode = elements.buildProductionMode ? elements.buildProductionMode.value : 'faceless';
     const profile = PRODUCTION_MODE_PROFILES[mode] || PRODUCTION_MODE_PROFILES.faceless;
-    const isAiVideos = mode === 'aiVideos';
-    const aiSource = isAiVideos ? _syncAiVideosSourceUI() : null;
-    const scriptRoute = isAiVideos && aiSource.kind === 'script';
-    if (isAiVideos && elements.fastMediaToggle) elements.fastMediaToggle.checked = false;
 
-    document.body.classList.remove('mode-faceless', 'mode-talkingHead', 'mode-aiVideos');
+    document.body.classList.remove('mode-faceless', 'mode-talkingHead');
     document.body.classList.add(`mode-${mode}`);
 
     if (elements.productionModeSummaryTitle) elements.productionModeSummaryTitle.textContent = profile.title;
@@ -12459,89 +12674,48 @@ function _syncProductionModeUI() {
         }));
     }
 
-    _setModeGroup('ai-videos-script-group', isAiVideos);
-    _setModeGroup('audio-import-card', !(isAiVideos && aiSource?.selected === 'script'));
-    _setModeGroup('format-group', !isAiVideos);
-    _setModeGroup('language-group', !scriptRoute);
-    _setModeGroup('subtitles-group', !scriptRoute);
-    _setModeGroup('map-style-group', !scriptRoute);
-    _setModeGroup('reference-style-group', !scriptRoute);
-    _setModeGroup('smart-ai-group', !scriptRoute);
-    _setModeGroup('ai-provider-group', !scriptRoute);
-    _setModeGroup('ai-thinking-group', !scriptRoute);
-    _setModeGroup('fallback-media-settings', !scriptRoute);
-    _setModeGroup('fast-media-group', !isAiVideos);
-    _setModeGroup('repeat-settings-group', !scriptRoute);
-    _setModeGroup('force-fresh-group', !scriptRoute);
-    _setModeGroup('script-build-note', scriptRoute);
-    _setSettingsTabVisibility('build', !scriptRoute);
-
-    if (elements.mediaTabLabel) elements.mediaTabLabel.textContent = isAiVideos ? 'Generator' : 'Media';
-    if (elements.buildTabLabel) elements.buildTabLabel.textContent = isAiVideos ? 'Advanced' : 'Build';
-    if (elements.inputSourceHeading) {
-        elements.inputSourceHeading.textContent = isAiVideos ? '🎙️ Narration Audio (optional)' : '📁 Import Audio';
-    }
-    if (elements.btnGenerate) {
-        elements.btnGenerate.textContent = scriptRoute
-            ? 'Generate AI Video from Script'
-            : (isAiVideos ? 'Generate AI Video from Audio' : profile.generateLabel);
-    }
-    if (elements.btnRepeatStep) {
-        elements.btnRepeatStep.textContent = isAiVideos ? 'Repeat Selected AI Step' : 'Repeat Selected Step';
-    }
+    if (elements.mediaTabLabel) elements.mediaTabLabel.textContent = 'Media';
+    if (elements.buildTabLabel) elements.buildTabLabel.textContent = 'Build';
+    if (elements.inputSourceHeading) elements.inputSourceHeading.textContent = 'Import narration';
+    if (elements.btnGenerate) elements.btnGenerate.textContent = profile.generateLabel;
+    if (elements.btnRepeatStep) elements.btnRepeatStep.textContent = 'Repeat Selected Step';
+    _syncRepeatStepUI();
     if (elements.buildQuality) {
-        const labels = isAiVideos
-            ? {
-                mini: scriptRoute ? 'Economy (fewer generated clips)' : 'Economy (faster AI-video build)',
-                standard: scriptRoute ? 'Standard (balanced clip count)' : 'Standard (balanced AI-video build)',
-                pro: scriptRoute ? 'Cinematic (more generated shots)' : 'Pro (denser premium edit)',
-            }
-            : {
-                mini: 'Mini (Fast, Images Only)',
-                standard: 'Standard (Balanced)',
-                pro: 'Pro (Best Quality)',
-            };
+        const labels = {
+            mini: 'Mini (Fast, Images Only)',
+            standard: 'Standard (Balanced)',
+            pro: 'Pro (Best Quality)',
+        };
         for (const option of elements.buildQuality.options) {
             if (labels[option.value]) option.textContent = labels[option.value];
         }
     }
     if (elements.buildQualityHint) {
-        elements.buildQualityHint.textContent = scriptRoute
-            ? 'Controls how densely the story is split into generated visual beats. More shots use more generator credits.'
-            : 'Controls scene count, transitions, motion-graphics density, and build depth.';
+        elements.buildQualityHint.textContent = 'Controls scene count, transitions, motion-graphics density, and build depth.';
     }
     if (elements.aiInstructionsHint) {
-        elements.aiInstructionsHint.textContent = scriptRoute
-            ? 'Applied directly to every generated scene prompt. Use it for camera language, realism, lighting, pacing, and exclusions.'
-            : 'Sent to every decision brain — Director, Visual Planner, templates, motion graphics, effects. Highest priority.';
+        elements.aiInstructionsHint.textContent = 'Sent to every decision brain — Director, Visual Planner, templates, motion graphics, effects. Highest priority.';
     }
 
     if (elements.veoAiVideoEnabled) {
-        elements.veoAiVideoEnabled.classList.toggle('mode-hidden', isAiVideos);
-        elements.veoAiVideoEnabled.disabled = isAiVideos;
+        elements.veoAiVideoEnabled.classList.remove('mode-hidden');
+        elements.veoAiVideoEnabled.disabled = false;
     }
-    if (elements.veoAiVideoToggleRow) elements.veoAiVideoToggleRow.style.cursor = isAiVideos ? 'default' : 'pointer';
-    if (elements.veoAiVideoTitle) {
-        elements.veoAiVideoTitle.textContent = isAiVideos ? '🎬 AI Video Generator' : '🎬 AI Video — generate select scenes';
-    }
-    elements.veoAiVideoModeBadge?.classList.toggle('hidden', !isAiVideos);
+    if (elements.veoAiVideoToggleRow) elements.veoAiVideoToggleRow.style.cursor = 'pointer';
+    if (elements.veoAiVideoTitle) elements.veoAiVideoTitle.textContent = '🎬 AI Video — generate select scenes';
+    elements.veoAiVideoModeBadge?.classList.add('hidden');
     if (elements.veoAiVideoDescription) {
-        elements.veoAiVideoDescription.textContent = isAiVideos
-            ? (scriptRoute
-                ? 'Required for this production mode. Every story beat is sent to the selected generator.'
-                : 'Required for this production mode. Narration timing is preserved while every eligible visual scene is generated.')
-            : 'Optional hybrid mode: generate selected B-roll scenes instead of downloading them.';
+        elements.veoAiVideoDescription.textContent = 'Optional hybrid mode: generate selected B-roll scenes instead of downloading them.';
     }
-    elements.veoScopeGroup?.classList.toggle('mode-hidden', isAiVideos);
+    elements.veoScopeGroup?.classList.remove('mode-hidden');
     _syncVeoRow();
 
     if (elements.fallbackMediaSettings) {
-        elements.fallbackMediaSettings.classList.toggle('primary-media-settings', !isAiVideos);
-        elements.fallbackMediaSettings.classList.toggle('fallback-media-settings', isAiVideos && !scriptRoute);
-        const profileKey = isAiVideos ? 'fallback' : 'primary';
-        if (elements.fallbackMediaSettings.dataset.profile !== profileKey) {
-            elements.fallbackMediaSettings.dataset.profile = profileKey;
-            elements.fallbackMediaSettings.open = !isAiVideos;
+        elements.fallbackMediaSettings.classList.add('primary-media-settings');
+        elements.fallbackMediaSettings.classList.remove('fallback-media-settings');
+        if (elements.fallbackMediaSettings.dataset.profile !== 'primary') {
+            elements.fallbackMediaSettings.dataset.profile = 'primary';
+            elements.fallbackMediaSettings.open = true;
         }
     }
 
@@ -12550,7 +12724,7 @@ function _syncProductionModeUI() {
     _syncAudioGate();
     const previewHint = elements.previewPlaceholder?.querySelector('.small');
     if (previewHint && state.scenes.length === 0) {
-        previewHint.textContent = isAiVideos ? 'Add narration audio or a story to get started' : 'Import audio to get started';
+        previewHint.textContent = 'Import audio to get started';
     }
     _syncFastMediaUI();
     _syncGenerateAvailability();
@@ -12571,8 +12745,7 @@ function _syncPresenterRow() {
 // AI Video (Veo) options show only when the toggle is on.
 function _syncVeoRow() {
     if (elements.veoAiVideoOpts && elements.veoAiVideoEnabled) {
-        const required = elements.buildProductionMode?.value === 'aiVideos';
-        elements.veoAiVideoOpts.style.display = (required || elements.veoAiVideoEnabled.checked) ? 'block' : 'none';
+        elements.veoAiVideoOpts.style.display = elements.veoAiVideoEnabled.checked ? 'block' : 'none';
     }
 }
 
@@ -12637,7 +12810,6 @@ function saveSettings() {
         subtitlesEnabled: state.subtitlesEnabled,
         mutedTracks: state.mutedTracks,
         presenterImage: state.presenterImage || '',
-        aiVideosInputMode: state.aiVideosInputMode || 'auto',
         buildStyleProfile: elements.buildStyleProfile ? elements.buildStyleProfile.value : 'none',
     }));
     // Also trigger .fvp auto-save so settings persist per-project
@@ -12739,11 +12911,6 @@ function loadSettings() {
             if (elements.buildMapStylePack && s.buildMapStylePack) elements.buildMapStylePack.value = s.buildMapStylePack;
             if (elements.buildProductionMode && s.buildProductionMode) elements.buildProductionMode.value = s.buildProductionMode;
             state.presenterImage = s.presenterImage || '';
-            state.aiVideosScript = '';
-            state.aiVideosInputMode = ['audio', 'script'].includes(s.aiVideosInputMode) ? s.aiVideosInputMode : 'auto';
-            state.aiVideosScriptSource = { type: 'paste', label: '' };
-            if (elements.aiVideosScript) elements.aiVideosScript.value = state.aiVideosScript;
-            if (elements.aiVideosInputMode) elements.aiVideosInputMode.value = state.aiVideosInputMode;
             if (elements.klingAvatarEnabled) elements.klingAvatarEnabled.checked = !!s.klingAvatar;
             if (elements.klingResolution && s.klingResolution) elements.klingResolution.value = s.klingResolution;
             if (elements.klingAvatarPrompt) elements.klingAvatarPrompt.value = s.klingAvatarPrompt || '';
@@ -12765,6 +12932,7 @@ function loadSettings() {
             if (elements.clipAnalyzerToggle) elements.clipAnalyzerToggle.checked = s.clipAnalyzer !== false;
             if (elements.repeatFromStep) elements.repeatFromStep.value = s.repeatFromStep || 'visual-planner';
             if (elements.forceFreshFootage) elements.forceFreshFootage.checked = s.forceFreshFootage === true;
+            _syncRepeatStepUI();
             // Restore track mute state
             if (s.mutedTracks) state.mutedTracks = s.mutedTracks;
             // Restore footage source toggles
@@ -12811,13 +12979,6 @@ function applyProjectSettings(s, { projectFieldOverride = null } = {}) {
         if (elements.buildMapStylePack && s.buildMapStylePack) elements.buildMapStylePack.value = s.buildMapStylePack;
         if (elements.buildProductionMode && s.buildProductionMode) elements.buildProductionMode.value = s.buildProductionMode;
         state.presenterImage = s.presenterImage || '';
-        state.aiVideosScript = s.aiVideosScript || '';
-        state.aiVideosInputMode = ['audio', 'script'].includes(s.aiVideosInputMode) ? s.aiVideosInputMode : 'auto';
-        state.aiVideosScriptSource = s.aiVideosScriptSource && typeof s.aiVideosScriptSource === 'object'
-            ? { type: s.aiVideosScriptSource.type || 'paste', label: String(s.aiVideosScriptSource.label || '').slice(0, 500) }
-            : { type: 'paste', label: '' };
-        if (elements.aiVideosScript) elements.aiVideosScript.value = state.aiVideosScript;
-        if (elements.aiVideosInputMode) elements.aiVideosInputMode.value = state.aiVideosInputMode;
         if (elements.klingAvatarEnabled) elements.klingAvatarEnabled.checked = !!s.klingAvatar;
         if (elements.klingResolution && s.klingResolution) elements.klingResolution.value = s.klingResolution;
         if (elements.klingAvatarPrompt) elements.klingAvatarPrompt.value = s.klingAvatarPrompt || '';
@@ -12833,6 +12994,7 @@ function applyProjectSettings(s, { projectFieldOverride = null } = {}) {
         if (elements.buildLanguage && s.buildLanguage) elements.buildLanguage.value = s.buildLanguage;
         if (elements.repeatFromStep && s.repeatFromStep) elements.repeatFromStep.value = s.repeatFromStep;
         if (elements.forceFreshFootage) elements.forceFreshFootage.checked = s.forceFreshFootage === true;
+        _syncRepeatStepUI();
         // Track mute
         if (s.mutedTracks) state.mutedTracks = s.mutedTracks;
         // Footage sources
@@ -12864,7 +13026,6 @@ function _requireProject() {
 function _syncAudioGate() {
     const dz = elements.dropZone;
     if (!dz || state.audioFile) return; // don't clobber the loaded-audio display
-    const isAiVideos = elements.buildProductionMode?.value === 'aiVideos';
     const lines = dz.querySelectorAll('p');
     const setCopy = (primary, secondary) => {
         if (lines[0]) lines[0].textContent = primary;
@@ -12874,19 +13035,14 @@ function _syncAudioGate() {
         dz.classList.remove('locked');
         dz.style.opacity = '';
         dz.style.cursor = 'pointer';
-        dz.title = isAiVideos ? 'Optional narration audio for AI Video mode' : 'Import narration audio';
-        setCopy(
-            isAiVideos ? 'Drop narration audio here (optional)' : 'Drag & drop your voiceover here',
-            isAiVideos ? 'or use Story source in Setup' : 'or click to browse'
-        );
+        dz.title = 'Import narration audio';
+        setCopy('Drag & drop your voiceover here', 'or click to browse');
     } else {
         dz.classList.add('locked');
         dz.style.opacity = '0.55';
         dz.style.cursor = 'not-allowed';
         dz.title = 'Create or open a project first';
-        setCopy('📁 Create or open a project first', isAiVideos
-            ? 'Audio and story imports unlock inside a project'
-            : 'Import unlocks once you have a project');
+        setCopy('📁 Create or open a project first', 'Import unlocks once you have a project');
     }
 }
 
@@ -13239,22 +13395,69 @@ function showOpenProjectDialog() {
     const existing = document.getElementById('open-project-dialog');
     if (existing) existing.remove();
 
+    const previouslyFocused = document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+
     const overlay = document.createElement('div');
     overlay.id = 'open-project-dialog';
-    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:10000;display:flex;align-items:center;justify-content:center;';
+    overlay.className = 'project-open-overlay';
 
     const dialog = document.createElement('div');
-    dialog.style.cssText = 'background:#1e1e2e;border:1px solid #444;border-radius:12px;padding:24px 28px;width:460px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,0.5);';
+    dialog.className = 'project-open-dialog';
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('aria-labelledby', 'open-project-title');
+    dialog.setAttribute('aria-describedby', 'open-project-description');
     dialog.innerHTML = `
-        <h2 style="margin:0 0 10px;font-size:1.2rem;color:#e0e0e0;font-weight:600;">Open Project</h2>
-        <p style="margin:0 0 18px;color:#aaa;line-height:1.45;">Choose how you want to open your project.</p>
-        <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:12px;">
-            <button id="op-open-folder" style="padding:11px 14px;background:#2e3a70;border:1px solid #5b6bd8;border-radius:8px;color:#fff;cursor:pointer;font-size:0.95rem;font-weight:600;text-align:left;">Open Project Folder</button>
-            <button id="op-open-file" style="padding:11px 14px;background:#2a2f3f;border:1px solid #555;border-radius:8px;color:#fff;cursor:pointer;font-size:0.95rem;font-weight:600;text-align:left;">Open .fvp Project File</button>
+        <div class="project-open-dialog__header">
+            <div>
+                <h2 id="open-project-title">Open Project</h2>
+                <p id="open-project-description">Choose an existing project folder or a saved .fvp file.</p>
+            </div>
+            <button id="op-close" class="project-open-dialog__close" type="button" aria-label="Close open project dialog" title="Close">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M6 6l12 12M18 6L6 18"></path>
+                </svg>
+            </button>
         </div>
-        <div id="op-status" style="min-height:18px;margin-bottom:12px;color:#888;font-size:0.85rem;"></div>
-        <div style="display:flex;justify-content:flex-end;">
-            <button id="op-cancel" style="padding:9px 16px;background:transparent;border:1px solid #555;border-radius:6px;color:#aaa;cursor:pointer;font-size:0.9rem;">Cancel</button>
+        <div class="project-open-dialog__options">
+            <button id="op-open-folder" class="project-open-option project-open-option--preferred" type="button">
+                <span class="project-open-option__icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24">
+                        <path d="M3.5 6.5h6l2 2h9v9.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"></path>
+                        <path d="M3.5 9h17"></path>
+                    </svg>
+                </span>
+                <span class="project-open-option__copy">
+                    <strong>Open Project Folder</strong>
+                    <small>Load a project directory with its media and settings.</small>
+                </span>
+                <span class="project-open-option__arrow" aria-hidden="true">
+                    <svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"></path></svg>
+                </span>
+            </button>
+            <button id="op-open-file" class="project-open-option" type="button">
+                <span class="project-open-option__icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24">
+                        <path d="M6 3.5h8l4 4V20H6z"></path>
+                        <path d="M14 3.5V8h4"></path>
+                        <path d="M9 13h6M9 16h4"></path>
+                    </svg>
+                </span>
+                <span class="project-open-option__copy">
+                    <strong>Open .fvp Project File</strong>
+                    <small>Load a saved project from a single .fvp file.</small>
+                </span>
+                <span class="project-open-option__arrow" aria-hidden="true">
+                    <svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"></path></svg>
+                </span>
+            </button>
+        </div>
+        <div id="op-status" class="project-open-dialog__status" role="status" aria-live="polite"></div>
+        <div class="project-open-dialog__footer">
+            <span class="project-open-dialog__hint"><kbd>Esc</kbd> closes this window</span>
+            <button id="op-cancel" class="btn btn-secondary project-open-dialog__cancel" type="button">Cancel</button>
         </div>
     `;
 
@@ -13263,55 +13466,100 @@ function showOpenProjectDialog() {
 
     const openFolderBtn = document.getElementById('op-open-folder');
     const openFileBtn = document.getElementById('op-open-file');
+    const closeBtn = document.getElementById('op-close');
     const cancelBtn = document.getElementById('op-cancel');
     const statusEl = document.getElementById('op-status');
+    let isBusy = false;
+
+    const setStatus = (text = '', tone = '') => {
+        statusEl.textContent = text;
+        if (tone) {
+            statusEl.dataset.tone = tone;
+        } else {
+            delete statusEl.dataset.tone;
+        }
+    };
 
     const setBusy = (busy, text = '') => {
+        isBusy = busy;
         openFolderBtn.disabled = busy;
         openFileBtn.disabled = busy;
+        closeBtn.disabled = busy;
         cancelBtn.disabled = busy;
-        openFolderBtn.style.opacity = busy ? '0.6' : '1';
-        openFileBtn.style.opacity = busy ? '0.6' : '1';
-        statusEl.textContent = text;
+        dialog.setAttribute('aria-busy', String(busy));
+        overlay.classList.toggle('is-busy', busy);
+        setStatus(text, busy ? 'busy' : '');
+    };
+
+    const removeDialog = ({ force = false, restoreFocus = true } = {}) => {
+        if (isBusy && !force) return;
+        window.removeEventListener('keydown', handleDialogKeydown);
+        overlay.remove();
+        if (restoreFocus && previouslyFocused?.isConnected) {
+            previouslyFocused.focus();
+        }
+    };
+
+    const handleDialogKeydown = (event) => {
+        if (!overlay.isConnected) {
+            window.removeEventListener('keydown', handleDialogKeydown);
+            return;
+        }
+
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            removeDialog();
+            return;
+        }
+
+        if (event.key !== 'Tab') return;
+        const focusable = Array.from(dialog.querySelectorAll('button:not(:disabled)'));
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+        }
     };
 
     const runOpen = async (kind) => {
         const openFolder = window.electronAPI.openExistingProjectFolder;
         const openFile = window.electronAPI.openExistingProjectFile;
         if (!openFolder || !openFile) {
-            statusEl.style.color = '#ff8f8f';
-            statusEl.textContent = 'Open project APIs are unavailable.';
+            setStatus('Open project controls are unavailable. Restart the app and try again.', 'error');
             return;
         }
-        setBusy(true, kind === 'folder' ? 'Selecting folder...' : 'Selecting .fvp file...');
+        setBusy(true, kind === 'folder' ? 'Selecting project folder...' : 'Selecting .fvp project file...');
         try {
             await _saveBeforeProjectSwitch();
             const result = kind === 'folder' ? await openFolder() : await openFile();
             if (result && result.success) {
-                overlay.remove();
+                removeDialog({ force: true, restoreFocus: false });
                 _finishProjectOpen(result, 'Project');
                 return;
             }
             setBusy(false, '');
             if (result && result.cancelled) return;
-            statusEl.style.color = '#ff8f8f';
-            statusEl.textContent = result?.error || 'Failed to open project.';
+            setStatus(result?.error || 'The project could not be opened. Check the path and try again.', 'error');
         } catch (e) {
             setBusy(false, '');
-            statusEl.style.color = '#ff8f8f';
-            statusEl.textContent = e?.message || 'Failed to open project.';
+            setStatus(e?.message || 'The project could not be opened. Check the path and try again.', 'error');
         }
     };
 
     openFolderBtn.addEventListener('click', () => runOpen('folder'));
     openFileBtn.addEventListener('click', () => runOpen('file'));
-    cancelBtn.addEventListener('click', () => overlay.remove());
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
-    window.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && document.getElementById('open-project-dialog')) {
-            overlay.remove();
-        }
-    }, { once: true });
+    closeBtn.addEventListener('click', () => removeDialog());
+    cancelBtn.addEventListener('click', () => removeDialog());
+    overlay.addEventListener('click', (event) => {
+        if (event.target === overlay) removeDialog();
+    });
+    window.addEventListener('keydown', handleDialogKeydown);
+    requestAnimationFrame(() => openFolderBtn.focus());
 }
 
 async function openExistingProject() {

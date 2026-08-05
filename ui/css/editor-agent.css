@@ -339,6 +339,9 @@
     line-height: 1.45;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+    cursor: text;
+    -webkit-user-select: text;
+    user-select: text;
 }
 
 .agent-message.user {
@@ -368,6 +371,9 @@
     border: 1px solid rgba(123, 108, 255, 0.34);
     border-radius: 11px;
     background: linear-gradient(145deg, rgba(108, 93, 230, 0.13), rgba(255, 255, 255, 0.025));
+    cursor: text;
+    -webkit-user-select: text;
+    user-select: text;
 }
 
 .agent-plan-kicker {
@@ -424,6 +430,9 @@
     border: 1px solid rgba(74, 205, 139, 0.3);
     border-radius: 11px;
     background: linear-gradient(145deg, rgba(45, 154, 100, 0.11), rgba(255, 255, 255, 0.025));
+    cursor: text;
+    -webkit-user-select: text;
+    user-select: text;
 }
 
 .agent-result-kicker {
@@ -492,6 +501,8 @@
     font-size: 10px;
     font-weight: 650;
     cursor: pointer;
+    -webkit-user-select: none;
+    user-select: none;
 }
 
 .agent-plan-actions .primary {

@@ -1,26 +1,22 @@
 // src/categories/index.js
 // ============================================================================
 // Category registry — the production-TYPE axis (orthogonal to niche + format):
-//   faceless · talkingHead · aiVideos.
+//   faceless · talkingHead.
 // A category declares how the video is PRODUCED (presenter vs not, where footage
 // comes from) + which formats it allows. Adding a category = drop a descriptor
 // file here and list it below.
 //
 // resolveMode() replaces the old hardcoded directors-brief ternary
-// (`… ? 'talkingHead' : 'faceless'`) that silently collapsed ANY non-talkingHead
-// value to faceless — which would have swallowed a new 'aiVideos' value. Because
-// every downstream guard is a string compare against 'talkingHead', a new category
-// id that isn't 'talkingHead' flows through the faceless code paths untouched, so
-// faceless + talkingHead stay byte-identical while aiVideos can branch on its own
-// descriptor (generation === 'ai-video').
+// (`… ? 'talkingHead' : 'faceless'`). Because every downstream guard is a string
+// compare against 'talkingHead', any id that isn't 'talkingHead' flows through the
+// faceless code paths untouched, so faceless + talkingHead stay byte-identical.
 // ============================================================================
 'use strict';
 
 const faceless = require('./faceless');
 const talkingHead = require('./talking-head');
-const aiVideos = require('./ai-videos');
 
-const CATEGORIES = [faceless, talkingHead, aiVideos];
+const CATEGORIES = [faceless, talkingHead];
 const BY_ID = Object.fromEntries(CATEGORIES.map((c) => [c.id, c]));
 
 // lowercased alias (incl. the id itself) → canonical id
@@ -48,10 +44,4 @@ function allowedFormats(id) {
     return (BY_ID[id] || faceless).allowedFormats;
 }
 
-// True when a category's footage is AI-GENERATED (Kling/Veo) rather than
-// downloaded stock — used to force the ai-video generation lane on.
-function usesAiVideo(id) {
-    return get(id).generation === 'ai-video';
-}
-
-module.exports = { CATEGORIES, BY_ID, resolveMode, get, getCategoryIds, allowedFormats, usesAiVideo };
+module.exports = { CATEGORIES, BY_ID, resolveMode, get, getCategoryIds, allowedFormats };

@@ -50,7 +50,7 @@ function _accountEnv(acct) {
         LIGHTNING_TEAMSPACE: acct.teamspace || '',
         LIGHTNING_USER: acct.user || '',
         LIGHTNING_ORG: acct.org || '',
-        LIGHTNING_MACHINE: acct.machine || process.env.LIGHTNING_MACHINE || 'L4',
+        LIGHTNING_MACHINE: acct.machine || process.env.LIGHTNING_MACHINE || 'T4',
     };
 }
 
@@ -64,16 +64,36 @@ function isConfigured() {
 
 const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Probe one endpoint and report WHY it isn't serving.
+ *
+ * `reachable` is the load-bearing part: a name that does not resolve is DEAD (no amount of
+ * waiting fixes it, and no other account can fix it either), whereas a 404/502/refused means
+ * the address is alive and the model is simply still loading. Collapsing those two into one
+ * boolean is what made the app stop a healthy, fully-loaded, already-paid-for GPU.
+ */
+async function _probe(url, timeoutMs = 4000) {
+    if (!url) return { ready: false, reachable: false, reason: 'no url' };
+    try {
+        const res = await axios.get(`${url.replace(/\/+$/, '')}/models`, {
+            timeout: timeoutMs, adapter: 'http', validateStatus: () => true,
+        });
+        const ready = res.status === 200 && Array.isArray(res.data?.data) && res.data.data.length > 0;
+        return { ready, reachable: true, reason: `http ${res.status}` };
+    } catch (e) {
+        const code = String((e && e.code) || '');
+        // Only a name-resolution failure proves the address itself is gone. Refused/reset/
+        // timeout all mean something answered for that name — treat those as "still booting".
+        const dead = code === 'ENOTFOUND' || code === 'EAI_AGAIN';
+        return { ready: false, reachable: !dead, reason: code || (e && e.message) || 'error' };
+    }
+}
+
 /** Is the vLLM endpoint answering right now? */
 async function isVisionReady(timeoutMs = 4000) {
     const url = _visionUrl();
     if (!url) return false;
-    try {
-        const res = await axios.get(`${url}/models`, { timeout: timeoutMs, adapter: 'http' });
-        return Array.isArray(res.data?.data) && res.data.data.length > 0;
-    } catch (_) {
-        return false;
-    }
+    return (await _probe(url, timeoutMs)).ready;
 }
 
 /** Spawn the Python control helper for one subcommand; resolve its JSON result. */
@@ -91,13 +111,25 @@ function _runPy(cmd, { timeoutMs = 360000, onProgress, env } = {}) {
             resolve({ ok: false, error: `python timeout after ${Math.round(timeoutMs / 1000)}s` });
         }, timeoutMs);
         proc.stdout.on('data', (d) => { stdout += d.toString(); });
-        proc.stderr.on('data', (d) => {
-            const line = d.toString().trim();
-            if (line && onProgress) onProgress(line.split(/\r?\n/).filter(Boolean).pop());
-        });
+        // Forward EVERY diagnostic line, not just the last one of each chunk. The helper
+        // explains itself here (dead address, fallback taken, no-domain relaunch); keeping
+        // only the chunk tail silently hid the reason a start behaved the way it did.
+        // A chunk can split mid-line, so hold the unterminated tail until more arrives.
+        let errBuf = '';
+        const pumpErr = (chunk, flush) => {
+            errBuf += chunk;
+            const lines = errBuf.split(/\r?\n/);
+            errBuf = flush ? '' : (lines.pop() || '');
+            for (const l of lines) {
+                const t = l.trim();
+                if (t && onProgress) onProgress(t);
+            }
+        };
+        proc.stderr.on('data', (d) => pumpErr(d.toString(), false));
         proc.on('error', (e) => { clearTimeout(killer); resolve({ ok: false, error: e.message }); });
         proc.on('close', () => {
             clearTimeout(killer);
+            pumpErr('', true);
             const last = stdout.trim().split(/\r?\n/).filter(Boolean).pop() || '';
             try { resolve(JSON.parse(last)); }
             catch (_) { resolve({ ok: false, error: `bad helper output: ${(last || 'empty').slice(0, 200)}` }); }
@@ -127,9 +159,19 @@ function _persistVisionUrl(url) {
     } catch (_) { /* best-effort */ }
 }
 
+/**
+ * The OpenAI-compatible base of an address. vLLM serves /v1/models, never /models, so every
+ * address must pass through here before it is probed or stored — a raw host would 404 forever
+ * and read as "the model never loaded".
+ */
+function _v1(rawUrl) {
+    const u = String(rawUrl || '').replace(/\/+$/, '');
+    return /\/v1$/.test(u) ? u : `${u}/v1`;
+}
+
 /** Repoint the vision endpoint at the freshly captured tunnel URL. */
 function _applyUrl(rawUrl, log) {
-    const full = /\/v1\/?$/.test(rawUrl) ? rawUrl.replace(/\/+$/, '') : `${rawUrl.replace(/\/+$/, '')}/v1`;
+    const full = _v1(rawUrl);
     process.env.LIGHTNING_VISION_URL = full;
     try { config.resolveVisionBackend(); } catch (_) {}
     // The vision call sites read config.qwen.baseUrl (cached object), NOT process.env at call
@@ -139,27 +181,94 @@ function _applyUrl(rawUrl, log) {
     if (log) log(`Lightning endpoint: ${full}`);
 }
 
-/** Poll the public tunnel URL directly until the model finishes loading. */
-async function _waitModel(log) {
-    const modelTimeoutMs = Number(process.env.LIGHTNING_MODEL_TIMEOUT_MS || 480000); // 8 min
+/**
+ * Poll every candidate address until the model answers on one of them.
+ *
+ * Returns { ready, url, sawAddress }. `sawAddress` is false only when NOT ONE candidate ever
+ * responded — i.e. we have no live address for the GPU at all. That is a different failure from
+ * "the model never loaded", and the caller must treat it differently: it is not this account's
+ * fault, so rotating to another account can only waste more paid GPU time.
+ */
+async function _waitModel(log, candidates) {
+    const modelTimeoutMs = Number(process.env.LIGHTNING_MODEL_TIMEOUT_MS || 900000); // 15 min for cold T4
+    // If nothing has answered by now, no address we hold is alive. Fail fast instead of paying
+    // out the full model timeout for a name that will never resolve.
+    const noAddressMs = Number(process.env.LIGHTNING_NO_ADDRESS_MS || 90000);
+    // Normalise first: a candidate straight from the helper has no /v1 suffix.
+    const urls = [...new Set((candidates || []).filter(Boolean).map(_v1))];
+    if (!urls.length) return { ready: false, url: '', sawAddress: false };
+
     const t0 = Date.now();
     let ticks = 0;
+    let sawAddress = false;
+    let lastReason = '';
     while (Date.now() - t0 < modelTimeoutMs) {
-        if (await isVisionReady()) { log(`Lightning vision ready ✓ (${Math.round((Date.now() - t0) / 1000)}s)`); return true; }
+        for (const url of urls) {
+            const p = await _probe(url);
+            lastReason = p.reason;
+            if (p.reachable) sawAddress = true;
+            if (p.ready) {
+                log(`Lightning vision ready ✓ (${Math.round((Date.now() - t0) / 1000)}s)`);
+                return { ready: true, url, sawAddress: true };
+            }
+        }
+        if (!sawAddress && Date.now() - t0 >= noAddressMs) {
+            log(`No address for the GPU responded in ${Math.round(noAddressMs / 1000)}s (${lastReason}) — not waiting out the model timeout.`);
+            return { ready: false, url: '', sawAddress: false };
+        }
         if (++ticks % 4 === 0) log(`Model loading… ${Math.round((Date.now() - t0) / 1000)}s`);
         await _sleep(5000);
     }
-    return false;
+    return { ready: false, url: '', sawAddress };
 }
 
 /** One start attempt for a specific env (account or single .env). Returns { ok, reason }. */
 async function _startWith(env, log) {
     const r = await _runPy('start', { timeoutMs: 420000, onProgress: log, env });
-    if (!r.ok) return { ok: false, reason: r.error || 'start failed' };
-    if (!r.url) return { ok: false, reason: 'no tunnel URL captured' };
+    if (!r.ok) {
+        return {
+            ok: false,
+            reason: r.error || 'start failed',
+            retryable: r.retryable !== false,
+        };
+    }
+    if (!r.url) {
+        return {
+            ok: false,
+            reason: r.error || 'no tunnel URL captured',
+            retryable: r.retryable !== false,
+            globalFailure: r.globalFailure === true,
+        };
+    }
     _applyUrl(r.url, log);
-    const ready = await _waitModel(log);
-    return ready ? { ok: true } : { ok: false, reason: 'model not ready in time' };
+    // The helper hands back every address it could find for this GPU (the configured tunnel and
+    // Lightning's own direct port). Poll them all — whichever comes alive first wins.
+    const candidates = [r.url, ...(Array.isArray(r.altUrls) ? r.altUrls : [])];
+    const wait = await _waitModel(log, candidates);
+    if (wait.ready) {
+        if (wait.url && wait.url !== _v1(r.url)) {
+            log('Primary address never answered — switched to the backup.');
+            _applyUrl(wait.url, log);
+        }
+        return { ok: true, startedByApp: r.startedByApp === true, startMethod: r.startMethod || null };
+    }
+    if (r.startedByApp === true) {
+        log(wait.sawAddress
+            ? 'Model did not become ready; stopping the Studio to prevent billing.'
+            : 'No address reached this GPU; stopping the Studio to prevent billing.');
+        await _runPy('stop', { timeoutMs: 120000, onProgress: log, env });
+    }
+    // Nothing ever answered: the addresses are broken, not this account. Every other account
+    // would fail identically, so mark it non-retryable and let the caller stop the rotation.
+    if (!wait.sawAddress) {
+        return {
+            ok: false,
+            reason: 'no reachable address for the GPU — the endpoint is unreachable, not the account',
+            retryable: false,
+            globalFailure: true,
+        };
+    }
+    return { ok: false, reason: 'model not ready in time', retryable: true };
 }
 
 /**
@@ -175,6 +284,7 @@ async function ensureReady({ onProgress } = {}) {
     // ── Pooled rotation ──
     if (rotation.isEnabled()) {
         const tried = new Set();
+        const failures = [];
         let acct = rotation.pickAccount();
         if (!acct) return { ok: false, reason: 'all Lightning accounts are exhausted or cooling down' };
         while (acct && !tried.has(acct.id)) {
@@ -184,23 +294,59 @@ async function ensureReady({ onProgress } = {}) {
             const res = await _startWith(_accountEnv(acct), log);
             if (res.ok) {
                 rotation.markHealthy(acct);
-                rotation.beginSession(acct);
-                _activeSession = { account: acct, startedAt: Date.now() };
-                return { ok: true, account: acct.id };
+                if (res.startedByApp) {
+                    rotation.beginSession(acct);
+                    _activeSession = { account: acct, startedAt: Date.now() };
+                } else {
+                    _activeSession = null;
+                }
+                return {
+                    ok: true,
+                    account: acct.id,
+                    alreadyReady: !res.startedByApp,
+                    startedByApp: res.startedByApp,
+                };
+            }
+            // A failure that is not the ACCOUNT's fault (no reachable address for the GPU) is
+            // identical for every account in the pool. Rotating through the rest can only burn
+            // more paid GPU minutes on a wall that will not move — stop here, and leave the
+            // account's health record untouched so it isn't struck for someone else's problem.
+            if (res.globalFailure === true) {
+                log(`Not an account problem (${res.reason}) — stopping the rotation instead of burning the other accounts.`);
+                return { ok: false, reason: res.reason, retryable: false };
             }
             log(`Account ${acct.label || acct.id} unavailable (${res.reason}) — rotating to next`);
+            failures.push({
+                account: acct.label || acct.id,
+                reason: res.reason || 'start failed',
+                retryable: res.retryable !== false,
+            });
             rotation.markFailure(acct, res.reason);
             acct = rotation.pickAccount();
         }
-        return { ok: false, reason: 'no Lightning account could be brought up' };
+        const uniqueReasons = [...new Set(failures.map((f) => f.reason).filter(Boolean))];
+        return {
+            ok: false,
+            reason: uniqueReasons.length === 1
+                ? uniqueReasons[0]
+                : `No Lightning account could be started. ${uniqueReasons.join(' | ')}`,
+            retryable: failures.some((f) => f.retryable),
+        };
     }
 
     // ── Single-account (.env) fallback ──
     if (await isVisionReady()) { log('Lightning vision already ready ✓'); return { ok: true, alreadyReady: true }; }
     log('Starting Lightning Studio + vLLM…');
     const res = await _startWith(process.env, log);
-    if (res.ok) { _activeSession = null; return { ok: true }; }
-    return { ok: false, reason: res.reason };
+    if (res.ok) {
+        _activeSession = null;
+        return {
+            ok: true,
+            alreadyReady: !res.startedByApp,
+            startedByApp: res.startedByApp,
+        };
+    }
+    return { ok: false, reason: res.reason, retryable: res.retryable !== false && res.globalFailure !== true };
 }
 
 /** Stop the active Studio (idempotent) and bill its usage back to the rotation manager. */
@@ -231,4 +377,9 @@ async function status() {
     return { configured: isConfigured(), ready, instanceState: state, pool: rotation.isEnabled() ? rotation.status() : null };
 }
 
-module.exports = { isConfigured, isVisionReady, getInstanceState, status, ensureReady, stop };
+module.exports = {
+    isConfigured, isVisionReady, getInstanceState, status, ensureReady, stop,
+    // Exported so the verify harness can prove a dead hostname is reported as unreachable
+    // while a live-but-not-serving one is not.
+    probeEndpoint: _probe,
+};

@@ -2,6 +2,7 @@
 
 const { parseJsonObject } = require('../../brain/strict-json');
 const { windowOf } = require('./scope-utils');
+const capabilityRegistry = require('./capabilities/registry');
 
 const VISUAL_REFERENCE = /\b(?:this|that|these|those|it|here|there|visible|shown|screen|preview)\b/i;
 const VAGUE_VISUAL_NOUN = /\b(?:bar|line|rule|rail|strip|box|plate|shape|thing|object|element|part|mark|decoration|icon|graphic|text|background|overlay)\b/i;
@@ -124,52 +125,75 @@ function activeLayerInventory(plan, request) {
     };
 }
 
-function _safePosition(value) {
-    const position = String(value || '');
-    return [
-        'top-left', 'top-right', 'bottom-left', 'bottom-right',
-        'center-left', 'center-right', 'center',
-    ].includes(position) ? position : '';
+function _groundedToolCatalog() {
+    return capabilityRegistry.listManifests()
+        .map((manifest) => ({
+            capabilityId: manifest.id,
+            specialist: manifest.specialist,
+            tools: (manifest.tools || []).filter((toolSpec) => (
+                toolSpec.action === toolSpec.canonicalAction
+                && toolSpec.visualTargets?.length
+            )).map((toolSpec) => ({
+                action: toolSpec.action,
+                description: toolSpec.description,
+                args: toolSpec.args,
+                visualTargets: toolSpec.visualTargets,
+            })),
+        }))
+        .filter((entry) => entry.tools.length);
 }
 
-function _safeGraphicsInvocation(invocation, target) {
-    if (!invocation || invocation.capabilityId !== 'graphics' || invocation.action !== 'edit-properties') {
-        return null;
+function _safeGroundedInvocation(invocation, target, request) {
+    if (!invocation || !target) return null;
+    const capabilityId = String(invocation.capabilityId || '');
+    const action = String(invocation.action || '');
+    const manifest = capabilityRegistry.getCapability(capabilityId)?.manifest;
+    const toolSpec = manifest?.tools?.find((candidate) => (
+        candidate.action === action
+        && candidate.action === candidate.canonicalAction
+        && candidate.visualTargets?.includes(target.kind)
+    ));
+    if (!toolSpec) return null;
+
+    const args = _clone(
+        invocation.args && typeof invocation.args === 'object'
+            ? invocation.args
+            : {}
+    );
+    if (target.kind === 'graphic') {
+        args.targetType = target.type;
+        args.targetIds = [target.id];
+        args.all = false;
+    } else if (target.kind === 'icon') {
+        args.targetIds = [target.id];
+        args.all = false;
     }
-    const source = invocation.args && typeof invocation.args === 'object' ? invocation.args : {};
-    const args = {
-        targetType: target.type,
-        targetIds: [target.id],
-        all: false,
-    };
-    const position = _safePosition(source.position);
-    if (position) args.position = position;
-    if (typeof source.accentRuleVisible === 'boolean') args.accentRuleVisible = source.accentRuleVisible;
-    if (source.transparentBackground === true) args.transparentBackground = true;
-    for (const field of ['animation', 'style', 'variant', 'backgroundColor', 'textColor']) {
-        if (typeof source[field] === 'string' && source[field].trim()) {
-            args[field] = source[field].trim().slice(0, 120);
-        }
-    }
-    if (Number.isFinite(Number(source.shadowStrength))) {
-        args.shadowStrength = Math.max(0, Math.min(1, Number(source.shadowStrength)));
-    }
-    if (Number.isFinite(Number(source.durationSeconds))) {
-        args.durationSeconds = Math.max(0.5, Math.min(120, Number(source.durationSeconds)));
-    }
-    if (Number.isFinite(Number(source.durationScale))) {
-        args.durationScale = Math.max(0.1, Math.min(4, Number(source.durationScale)));
-    }
-    if (Object.keys(args).length <= 3) return null;
-    return {
-        capabilityId: 'graphics',
-        action: 'edit-properties',
+    const normalized = capabilityRegistry.tryNormalizeInvocation({
+        capabilityId,
+        action,
         args,
         description: _compact(
             invocation.description
             || `edit the visible ${target.type} ${target.semanticPart || 'element'}`,
             300
         ),
+    }, {
+        request,
+        plan: null,
+        existingOperations: [],
+        log: () => { },
+    });
+    if (!normalized.operation) return null;
+    const normalizedIds = normalized.operation.args?.targetIds || [];
+    if (normalizedIds.length && (
+        normalizedIds.length !== 1
+        || String(normalizedIds[0]) !== String(target.id)
+    )) return null;
+    return {
+        capabilityId: normalized.operation.capabilityId,
+        action: normalized.operation.action,
+        args: normalized.operation.args,
+        description: normalized.operation.description,
     };
 }
 
@@ -191,8 +215,8 @@ function coerceVisualGrounding(raw, inventory, request) {
         }
         : null;
     const grounded = Boolean(target && confidence >= 0.62);
-    const invocation = grounded && target.kind === 'graphic'
-        ? _safeGraphicsInvocation(source.invocation, target)
+    const invocation = grounded
+        ? _safeGroundedInvocation(source.invocation, target, request)
         : null;
     return {
         required: true,
@@ -219,6 +243,7 @@ function coerceVisualGrounding(raw, inventory, request) {
 }
 
 function _prompt(request, inventory) {
+    const groundedTools = _groundedToolCatalog();
     return `You are the visual-grounding observer inside a professional video editor.
 The supplied image is an exact screenshot of the preview at ${inventory.time.toFixed(3)} seconds.
 Your job is to resolve what visible object the user is pointing at, then map it to ONE candidate layer and, only when safe, ONE declared edit invocation.
@@ -236,25 +261,11 @@ RENDERED SUB-PART VOCABULARY:
 - "icon": a separate pictogram, symbol, or cutout.
 - "media": the underlying photograph or video.
 
-SAFE VISUAL INVOCATION:
-For a graphic, you may return:
-{
-  "capabilityId": "graphics",
-  "action": "edit-properties",
-  "args": {
-    "targetType": "candidate type",
-    "targetIds": ["candidate id"],
-    "accentRuleVisible": false,
-    "transparentBackground": true,
-    "position": "top-left|top-right|bottom-left|bottom-right|center-left|center-right|center",
-    "textColor": "CSS color",
-    "backgroundColor": "CSS color",
-    "shadowStrength": 0.0,
-    "durationSeconds": 1.5,
-    "durationScale": 0.65
-  },
-  "description": "precise visible edit"
-}
+SAFE VISUAL TOOL CONTRACTS:
+${JSON.stringify(groundedTools)}
+
+Choose at most one tool whose visualTargets includes the identified target kind.
+Use only arguments declared by that tool. The application will inject the exact target id and type.
 Include only properties explicitly requested. Preserve all unrelated design, copy, timing, media, and effects.
 Never interpret a thin accent-rule as the whole graphic background.
 If the visible object cannot be mapped confidently to exactly one listed layer, return invocation:null.

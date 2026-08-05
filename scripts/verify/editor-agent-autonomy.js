@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 
 const registry = require('../../src/agents/editor-supervisor/capabilities/registry');
+const graphicsCapability = require('../../src/agents/editor-supervisor/capabilities/graphics');
 const { runAutonomousOperations } = require('../../src/agents/editor-supervisor/autonomous-runner');
 const { resolveContextualPayload } = require('../../src/agents/editor-supervisor/conversation-context');
 const sessionStore = require('../../src/agents/editor-supervisor/session-store');
@@ -211,6 +212,86 @@ async function verifyPersistentSessionAndFollowUps() {
             typoHeadlineDuration.text,
             'edit the duration of the headling make it shorter',
             'a misspelled headline-duration request must not inherit completed media work'
+        );
+
+        const pendingPlan = fixturePlan();
+        pendingPlan.templateScenes.push({
+            id: 'pending-stat-card',
+            clipId: 'pending-stat-card',
+            type: 'statCard',
+            templateType: true,
+            trackId: 'video-track-3',
+            startTime: 1,
+            endTime: 4,
+            duration: 3,
+            text: '$300 System',
+            style: 'editorial-light',
+            variant: 'sideBySide',
+            items: [{ value: '$300', label: 'Complete System' }],
+        });
+        const pendingScope = {
+            kind: 'visual',
+            scopeMode: 'selection',
+            label: '1 selected graphic',
+            fromSec: 1,
+            toSec: 4,
+            currentTime: 2,
+            totalDuration: 10,
+            contiguous: true,
+            clipRefs: [],
+            iconRefs: [],
+            visualRefs: [{
+                id: 'pending-stat-card',
+                type: 'statCard',
+                collection: 'templateScenes',
+                startTime: 1,
+                endTime: 4,
+                label: '$300 System',
+            }],
+        };
+        const pendingFollowUp = resolveContextualPayload({
+            text: 'ok do that',
+            effort: 'fast',
+            scope: pendingScope,
+        }, {
+            context: {
+                lastExecution: {
+                    summary: 'Regenerate the $300 System stat card',
+                    capabilityIds: ['graphics'],
+                    operations: [{ capabilityId: 'graphics', action: 'regenerate' }],
+                    scope: pendingScope,
+                    createdAt: '2026-07-25T22:44:38.496Z',
+                },
+                lastPlan: {
+                    summary: 'Restyle the selected statCard in place while preserving its content, timing, and identity',
+                    capabilityIds: ['graphics'],
+                    operations: [{ capabilityId: 'graphics', action: 'edit-properties' }],
+                    scope: pendingScope,
+                    createdAt: '2026-07-26T10:21:42.318Z',
+                },
+            },
+        }, pendingPlan);
+        assert.strictEqual(pendingFollowUp.contextResolution.source, 'plan');
+        assert.match(pendingFollowUp.text, /Previous plan: Restyle the selected statCard in place/i);
+        assert.doesNotMatch(pendingFollowUp.text, /Previous result: Regenerate/i);
+        const pendingRoute = graphicsCapability.planFast({
+            text: pendingFollowUp.text,
+            directives: {
+                graphics: {
+                    action: 'regenerate',
+                    requestedType: 'statCard',
+                },
+            },
+            request: {
+                ...pendingFollowUp,
+                effort: 'fast',
+            },
+            plan: pendingPlan,
+        });
+        assert.deepStrictEqual(
+            pendingRoute.operations.map((operation) => [operation.capabilityId, operation.action]),
+            [['graphics', 'edit-properties']],
+            '"ok do that" must execute the newest pending restyle plan, not an older regeneration'
         );
 
         const history = sessionStore.historyForModel(loaded, 'make it shorter');

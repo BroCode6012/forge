@@ -14,6 +14,7 @@ const PROBES = {
     export: 'runtime-export-probe.js',
     'qa-crop': 'runtime-qa-crop-probe.js',
     ui: 'runtime-ui-probe.js',
+    clipboard: 'runtime-clipboard-probe.js',
 };
 const probeName = process.argv[2];
 if (!PROBES[probeName]) {

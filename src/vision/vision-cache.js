@@ -19,7 +19,23 @@ const TTL_MS = Math.max(
     60 * 60 * 1000, // 1h floor
     parseInt(process.env.VISION_CACHE_TTL_MS || '', 10) || DEFAULT_TTL_MS
 );
-const CACHE_VERSION = String(process.env.VISION_CACHE_VERSION || 'vision-v2-2026-06-01');
+// Bumped 2026-08-04 alongside the move from the self-hosted Qwen2.5-VL-7B box to Claude
+// on Bedrock. The key encodes the URL and the scope but NOT which model produced the
+// verdict, so without a bump a stale entry from the old judge is served as though the new
+// judge had scored it — silently mixing two rubrics. Bump whenever the scoring model
+// changes. (Folding the model into the key would end this by construction, but the key
+// shape is deliberately frozen; see the refactor rule in scripts/verify/README.md.)
+//
+// v4, same day: the v3 entries are NOT from the judge v3 was bumped for. The configured
+// primary (us.anthropic.claude-sonnet-5) turned out to be un-entitled on this account and
+// 403'd on every call, so the chain fell through and bedrock-qwen-vl scored everything.
+// Measured on 9 labelled real frames, that stand-in kept 0 of 3 clips a human would use
+// (scripts/vision-judge-bench.js). Every v3 verdict is therefore a verdict from a judge we
+// have now proven rejects good footage; serving them would make the fix look like it did
+// nothing. Discard them. Measured cost of this bump on the live cache at the time: zero —
+// the only file on disk still held 31 v2-era entries, already unreachable since the v3
+// bump. The bump is insurance against v3 entries on any other project dir or machine.
+const CACHE_VERSION = String(process.env.VISION_CACHE_VERSION || 'vision-v4-2026-08-04');
 
 let _loaded = false;
 let _items = new Map();

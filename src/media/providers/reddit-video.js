@@ -721,7 +721,16 @@ class RedditVideoProvider extends BaseProvider {
 
     async download(url, outputPath, options = {}) {
         const duration = options.duration || 10;
-        const maxHeight = normalizeMaxHeight(config.youtube?.maxHeight);
+        // Same 1080p default the YouTube provider already applies. Uncapped, yt-dlp pulls
+        // the source resolution and the render transcode immediately throws everything
+        // above 1080p away (scale=1920:1080 in hyperframes-bridge). An explicit
+        // MAX_VIDEO_HEIGHT (config.youtube.maxHeight) still wins; YOUTUBE_DOWNLOAD_MAX_HEIGHT
+        // overrides the default (set it to 0 to truly uncap).
+        let maxHeight = normalizeMaxHeight(config.youtube?.maxHeight);
+        if (maxHeight === null) {
+            const envCap = process.env.YOUTUBE_DOWNLOAD_MAX_HEIGHT;
+            maxHeight = (envCap !== undefined && envCap !== '') ? normalizeMaxHeight(envCap) : 1080;
+        }
 
         const metadata = options._cachedMeta || await this._getVideoMetadata(url);
 

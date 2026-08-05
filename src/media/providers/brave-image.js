@@ -1,6 +1,7 @@
 const axios = require('axios');
 const BaseProvider = require('./base-provider');
 const config = require('../../settings/config');
+const { firstThumbUrl } = require('./preview-thumb');
 
 // Brave Image Search API — the closest official replacement for the retired
 // Bing Image Search API (Microsoft retired all Bing Search APIs on 2025-08-11).
@@ -77,6 +78,10 @@ class BraveImageProvider extends BaseProvider {
             const url = _cleanImageUrl(item?.properties?.url || item?.thumbnail?.src);
             if (!url || seen.has(url)) continue;
             seen.add(url);
+            // Only a real saving when the candidate resolved to the full-res
+            // `properties.url`; when it fell back to the thumbnail, thumb and
+            // candidate are the same bytes and there is nothing to defer.
+            const thumb = firstThumbUrl(item?.thumbnail?.src);
             results.push({
                 id: `brave:${url}`,
                 url,
@@ -85,6 +90,7 @@ class BraveImageProvider extends BaseProvider {
                 title: String(item?.title || '').trim(),
                 sourcePage: String(item?.url || item?.source || '').trim(),
                 _provider: 'brave',
+                _thumbUrl: thumb && thumb !== url ? thumb : '',
             });
             if (results.length >= MAX_RESULTS) break;
         }

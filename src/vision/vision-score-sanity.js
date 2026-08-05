@@ -136,24 +136,40 @@ function _pushParts(parts, value) {
     }
 }
 
-function _targetParts(keyword, context = {}) {
+// ── Anchor tiers ──
+// Not every word in the brief is an anchor. The curated fields below are LISTS
+// of concrete things the scene needs ("thermometer", "trench", "emblem"); the
+// prose fields one level down are SENTENCES written for a human, and every verb,
+// adverb and connective in them ("conveying", "adding", "placed", "beside",
+// "while") tokenizes into something almost any description echoes back. Counting
+// both tiers equally is how a 3/10 press thumbnail collected six "anchors"
+// (close-up, clean, conveying, institutional, authority, adding) and passed.
+// The split is structural, not a word list — it holds for every niche and every
+// topic because the inputs are the scene's own brief.
+function _strongTargetParts(keyword, context = {}) {
     const agent = context?.mediaAgent || {};
-    const hunter = context?.mediaHunter || {};
     const parts = [];
     _pushParts(parts, keyword);
-    _pushParts(parts, context?.visualIntent);
     _pushParts(parts, context?.literalRequiredObjects);
     _pushParts(parts, context?.subjectAnchors);
     _pushParts(parts, context?.mustShow);
     _pushParts(parts, context?.mandatoryVisible);
     _pushParts(parts, context?.mandatoryIdentity);
     _pushParts(parts, agent?.target);
-    _pushParts(parts, agent?.viewerNeed);
     _pushParts(parts, agent?.literalRequiredObjects);
     _pushParts(parts, agent?.subjectAnchors);
     _pushParts(parts, agent?.mustShow);
     _pushParts(parts, agent?.mandatoryVisible);
     _pushParts(parts, agent?.mandatoryIdentity);
+    return parts;
+}
+
+function _weakTargetParts(context = {}) {
+    const agent = context?.mediaAgent || {};
+    const hunter = context?.mediaHunter || {};
+    const parts = [];
+    _pushParts(parts, context?.visualIntent);
+    _pushParts(parts, agent?.viewerNeed);
     _pushParts(parts, hunter?.targetDescription);
     _pushParts(parts, hunter?.prefer);
     return parts;
@@ -239,12 +255,17 @@ function _mandatoryCoverage(description, context = {}) {
     };
 }
 
-function _uniqueTokens(parts) {
+function _uniqueTokens(parts, exclude = null) {
     const seen = new Set();
     const out = [];
     for (const part of parts) {
-        for (const token of _tokens(part)) {
+        // MANDATORY_GENERIC_TOKENS was only ever applied to mandatory coverage,
+        // so "visible", "clean", "close", "background", "image", "view" and
+        // "shot" still counted as anchors here — words that describe no subject
+        // at all and appear in nearly every vision description.
+        for (const token of _mandatoryTokens(part)) {
             if (seen.has(token)) continue;
+            if (exclude && exclude.has(token)) continue;
             seen.add(token);
             out.push(token);
             if (out.length >= 36) return out;
@@ -254,19 +275,41 @@ function _uniqueTokens(parts) {
 }
 
 function _descriptionCoverage(description, keyword, context = {}) {
-    const target = _uniqueTokens(_targetParts(keyword, context));
+    const strong = _uniqueTokens(_strongTargetParts(keyword, context));
+    const weak = _uniqueTokens(_weakTargetParts(context), new Set(strong));
+    const target = strong.concat(weak).slice(0, 36);
     const descTokens = new Set(_tokens(description));
-    const matched = target.filter(token => descTokens.has(token));
+    const matchedStrong = strong.filter(token => descTokens.has(token));
+    const matchedWeak = weak.filter(token => descTokens.has(token));
+    const matched = matchedStrong.concat(matchedWeak);
     const ratio = target.length ? matched.length / Math.min(target.length, 10) : 0;
-    return { target, matched, ratio };
+    return { target, matched, matchedStrong, matchedWeak, strong, weak, ratio };
 }
 
+// This helper rescues ONE thing: a scorecard the judge produced but we could not
+// read a number out of. It is not a second opinion on a number we CAN read.
+//
+// It drifted into being one. A caller widened `triggerScore` to "accept line
+// minus 1" so borderline clips could reach deeper analysis, but the race gate is
+// a hard `score < minimum` compare, so the same caller had to set the lift to
+// the accept line itself for the rescue to have any effect at all — and the two
+// together turned "unreadable scorecard" into "anything the judge disliked,
+// promoted to a pass on word overlap". One 67-scene build produced 28 rescues
+// against exactly 1 unreadable scorecard: 27 real judgments of 1, 3, 4 and 5 out
+// of 10 were lifted to precisely the pass mark, twice by stacking two rescues
+// (1 -> 5 -> 6). A 200x200, 6KB press thumbnail shipped as scene footage.
+//
+// A readable score is the judge doing its job. It stands.
 function applyVisionScoreSanity(result, keyword, context = {}, options = {}) {
     if (!result) return result;
+    // Never lift a score that was already lifted — that is how 1/10 reached the
+    // pass mark in two hops, each hop individually looking reasonable.
+    if (result.scoreSanity?.adjusted) return result;
     const score = Number(result.score ?? result.bestScore ?? 0);
     const triggerScore = Number.isFinite(Number(options.triggerScore)) ? Number(options.triggerScore) : 2;
     const parseError = !!result.parseError || (!!result.errorMessage && /missing numeric score|parse/i.test(String(result.errorMessage)));
-    if (!parseError && score > triggerScore) return result;
+    if (!parseError) return result;
+    if (score > triggerScore) return result;
 
     const description = String(result.description || '').trim();
     if (description.length < 12) return result;
@@ -277,6 +320,12 @@ function applyVisionScoreSanity(result, keyword, context = {}, options = {}) {
     if (!mandatoryCoverage.ok) return result;
 
     const coverage = _descriptionCoverage(description, keyword, context);
+    // The rescue has to rest on the scene's concrete subjects. Prose overlap
+    // alone is not evidence: "conveying, adding, beside, while" match almost
+    // anything. When the brief lists fewer than two concrete subjects, all of
+    // them must appear — there is nothing else to lean on.
+    const needStrong = Math.min(2, coverage.strong.length);
+    if (needStrong === 0 || coverage.matchedStrong.length < needStrong) return result;
     const enoughMatches = coverage.matched.length >= 3
         || (coverage.matched.length >= 2 && coverage.target.length <= 7)
         || coverage.ratio >= 0.35;
@@ -318,25 +367,45 @@ function applyVisionScoreSanity(result, keyword, context = {}, options = {}) {
 const SELF_DEFECT_RE = /(?<!\bno )(?<!\bnot )(?<!\bwithout )(?<!\bfree of )\b(news[- ](?:graphics?|banner|ticker|bug|overlay|strap)|channel (?:logo|bug|branding)|station (?:logo|branding)|broadcast (?:graphics?|overlay|packaging)|lower[- ]third|news ticker|ticker tape|burned[- ]in (?:text|caption|subtitle|graphics?)|on[- ]?screen (?:text|caption|headline)|caption (?:bar|strip)|(?:arabic|foreign(?:[- ]language)?) (?:text|caption|subtitle)|(?:large|prominent|heavy|visible) watermark)\b/i;
 const DEFECT_CAP = 4;
 
-function clampSelfReportedDefects(result) {
+// Broadcast branding — a channel logo, an agency stamp, a news ticker. Nobody
+// ever asks for these, so they keep the hard cap no matter what the scene
+// requested. Everything else SELF_DEFECT_RE catches is lettering, and lettering
+// is what a drawn explanation is made of.
+const BRANDING_DEFECT_RE = /\b(news[- ](?:graphics?|banner|ticker|bug|overlay|strap)|channel (?:logo|bug|branding)|station (?:logo|branding)|broadcast (?:graphics?|overlay|packaging)|lower[- ]third|news ticker|ticker tape|watermark)\b/i;
+// Cap for lettering on a scene that explicitly asked for a diagram/schematic.
+// Still a cap, not an exemption: a labelled diagram sits above the accept floor
+// but below clean footage, exactly like the packaging penalty one level up.
+const REQUESTED_GRAPHIC_CAP = 7;
+
+function clampSelfReportedDefects(result, context = {}) {
     if (!result) return result;
     const score = Number(result.score ?? result.bestScore ?? 0);
     if (!(score > DEFECT_CAP)) return result;
     const description = String(result.description || '');
     const m = description.match(SELF_DEFECT_RE);
     if (!m) return result;
+
+    // A scene whose own brief is "cross-section diagram with temperature
+    // indicators and soil layers" has ASKED for writing on the picture. Clamping
+    // it to 4 for having labels is the same self-defeating loop that left that
+    // scene with no media at all — one level further down. Branding is exempt
+    // from the exemption.
+    const wantsGraphic = !!context?.mediaHunter?.requestedPackaging?.graphic;
+    const cap = (wantsGraphic && !BRANDING_DEFECT_RE.test(m[0])) ? REQUESTED_GRAPHIC_CAP : DEFECT_CAP;
+    if (!(score > cap)) return result;
+
     return {
         ...result,
-        score: DEFECT_CAP,
-        bestScore: result.bestScore !== undefined ? DEFECT_CAP : result.bestScore,
+        score: cap,
+        bestScore: result.bestScore !== undefined ? cap : result.bestScore,
         rawScoreBeforeSanity: score,
         scoreSanity: {
             adjusted: true,
             from: score,
-            to: DEFECT_CAP,
+            to: cap,
             reason: `description self-reports broadcast packaging ("${m[0]}")`,
         },
-        description: `${description} [defect clamp: "${m[0]}" → ${DEFECT_CAP}/10]`,
+        description: `${description} [defect clamp: "${m[0]}" → ${cap}/10]`,
     };
 }
 

@@ -131,6 +131,7 @@ class MGRenderer {
             fadeSlide:   (f, fps, anim, mg) => this._computeAnim_fadeSlide(f, fps, anim, mg),
             springScale: (f, fps, anim, mg) => this._computeAnim_springScale(f, fps, anim, mg),
             typewriter:  (f, fps, anim, mg) => this._computeAnim_typewriter(f, fps, anim, mg),
+            wordCascade: (f, fps, anim, mg) => this._computeAnim_wordCascade(f, fps, anim, mg),
         };
     }
 
@@ -1312,15 +1313,31 @@ class MGRenderer {
         ctx.textBaseline = 'middle';
         MGRenderer._setFont(ctx, ls.titleWeight, ls.titleSize, s.fontHeading);
 
-        // Optional outline stroke (bold style) behind the shadowed fill
-        if (ls.outline && ls.outlineWidth > 0) {
-            ctx.strokeStyle = ls.outline;
-            ctx.lineWidth = ls.outlineWidth;
-            ctx.lineJoin = 'round';
-            ctx.miterLimit = 2;
-            ctx.strokeText(mg.text || '', 0, -30);
+        if (a.wordCascade) {
+            MGRenderer._drawHeadlineWordCascade(
+                ctx,
+                mg.text || '',
+                0,
+                -30,
+                ls,
+                mg,
+                a.wordCascade,
+                {
+                    outline: ls.outline,
+                    outlineWidth: ls.outlineWidth,
+                }
+            );
+        } else {
+            // Optional outline stroke (bold style) behind the shadowed fill
+            if (ls.outline && ls.outlineWidth > 0) {
+                ctx.strokeStyle = ls.outline;
+                ctx.lineWidth = ls.outlineWidth;
+                ctx.lineJoin = 'round';
+                ctx.miterLimit = 2;
+                ctx.strokeText(mg.text || '', 0, -30);
+            }
+            MGRenderer._drawHeadlineText(ctx, mg.text || '', 0, -30, ls, false, mg);
         }
-        MGRenderer._drawHeadlineText(ctx, mg.text || '', 0, -30, ls, false, mg);
 
         ctx.filter = 'none';
 
@@ -1705,6 +1722,45 @@ class MGRenderer {
             stampScale: 1,
             stampAlpha: Math.min(1, revealProgress * 4),
             revealProgress,
+        };
+    }
+
+    _computeAnim_wordCascade(frame, fps, anim, mg) {
+        const { clamp01, interpolate } = AnimationUtils;
+        const speed = anim.speed;
+        const wordCount = Math.max(
+            1,
+            String(mg?.text || '').trim().split(/\s+/).filter(Boolean).length
+        );
+        const staggerFrames = Math.max(1, Math.round((0.11 / speed) * fps));
+        const revealFrames = Math.max(1, Math.round((0.44 / speed) * fps));
+        const completionFrame = Math.max(
+            revealFrames,
+            (wordCount - 1) * staggerFrames + revealFrames
+        );
+        const overall = clamp01(frame / completionFrame);
+        return {
+            scale: 1,
+            slideY: 0,
+            blur: 0,
+            barSpring: overall,
+            textSpring: overall,
+            subSpring: interpolate(
+                frame,
+                [completionFrame * 0.68, completionFrame],
+                [0, 1],
+                { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' }
+            ),
+            stampScale: 1,
+            stampAlpha: Math.min(1, overall * 4),
+            revealProgress: overall,
+            wordCascade: {
+                frame,
+                fps,
+                speed,
+                staggerFrames,
+                revealFrames,
+            },
         };
     }
 
@@ -7139,6 +7195,64 @@ class MGRenderer {
         ctx.shadowOffsetX = 0;
         ctx.shadowOffsetY = 0;
         MGRenderer._drawStyledText(ctx, text, x, y, mg);
+    }
+
+    static _drawHeadlineWordCascade(ctx, text, x, y, ls, mg, cascade, options = {}) {
+        const source = String(text || '');
+        const matches = [...source.matchAll(/\S+/g)];
+        if (!matches.length) return;
+
+        const originalAlpha = ctx.globalAlpha;
+        const originalAlign = ctx.textAlign;
+        const totalWidth = ctx.measureText(source).width;
+        const left = originalAlign === 'center'
+            ? x - totalWidth / 2
+            : (originalAlign === 'right' || originalAlign === 'end' ? x - totalWidth : x);
+        const fontHeight = Math.max(36, Number(ls?.titleSize) || 72);
+
+        matches.forEach((match, index) => {
+            const localFrame = Number(cascade.frame) - index * Number(cascade.staggerFrames);
+            const t = Math.max(
+                0,
+                Math.min(1, localFrame / Math.max(1, Number(cascade.revealFrames)))
+            );
+            if (t <= 0) return;
+
+            const eased = 1 - Math.pow(1 - t, 3);
+            const prefixWidth = ctx.measureText(source.slice(0, match.index)).width;
+            const wordWidth = Math.max(1, ctx.measureText(match[0]).width);
+            const wordLeft = left + prefixWidth;
+            const wordCenter = wordLeft + wordWidth / 2;
+            const rise = (1 - eased) * 42;
+            const scale = 0.88 + eased * 0.12;
+
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(
+                wordLeft - 18,
+                y - fontHeight,
+                wordWidth + 36,
+                fontHeight * 2.15
+            );
+            ctx.clip();
+            ctx.globalAlpha = originalAlpha * t;
+            ctx.translate(wordCenter, y);
+            ctx.scale(scale, scale);
+            ctx.translate(-wordCenter, -y + rise);
+
+            if (options.outline && Number(options.outlineWidth) > 0) {
+                ctx.strokeStyle = options.outline;
+                ctx.lineWidth = Number(options.outlineWidth);
+                ctx.lineJoin = 'round';
+                ctx.miterLimit = 2;
+                ctx.strokeText(source, x, y);
+            }
+            MGRenderer._drawHeadlineText(ctx, source, x, y, ls, false, mg);
+            ctx.restore();
+        });
+
+        ctx.globalAlpha = originalAlpha;
+        ctx.textAlign = originalAlign;
     }
 
     // ========================================================================

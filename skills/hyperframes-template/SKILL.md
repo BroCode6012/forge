@@ -82,6 +82,17 @@ Every color and font in your CSS must come from it. If you reach for #333,
   Stay comfortably under them — a truncated response fails entirely.
 - Respect the scene duration you're given: last exit tween must END at or
   before `duration`; entrance starts at ≥ 0.05.
+- Every exit that makes a selector hidden (`opacity:0`, `autoAlpha:0`,
+  `visibility:"hidden"`, or `display:"none"`) must be followed by a matching
+  `tl.set()` on that exact selector at the exit end, for example:
+  `tl.set("#ns-title", { opacity:0, visibility:"hidden" }, 4.80)`. This hard
+  kill is required for deterministic nonlinear seeking.
+- One selector has ONE transform owner. If its CSS contains
+  `transform:translate/scale/rotate(...)`, do not animate `x`, `y`,
+  `xPercent`, `yPercent`, `scale`, or rotation on that same selector with
+  `tl.to`, `tl.set`, or `gsap.set`. Put the CSS transform on an unanimated
+  wrapper, or remove it and use `tl.fromTo` so GSAP owns the complete
+  transform.
 
 ## OVERLAY MODE (when SCENE ROLE says OVERLAY)
 

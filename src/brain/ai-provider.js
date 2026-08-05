@@ -66,13 +66,24 @@ function _refreshQwenRuntimeConfig(opts = {}) {
         const hasParsedImagePrimary = Object.prototype.hasOwnProperty.call(parsed, 'QWEN_IMAGE_API_KEY');
         const hasParsedImageLane = hasParsedImagePrimary || Object.prototype.hasOwnProperty.call(parsed, 'QWEN_VL_API_KEY');
         const hasParsedOmniLane = Object.prototype.hasOwnProperty.call(parsed, 'QWEN_OMNI_API_KEY');
-        const nextSharedKeys = _parseEnvList(parsed.QWEN_VISION_API_KEY || process.env.QWEN_VISION_API_KEY || '');
-        const nextImageKeys = _parseEnvList(hasParsedImageLane
-            ? (hasParsedImagePrimary ? (parsed.QWEN_IMAGE_API_KEY || '') : (parsed.QWEN_VL_API_KEY || ''))
-            : (process.env.QWEN_IMAGE_API_KEY || process.env.QWEN_VL_API_KEY || ''));
-        const nextOmniKeys = _parseEnvList(hasParsedOmniLane
-            ? (parsed.QWEN_OMNI_API_KEY || '')
-            : (process.env.QWEN_OMNI_API_KEY || ''));
+        // Lightning's backend selector intentionally replaces hosted-Qwen key pools with
+        // one logical self-hosted credential. Do not let the five-second .env hot-reload
+        // restore old DashScope image/omni keys and turn one T4 endpoint back into several
+        // fake lanes. Other backends keep the normal live-key refresh behavior.
+        const lightningOwnsVisionKeys = String(process.env.VISION_BACKEND || '').toLowerCase() === 'lightning';
+        const nextSharedKeys = _parseEnvList(lightningOwnsVisionKeys
+            ? (process.env.QWEN_VISION_API_KEY || '')
+            : (parsed.QWEN_VISION_API_KEY || process.env.QWEN_VISION_API_KEY || ''));
+        const nextImageKeys = _parseEnvList(lightningOwnsVisionKeys
+            ? (process.env.QWEN_IMAGE_API_KEY || process.env.QWEN_VL_API_KEY || process.env.QWEN_VISION_API_KEY || '')
+            : (hasParsedImageLane
+                ? (hasParsedImagePrimary ? (parsed.QWEN_IMAGE_API_KEY || '') : (parsed.QWEN_VL_API_KEY || ''))
+                : (process.env.QWEN_IMAGE_API_KEY || process.env.QWEN_VL_API_KEY || '')));
+        const nextOmniKeys = _parseEnvList(lightningOwnsVisionKeys
+            ? (process.env.QWEN_OMNI_API_KEY || process.env.QWEN_VISION_API_KEY || '')
+            : (hasParsedOmniLane
+                ? (parsed.QWEN_OMNI_API_KEY || '')
+                : (process.env.QWEN_OMNI_API_KEY || '')));
         const effectiveImageKeys = (hasParsedImageLane || nextImageKeys.length) ? nextImageKeys : nextSharedKeys;
         const effectiveOmniKeys = (hasParsedOmniLane || nextOmniKeys.length) ? nextOmniKeys : nextSharedKeys;
         // process.env wins over the raw .env file for the base URL + model: the VISION_BACKEND
@@ -423,6 +434,24 @@ const QWEN_OMNI_TRANSIENT_WINDOW_MS = Math.max(
 // vision endpoint before cooling the lane and falling back. Catches the parallel-flood
 // resets seen against the self-hosted box. QWEN_VISION_NET_RETRIES=0 disables.
 const QWEN_VISION_NET_RETRIES = Math.max(0, Math.min(4, parseInt(process.env.QWEN_VISION_NET_RETRIES || '2', 10) || 2));
+// BACKPRESSURE, NOT DEATH.
+//
+// On a hosted multi-tenant API a 429 means "your quota is spent" — the right
+// answer is to bench that model and go elsewhere. On OUR OWN box it means
+// "the queue is full right now", and it clears in seconds. The Jul-29 build
+// treated the second case like the first: 13 cooldowns of 30s each on the only
+// model/key combo there is, so `_getBestKeyAndModel` returned null, the lane
+// reported "temporarily unavailable" 31 times, and every one of those frames
+// went to paid Bedrock instead of the GPU we were already renting.
+//
+// So on a self-hosted runtime a busy signal gets a longer wait ladder and a
+// seconds-scale bench instead of a half-minute one. Hosted DashScope keeps the
+// old behaviour exactly. QWEN_VISION_BUSY_RETRIES=0 disables the ladder.
+const QWEN_VISION_BUSY_RETRIES = Math.max(0, Math.min(8, parseInt(process.env.QWEN_VISION_BUSY_RETRIES || '4', 10) || 4));
+const QWEN_VISION_BUSY_BACKOFF_MS = [500, 1200, 2500, 4000, 6000, 8000, 10000, 12000];
+// HTTP statuses a saturated inference server emits: 429 too-many-requests,
+// 503 unavailable (vLLM sheds load), 529 overloaded.
+const VISION_BACKPRESSURE_STATUSES = new Set([429, 503, 529]);
 const QWEN_OMNI_HTTP_ENABLED = !['0', 'false', 'off', 'no'].includes(String(process.env.QWEN_OMNI_HTTP_ENABLED || '1').toLowerCase());
 const QWEN_OMNI_REALTIME_ENABLED = !['0', 'false', 'off', 'no'].includes(String(process.env.QWEN_OMNI_REALTIME_ENABLED || '1').toLowerCase());
 const QWEN_OMNI_REALTIME_TIMEOUT_MS = Math.max(
@@ -1019,11 +1048,78 @@ function _isQuotaError(err) {
 
     // Everything else that can reasonably be a transient or model-specific error
     // is a cooldown, NOT permanent. This covers: generic 403s, regional 404s,
-    // bad-request 400s, rate-limit 429s, server errors 5xx.
-    if (status === 400 || status === 403 || status === 404) return 'rate_limited';
+    // rate-limit 429s, server errors 5xx.
+    //
+    // 400 IS DELIBERATELY ABSENT — see _isRequestDefectError. A 400 is the
+    // protocol describing the payload we just sent, never the pool's capacity,
+    // so it must fail one call and never bench a key/model.
+    if (status === 403 || status === 404) return 'rate_limited';
     if (status === 429) return 'rate_limited';
     if (status === 500 || status === 502 || status === 503) return 'rate_limited';
     return null;
+}
+
+/**
+ * Pull the server's OWN error text out of an axios error.
+ *
+ * Without this the box's real complaint ("Input length 4127 exceeds model's
+ * maximum context length 4096") never reached a log line — the build only ever
+ * printed the generic "box busy" label, which is why a request-shaped fault
+ * looked like a capacity fault for an entire build.
+ */
+function _qwenErrorText(err) {
+    let data = err?.response?.data ?? err?.data ?? {};
+    if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch (_) { return data.slice(0, 400); }
+    }
+    const fromBody = data?.error?.message || data?.message
+        || (data && typeof data === 'object' && Object.keys(data).length ? JSON.stringify(data).slice(0, 400) : '');
+    return String(fromBody || err?.message || '');
+}
+
+/**
+ * Is this a REQUEST defect (our payload) rather than a POOL defect (their capacity)?
+ *
+ * HTTP 400 means "the request you sent was malformed". That is a statement about
+ * the bytes we just uploaded — it says nothing about whether the key is valid,
+ * the model is alive, or the server is busy. Benching a key/model for it is a
+ * category error, and on a self-hosted box it is fatal: there is exactly ONE key
+ * and ONE model, so a single bad payload benches the whole lane,
+ * `_getBestKeyAndModel` returns null, and every remaining frame in the build
+ * falls through to paid Bedrock.
+ *
+ * Measured on the Jul-31 build: the box's own log recorded 16×400 (prompt+image
+ * over the context window, plus undecodable image bytes) across a 47-minute
+ * media phase — and the GPU scored ZERO images. 16 bad requests should cost 16
+ * requests.
+ *
+ * ORDERING MATTERS. This is consulted only AFTER the two 400s that ARE genuine
+ * pool facts, both of which keep their existing behaviour:
+ *   - `_isQuotaError`'s explicit free-tier codes (DashScope can carry quota on a 400)
+ *   - `_isQwenTransportUnsupportedError` ("this model can't be called this way")
+ *
+ * The DECISION is the HTTP status alone — no phrase matching — so it holds for
+ * any OpenAI-compatible server (vLLM, DashScope, or anything added later). The
+ * phrases below only choose a friendly label for the log line.
+ *
+ * @returns {string|null} short human reason, or null if this is not a request defect
+ */
+function _isRequestDefectError(err) {
+    const status = err?.response?.status || err?.status || 0;
+    if (status !== 400) return null;
+    const msg = _qwenErrorText(err).toLowerCase();
+    if (msg.includes('context length') || msg.includes('context_length') || msg.includes('input length')) {
+        return 'prompt + image is longer than this model can read';
+    }
+    if (msg.includes('image') && (msg.includes('cannot identify') || msg.includes('failed to load')
+        || msg.includes('decode') || msg.includes('corrupt'))) {
+        return 'image bytes could not be decoded';
+    }
+    if (msg.includes('may be provided in one prompt') || msg.includes('limit_mm_per_prompt')
+        || msg.includes('limit-mm-per-prompt')) {
+        return 'too many images for one request';
+    }
+    return 'malformed request';
 }
 
 function _isQwenTransportUnsupportedError(err) {
@@ -1327,13 +1423,26 @@ function _markModelExhausted(model, reason, apiKey, role = 'vision') {
         // (536 rate-limit hits in one run → the free Qwen pool depleted in minutes → vision
         // fell to PAID Bedrock 298×, which then 429-throttled 476× → the ~3h media phase).
         // 30s keeps the free pool alive and usable. Override with QWEN_VISION_COOLDOWN_MS.
-        const cooldownMs = Math.max(5_000, parseInt(process.env.QWEN_VISION_COOLDOWN_MS, 10) || 30_000);
+        //
+        // ONE EXCEPTION — our own box. On hosted DashScope there are many models
+        // across many keys, so benching one for 30s costs nothing. On a rented
+        // GPU there is exactly one model on one key, so the same 30s benches the
+        // ENTIRE lane: `_getBestKeyAndModel` returns null, the caller is told
+        // "all combos temporarily unavailable", and the frame goes to paid
+        // Bedrock. That happened 31 times in the Jul-29 build off 13 cooldowns.
+        // A busy queue drains in seconds, so wait seconds.
+        const selfHostedBusy = reason === 'rate_limited' && _isSelfHostedVisionRuntime();
+        const cooldownMs = selfHostedBusy
+            ? Math.max(1_000, parseInt(process.env.QWEN_VISION_BUSY_COOLDOWN_MS, 10) || 4_000)
+            : Math.max(5_000, parseInt(process.env.QWEN_VISION_COOLDOWN_MS, 10) || 30_000);
         map[model] = Date.now() + cooldownMs;
         const reasonLabel = reason === 'network'
             ? 'network transient'
             : reason === 'timeout'
                 ? 'timeout'
-                : 'rate limited';
+                : selfHostedBusy
+                    ? 'box busy'
+                    : 'rate limited';
         const healthStatus = reason === 'network'
             ? 'network'
             : reason === 'timeout'
@@ -1408,7 +1517,16 @@ function _getAvailableModel(pool, configuredModel, apiKey, role = 'vision') {
  */
 const _qwenRoundRobinIdx = {}; // role -> monotonic counter, spreads calls across combos
 
-function _getBestKeyAndModel(pool, configuredModel, role = 'vision') {
+/**
+ * @param {Set<string>} [excludeCombos] - `${_hashApiKey(key)}:${model}` entries the
+ *        CALLER has already tried in this one call. Purely call-local: it lets a
+ *        retry loop advance to a fresh combo WITHOUT benching the current one in
+ *        global state. Before this existed, the only way to move the rotation
+ *        forward was `_markModelExhausted(..., 'rate_limited')`, which meant a
+ *        one-off bad payload sidelined a perfectly healthy key/model for every
+ *        later call in the build. Omit it and behaviour is exactly as before.
+ */
+function _getBestKeyAndModel(pool, configuredModel, role = 'vision', excludeCombos = null) {
     const keys = _getQwenKeys(role);
     if (keys.length === 0) return null;
 
@@ -1422,6 +1540,7 @@ function _getBestKeyAndModel(pool, configuredModel, role = 'vision') {
     const available = [];
     for (const model of orderedModels) {
         for (let i = 0; i < keys.length; i++) {
+            if (excludeCombos && excludeCombos.has(`${_hashApiKey(keys[i])}:${model}`)) continue;
             if (_isModelAvailable(model, keys[i], role)) {
                 available.push({ apiKey: keys[i], model, keyIndex: i + 1 });
             }
@@ -1702,15 +1821,105 @@ function _recordQwenOmniTransient(reason) {
 // A cloudflared tunnel (Lightning backend) rate-limits / 524-times-out under the build's
 // parallel vision flood (hundreds of concurrent scoring calls). And with a SINGLE self-hosted
 // model, one 429 cools the only combo for 2 min → everything falls to Bedrock. Capping in-flight
-// requests keeps the tunnel + the single L4 vLLM under their limit. 0 = unlimited (a direct-IP
+// requests keeps the tunnel + the single configured GPU/vLLM under their limit. 0 = unlimited (a direct-IP
 // AWS box needs no cap). QWEN_VISION_MAX_CONCURRENCY is auto-set to a safe value for Lightning.
 let _visionInFlight = 0;
 const _visionWaiters = [];
-function _visionConcurrencyLimit() { return parseInt(process.env.QWEN_VISION_MAX_CONCURRENCY || '0', 10) || 0; }
+function _visionConfiguredConcurrency() { return parseInt(process.env.QWEN_VISION_MAX_CONCURRENCY || '0', 10) || 0; }
+
+// The configured cap is the box's ADVERTISED capacity (vLLM's MAX_NUM_SEQS),
+// not what it sustains for this build's prompt sizes on this GPU on this run.
+// When our own requests start timing out, we are the ones overloading it — so
+// the cap floats down; when they flow again it floats back up. Classic
+// additive-increase / multiplicative-decrease: slow to trust, quick to back
+// off, which is the right asymmetry when guessing high stalls the build on a
+// paid fallback. Nothing here is niche- or topic-specific; the only input is
+// the box's own behaviour during this run.
+let _visionAdaptiveCap = 0;
+let _visionOkStreak = 0;
+function _visionConcurrencyLimit() {
+    const configured = _visionConfiguredConcurrency();
+    if (configured <= 0) return 0;
+    if (_visionAdaptiveCap <= 0 || _visionAdaptiveCap > configured) _visionAdaptiveCap = configured;
+    return _visionAdaptiveCap;
+}
+function _narrowVisionConcurrency(why) {
+    if (_visionConfiguredConcurrency() <= 0) return;
+    const before = _visionConcurrencyLimit();
+    if (before <= 1) return;
+    _visionAdaptiveCap = Math.max(1, Math.floor(before / 2));
+    _visionOkStreak = 0;
+    console.log(`  🎚️ [Qwen Image] easing off the box: ${before} → ${_visionAdaptiveCap} in flight (${why})`);
+}
+function _widenVisionConcurrency() {
+    const configured = _visionConfiguredConcurrency();
+    if (configured <= 0) return;
+    const current = _visionConcurrencyLimit();
+    if (current >= configured) { _visionOkStreak = 0; return; }
+    // One clean pass per open slot before asking for another one back.
+    if (++_visionOkStreak < current * 3) return;
+    _visionAdaptiveCap = current + 1;
+    _visionOkStreak = 0;
+    console.log(`  🎚️ [Qwen Image] box keeping up: ${current} → ${_visionAdaptiveCap} in flight`);
+}
+function _isLightningVisionRuntime() {
+    return String(process.env.VISION_BACKEND || '').toLowerCase() === 'lightning';
+}
+
+/**
+ * Are we scoring against a box WE rent (Lightning studio / the AWS GPU
+ * instance), rather than a hosted multi-tenant API?
+ *
+ * The URL is authoritative when we have one — `config.qwen.baseUrl` is the
+ * cached object `_applyUrl()` pushes the ephemeral tunnel URL into, and it is
+ * what the call sites actually read. Backend name is only the fallback.
+ */
+function _isSelfHostedVisionRuntime() {
+    const url = String(config.qwen?.baseUrl || process.env.QWEN_BASE_URL || '').toLowerCase();
+    if (url) return !/aliyuncs\.com|dashscope|openrouter|siliconflow|api\.together/.test(url);
+    const backend = String(process.env.VISION_BACKEND || '').toLowerCase();
+    return backend === 'lightning' || backend === 'aws';
+}
+
+/** A busy signal from our own box — the queue is full, not the quota. */
+function _isVisionBackpressure(err) {
+    return VISION_BACKPRESSURE_STATUSES.has(err?.response?.status) && _isSelfHostedVisionRuntime();
+}
+
+/**
+ * A timeout from a box WE rent is the same signal as a 429 — the queue is deep,
+ * not the box dead. vLLM under load simply doesn't answer inside the window; it
+ * has no spare capacity to send a status code with.
+ *
+ * Treating it as death is expensive because there is exactly ONE of these boxes:
+ * the timeout benched the only key+model combo for 30s, which made every other
+ * in-flight scoring call fail instantly with "all combos unavailable" and drop
+ * to paid Bedrock. In one 67-scene run that turned a handful of real timeouts
+ * into 61 failures, two multi-minute stalls, and not a single successful GPU
+ * score — while the box itself answered a probe in 2.4s.
+ */
+function _isSelfHostedVisionTimeout(err) {
+    if (!_isSelfHostedVisionRuntime()) return false;
+    return err?.code === 'ECONNABORTED'
+        || err?.code === 'ETIMEDOUT'
+        || /timeout/i.test(String(err?.message || ''));
+}
+function _qwenVisionRequestTimeoutMs() {
+    const defaultMs = _isLightningVisionRuntime() ? 45_000 : 25_000;
+    const configured = parseInt(process.env.QWEN_VISION_REQUEST_TIMEOUT_MS || String(defaultMs), 10) || defaultMs;
+    return Math.max(5_000, Math.min(120_000, configured));
+}
 function _releaseVisionSlot() {
-    const next = _visionWaiters.shift();
-    if (next) next();                                    // hand our slot to the next waiter
-    else _visionInFlight = Math.max(0, _visionInFlight - 1);
+    // Always give the slot back first, then admit as many waiters as the CURRENT
+    // cap allows. Handing our slot straight to the next waiter (the old shape)
+    // meant a narrowed cap never took effect — the same number of requests kept
+    // flowing no matter how hard the box was struggling.
+    _visionInFlight = Math.max(0, _visionInFlight - 1);
+    const limit = _visionConcurrencyLimit();
+    while (_visionWaiters.length && (limit <= 0 || _visionInFlight < limit)) {
+        _visionInFlight++;
+        _visionWaiters.shift()();
+    }
 }
 async function _acquireVisionSlot() {
     const limit = _visionConcurrencyLimit();
@@ -1754,21 +1963,29 @@ async function _qwenVisionWithRotationInner(prompt, base64Image, mimeType, maxTo
         Math.min(allKeys.length, parseInt(process.env.QWEN_IMAGE_FAST_FAIL_TIMEOUT_KEYS || String(defaultTimeoutKeyThreshold), 10) || defaultTimeoutKeyThreshold)
     );
 
+    // Request defects (HTTP 400) seen during THIS one call. They describe the
+    // payload we uploaded, so they never bench a combo — but if every combo
+    // rejects the same payload we must say so plainly rather than blaming the
+    // pool's capacity, which is what sent a whole build to paid Bedrock.
+    const requestDefects = [];
+
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        // Find best available key+model combo (vision pool)
-        const combo = _getBestKeyAndModel(QWEN_IMAGE_POOL, configuredModel, 'image');
+        // Find best available key+model combo (vision pool). Passing `triedCombos`
+        // advances the rotation WITHOUT benching anything in global state.
+        const combo = _getBestKeyAndModel(QWEN_IMAGE_POOL, configuredModel, 'image', triedCombos);
         if (!combo) {
+            if (requestDefects.length) {
+                throw new Error(`Qwen vision rejected this request — ${requestDefects[0]}`
+                    + ` (${requestDefects.length} combo(s) agreed; the box is healthy, the payload is not)`);
+            }
             throw new Error(_describeQwenPoolUnavailable(QWEN_IMAGE_POOL, 'image')
                 || 'All Qwen image-capable models exhausted across all API keys - no quota left');
         }
 
         const { apiKey, model, keyIndex } = combo;
         const comboKey = `${_hashApiKey(apiKey)}:${model}`;
-        if (triedCombos.has(comboKey)) {
-            // Already tried this exact combo — mark as rate_limited to skip it
-            _markModelExhausted(model, 'rate_limited', apiKey, 'image');
-            continue;
-        }
+        // Defensive only — the selector above already excludes tried combos.
+        if (triedCombos.has(comboKey)) break;
         triedCombos.add(comboKey);
 
         // Pace DashScope calls so the candidate race's parallel vision scores don't
@@ -1828,15 +2045,33 @@ async function _qwenVisionWithRotationInner(prompt, base64Image, mimeType, maxTo
                                 'Authorization': `Bearer ${apiKey}`,
                                 'Content-Type': 'application/json'
                             },
-                            timeout: 25000,
+                            timeout: _qwenVisionRequestTimeoutMs(),
                         });
                         break;
                     } catch (e) {
                         const resetLike = e.code === 'ECONNRESET' || e.code === 'EPIPE'
                             || /socket hang up|ECONNRESET/i.test(String(e.message || ''));
-                        if (resetLike && r < netRetries) {
-                            const backoff = [250, 600][Math.min(r, 1)];
-                            console.log(`  🔁 [Qwen Image] connection reset on ${model} — quick retry ${r + 1}/${netRetries} in ${backoff}ms (staying on box)`);
+                        // Backpressure from our own box gets a longer ladder than a
+                        // connection blip: the queue genuinely needs seconds to
+                        // drain, and waiting for it is strictly cheaper than
+                        // benching the only combo we have and paying Bedrock.
+                        const busy = _isVisionBackpressure(e);
+                        // Same ladder for a timeout on our own box: it means the
+                        // queue is deep, and easing off is strictly cheaper than
+                        // benching the only combo we have and paying Bedrock for
+                        // the rest of the build.
+                        const slowBox = _isSelfHostedVisionTimeout(e);
+                        if (slowBox) _narrowVisionConcurrency('request timed out');
+                        const queued = busy || slowBox;
+                        const tries = queued ? Math.max(netRetries, QWEN_VISION_BUSY_RETRIES) : netRetries;
+                        if ((resetLike || queued) && r < tries) {
+                            const backoff = queued
+                                ? QWEN_VISION_BUSY_BACKOFF_MS[Math.min(r, QWEN_VISION_BUSY_BACKOFF_MS.length - 1)]
+                                : [250, 600][Math.min(r, 1)];
+                            const reason = busy ? `server busy (${e.response?.status})`
+                                : slowBox ? 'box queue deep (timeout)'
+                                : 'connection reset';
+                            console.log(`  🔁 [Qwen Image] ${reason} on ${model} — quick retry ${r + 1}/${tries} in ${backoff}ms (staying on box)`);
                             await new Promise(res => setTimeout(res, backoff));
                             continue;
                         }
@@ -1853,6 +2088,7 @@ async function _qwenVisionWithRotationInner(prompt, base64Image, mimeType, maxTo
                 }
                 consecutiveTimeouts = 0; // success resets the streak
                 timeoutKeyHashes.clear();
+                _widenVisionConcurrency(); // the box is coping — hand a slot back
                 return text;
             }
         } catch (err) {
@@ -1860,6 +2096,7 @@ async function _qwenVisionWithRotationInner(prompt, base64Image, mimeType, maxTo
             const isNetwork = _isTransientNetworkError(err) && !isTimeout;
             const transportUnsupported = _isQwenTransportUnsupportedError(err);
             const quotaErr = transportUnsupported ? null : _isQuotaError(err);
+            const requestDefect = transportUnsupported ? null : _isRequestDefectError(err);
             if (transportUnsupported) {
                 _markQwenRuntimeUnsupported(model, err, 'image');
                 _setQwenHealthRecord(apiKey, model, 'image', 'unsupported', {
@@ -1867,6 +2104,19 @@ async function _qwenVisionWithRotationInner(prompt, base64Image, mimeType, maxTo
                     message: err?.response?.data?.error?.message || err?.response?.data?.message || err?.message || '',
                     source: 'runtime',
                 });
+                consecutiveTimeouts = 0;
+                timeoutKeyHashes.clear();
+                continue;
+            }
+            if (requestDefect) {
+                // OUR payload, not THEIR capacity. Rotate to another combo for this
+                // one frame, but do NOT bench, and do NOT write a sticky `bad_param`
+                // health record — that would sideline a healthy combo through a
+                // different door and reproduce the exact bug this branch removes.
+                requestDefects.push(requestDefect);
+                console.log(`  ✋ [Qwen Image] Key ${keyIndex} rejected this request on ${model} — ${requestDefect}`);
+                const said = _qwenErrorText(err).slice(0, 300);
+                if (said) console.log(`     box said: ${said}`);
                 consecutiveTimeouts = 0;
                 timeoutKeyHashes.clear();
                 continue;
@@ -1928,22 +2178,27 @@ async function _qwenOmniWithRotationInner(content, maxTokens, configuredModel) {
     const triedCombos = new Set();
     const maxAttempts = allKeys.length * (QWEN_OMNI_POOL.length + 1);
     let transientFailures = 0;
+    // HTTP 400s seen in this call — payload faults, never benched. See _isRequestDefectError.
+    const requestDefects = [];
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         if (Date.now() < _qwenOmniLaneCooldownUntil) {
             throw new Error('Qwen Omni lane is cooling down after transient failures');
         }
-        const combo = _getBestKeyAndModel(QWEN_OMNI_POOL, configuredModel, 'omni');
+        // `triedCombos` advances the rotation without benching — see _getBestKeyAndModel.
+        const combo = _getBestKeyAndModel(QWEN_OMNI_POOL, configuredModel, 'omni', triedCombos);
         if (!combo) {
+            if (requestDefects.length) {
+                throw new Error(`Qwen Omni rejected this request — ${requestDefects[0]}`
+                    + ` (${requestDefects.length} combo(s) agreed; the payload is the problem, not the pool)`);
+            }
             throw new Error('All Qwen Omni models exhausted across all API keys');
         }
 
         const { apiKey, model, keyIndex } = combo;
         const comboKey = `${_hashApiKey(apiKey)}:${model}`;
-        if (triedCombos.has(comboKey)) {
-            _markModelExhausted(model, 'rate_limited', apiKey, 'omni');
-            continue;
-        }
+        // Defensive only — the selector above already excludes tried combos.
+        if (triedCombos.has(comboKey)) break;
         triedCombos.add(comboKey);
 
         try {
@@ -1985,6 +2240,19 @@ async function _qwenOmniWithRotationInner(content, maxTokens, configuredModel) {
                 });
                 transientFailures = 0;
                 continue;
+            }
+            if (!transportUnsupported) {
+                const requestDefect = _isRequestDefectError(err);
+                if (requestDefect) {
+                    // Payload fault — rotate for this call, never bench the combo and
+                    // never write a sticky health record. Same rule as the image lane.
+                    requestDefects.push(requestDefect);
+                    console.log(`  ✋ [Qwen Omni] Key ${keyIndex} rejected this request on ${model} — ${requestDefect}`);
+                    const said = _qwenErrorText(err).slice(0, 300);
+                    if (said) console.log(`     server said: ${said}`);
+                    transientFailures = 0;
+                    continue;
+                }
             }
             if (quotaErr || isTimeout || isNetwork) {
                 if (isTimeout) console.log(`  ⏱️ [Qwen Omni] Key ${keyIndex} timeout on ${model} — rotating`);
@@ -2055,13 +2323,141 @@ function _base64Bytes(value) {
     return Buffer.from(data || '', 'base64');
 }
 
+let _visionFfmpegPath;
+function _visionFfmpeg() {
+    if (_visionFfmpegPath !== undefined) return _visionFfmpegPath;
+    try {
+        const p = require('ffmpeg-static');
+        _visionFfmpegPath = (p && require('fs').existsSync(p)) ? p : false;
+    } catch (_) {
+        _visionFfmpegPath = false;
+    }
+    if (!_visionFfmpegPath) {
+        _visionFfmpegPath = process.env.FFMPEG_PATH
+            || (process.platform === 'win32' ? 'C:\\ffmg\\bin\\ffmpeg.exe' : 'ffmpeg');
+    }
+    return _visionFfmpegPath;
+}
+
+/**
+ * Last-resort decode for bytes @napi-rs/canvas refuses.
+ *
+ * The canvas decoder is strict: a frame that is truncated, in an unusual pixel
+ * format, or wrapped in a container it doesn't know comes back as a throw. The
+ * old catch then shipped those raw bytes onward still LABELLED image/jpeg, so
+ * every model in the chain rejected them in turn — 54 "not a recognizable
+ * jpeg/png" errors in the 2026-07-31 build (18 distinct images × 3 models),
+ * every one of them a paid call that could not have succeeded. All 18 came from
+ * video lanes (YouTube 10, Pexels 3, Reddit 1), i.e. extracted frames.
+ *
+ * ffmpeg decodes a far wider range than the canvas library, including partial
+ * frames, so most of those images are recoverable rather than lost.
+ *
+ * @returns {Promise<Buffer|null>} JPEG bytes, or null if even ffmpeg can't read it
+ */
+async function _ffmpegDecodeToJpeg(raw, maxSide, quality = 4) {
+    const bin = _visionFfmpeg();
+    if (!bin) return null;
+    return new Promise((resolve) => {
+        let child;
+        try {
+            child = require('child_process').spawn(bin, [
+                '-hide_banner', '-loglevel', 'error',
+                '-i', 'pipe:0',
+                '-frames:v', '1',
+                // Only shrink; never upscale a small frame into a big soft one.
+                '-vf', `scale='min(${maxSide},iw)':-2`,
+                '-q:v', String(quality),
+                '-f', 'mjpeg', 'pipe:1',
+            ], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+        } catch (_) {
+            return resolve(null);
+        }
+        const chunks = [];
+        let settled = false;
+        const done = (val) => { if (!settled) { settled = true; resolve(val); } };
+        const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} done(null); }, 15_000);
+        child.stdout.on('data', (d) => chunks.push(d));
+        child.stderr.on('data', () => {});
+        child.on('error', () => { clearTimeout(timer); done(null); });
+        child.on('close', () => {
+            clearTimeout(timer);
+            const out = Buffer.concat(chunks);
+            // Validate the SHAPE, not the size. A byte-count floor is a guess: a
+            // small or flat frame compresses to a few hundred bytes and was being
+            // discarded as "failed" even though ffmpeg had decoded it perfectly.
+            // A JPEG SOI marker is the actual proof that a frame came out.
+            const isJpeg = out.length > 100
+                && out[0] === 0xff && out[1] === 0xd8 && out[2] === 0xff;
+            done(isJpeg ? out : null);
+        });
+        // A truncated source makes ffmpeg exit before draining stdin; that EPIPE
+        // is expected and must not crash the build.
+        child.stdin.on('error', () => {});
+        try { child.stdin.end(raw); } catch (_) { /* handled above */ }
+    });
+}
+
+/**
+ * ffmpeg rescue, or an explicit "nothing can read this" marker.
+ *
+ * Shared by BOTH ways we get here: the in-process decoder threw, or we refused
+ * to even offer it the bytes (see _normalizeVisionImage's pre-flight sniff).
+ *
+ * @returns {Promise<object>} a normalized-image result
+ */
+async function _rescueVisionFrame(raw, maxSide, mimeType, reason) {
+    const rescued = await _ffmpegDecodeToJpeg(raw, maxSide);
+    if (rescued) {
+        console.log(`  [vision] ffmpeg rescued the frame — ${Math.round(rescued.length / 1024)}KB JPEG`);
+        return {
+            base64: rescued.toString('base64'),
+            mimeType: 'image/jpeg',
+            bytes: rescued.length,
+            changed: true,
+            rescued: true,
+        };
+    }
+
+    // Nothing can read these bytes. Shipping them anyway is a guaranteed
+    // failure at EVERY provider in the chain — 3 paid calls that cannot
+    // succeed — so hand back an explicit "unreadable" marker and let the
+    // caller stop. This is a defect in THIS candidate, not a vision outage:
+    // callers must not report it as an API failure or one bad frame aborts
+    // the whole race (see the score-parse sentinel bug).
+    console.log('  [vision] ffmpeg could not read it either — dropping this frame instead of paying for 3 refusals');
+    return {
+        base64: '',
+        mimeType: mimeType || 'image/jpeg',
+        bytes: 0,
+        changed: false,
+        unreadable: true,
+        reason,
+    };
+}
+
 async function _normalizeVisionImage(base64Image, mimeType = 'image/jpeg', options = {}) {
     const raw = _base64Bytes(base64Image);
     if (!raw.length) return { base64: '', mimeType: mimeType || 'image/jpeg', bytes: 0, changed: false };
 
     const maxBytes = Math.max(120_000, parseInt(String(options.maxBytes || process.env.VISION_IMAGE_MAX_BYTES || '750000'), 10) || 750_000);
     const maxSide = Math.max(320, parseInt(String(options.maxSide || process.env.VISION_IMAGE_MAX_SIDE || '1280'), 10) || 1280);
-    const qualities = [0.82, 0.74, 0.66, 0.58, 0.50, 0.42];
+    // @napi-rs/canvas takes JPEG quality as 0-100, NOT the 0-1 fraction the DOM canvas
+    // uses. Passing 0.82 floored to quality 1 and shipped a 19KB smear of a 1600x900
+    // frame to the vision model — signs, faces and small subjects were unreadable in
+    // every scoring call. Keep the ladder as human-readable percentages.
+    const qualities = [82, 74, 66, 58, 50, 42];
+
+    // PRE-FLIGHT SNIFF — this must happen BEFORE loadImage, and no try/catch can
+    // replace it. @napi-rs/canvas SEGFAULTS on a TIFF (exit 139, no exception),
+    // so a single .jpg URL that actually serves TIFF bytes kills the whole build
+    // silently. Unknown formats go to ffmpeg, which usually reads them fine.
+    const { isCanvasSafeImage, sniffImageFormat } = require('../util/image-bytes');
+    if (!isCanvasSafeImage(raw)) {
+        const fmt = sniffImageFormat(raw) || 'unrecognised bytes';
+        console.log(`  [vision] ${fmt} is not safe to decode in-process (${Math.round(raw.length / 1024)}KB) — going straight to ffmpeg`);
+        return await _rescueVisionFrame(raw, maxSide, mimeType, `${fmt} cannot be decoded in-process`);
+    }
 
     try {
         const { createCanvas, loadImage } = require('@napi-rs/canvas');
@@ -2091,15 +2487,13 @@ async function _normalizeVisionImage(base64Image, mimeType = 'image/jpeg', optio
             changed: out.length !== raw.length || w !== sourceW || h !== sourceH || !/jpe?g/i.test(String(mimeType || '')),
         };
     } catch (err) {
-        if (raw.length > maxBytes) {
-            console.log(`  [vision] image normalization failed (${err.message}); sending original ${Math.round(raw.length / 1024)}KB`);
-        }
-        return {
-            base64: raw.toString('base64'),
-            mimeType: mimeType || 'image/jpeg',
-            bytes: raw.length,
-            changed: false,
-        };
+        // ALWAYS log. This used to fire only for oversized images, so a small
+        // corrupt/truncated frame was passed through still labelled image/jpeg
+        // with no trace in the log — the downstream Bedrock 400 ("detected file
+        // MIME type application/octet-stream does not match image/jpeg") then
+        // looked like it came from nowhere.
+        console.log(`  [vision] image normalization failed (${err.message}); ${Math.round(raw.length / 1024)}KB — trying ffmpeg`);
+        return await _rescueVisionFrame(raw, maxSide, mimeType, err.message);
     }
 }
 
@@ -2125,7 +2519,10 @@ async function _qwenRealtimeFramePayloads(frames) {
     const out = [];
     for (const f of picked) {
         try {
-            out.push(await _qwenRealtimeImageBase64(f));
+            // '' means the bytes are undecodable even by ffmpeg — sending an empty
+            // image part is a guaranteed request rejection, so drop the frame.
+            const b64 = await _qwenRealtimeImageBase64(f);
+            if (b64) out.push(b64);
         } catch (_) {
             // Skip bad frame decode; the HTTP lane or fallback can still carry the call.
         }
@@ -2235,14 +2632,13 @@ async function _qwenOmniRealtimeWithRotation(prompt, frames, maxTokens, configur
     const preferred = configuredModel || process.env.QWEN_OMNI_REALTIME_MODEL || 'qwen3.5-omni-plus-realtime';
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const combo = _getBestKeyAndModel(QWEN_OMNI_REALTIME_POOL, preferred, 'omni');
+        // `triedCombos` advances the rotation without benching — see _getBestKeyAndModel.
+        const combo = _getBestKeyAndModel(QWEN_OMNI_REALTIME_POOL, preferred, 'omni', triedCombos);
         if (!combo) throw new Error('All Qwen Omni realtime models exhausted across all API keys');
         const { apiKey, model, keyIndex } = combo;
         const comboKey = `${_hashApiKey(apiKey)}:${model}`;
-        if (triedCombos.has(comboKey)) {
-            _markModelExhausted(model, 'rate_limited', apiKey, 'omni');
-            continue;
-        }
+        // Defensive only — the selector above already excludes tried combos.
+        if (triedCombos.has(comboKey)) break;
         triedCombos.add(comboKey);
 
         const started = Date.now();
@@ -2267,6 +2663,15 @@ async function _qwenOmniRealtimeWithRotation(prompt, frames, maxTokens, configur
             }
             if (['timeout', 'network', 'rate_limited', 'transient'].includes(status)) {
                 _markModelExhausted(model, status === 'network' ? 'network' : status === 'timeout' ? 'timeout' : 'rate_limited', apiKey, 'omni');
+                continue;
+            }
+            const realtimeDefect = status === 'bad_param' ? (_isRequestDefectError(err) || 'invalid payload') : null;
+            if (realtimeDefect) {
+                // Payload fault — rotate, but do NOT persist `bad_param`. That status
+                // is STICKY (see _qwenHealthSkipReason), so recording it here would
+                // sideline a healthy combo for the whole freshness window over one
+                // bad frame — the same mistake as benching, through a different door.
+                console.log(`  ✋ [Qwen Omni Realtime] Key ${keyIndex} rejected this request on ${model} — ${realtimeDefect}`);
                 continue;
             }
             _setQwenHealthRecord(apiKey, model, 'omniRealtime', status || 'error', { message: err.message, source: 'runtime' });
@@ -2961,6 +3366,15 @@ function _visionDirectives() {
 async function callVisionAI(prompt, base64Image, mimeType = 'image/jpeg', options = {}) {
     const { maxTokens = 200 } = options;
     const normalized = await _normalizeVisionImage(base64Image, mimeType, options);
+    if (normalized.unreadable) {
+        // Stop here. Walking the chain with bytes nothing can decode costs one
+        // paid call per provider and cannot possibly succeed. The tag lets the
+        // caller record a DEFECTIVE CANDIDATE rather than a vision outage —
+        // an outage makes callers keep the clip and can abort a whole race.
+        const err = new Error(`vision image is undecodable (${normalized.reason || 'unknown format'})`);
+        err.visionImageUnreadable = true;
+        throw err;
+    }
     base64Image = normalized.base64;
     mimeType = normalized.mimeType;
     if (normalized.changed && options.logVisionCompression !== false) {
@@ -3006,6 +3420,10 @@ async function callVisionAI(prompt, base64Image, mimeType = 'image/jpeg', option
             return text;
         } catch (error) {
             console.log(`  ⚠️ [${provider}] Vision error: ${error.message}`);
+            // Entitlement/config failures are permanent — flag once, loudly, and stop
+            // paying a doomed roundtrip for them on every remaining frame.
+            const permanent = _permanentVisionFailure(error);
+            if (permanent) _markVisionProviderDead(provider, permanent, i === 0);
             if (i < chain.length - 1) {
                 console.log(`  🔄 Falling back to ${chain[i + 1]} for vision...`);
                 continue;
@@ -3066,7 +3484,10 @@ function _visionProviderAvailable(provider) {
 }
 
 function _configuredVisionOrder() {
-    const overridePrimary = _normalizeVisionProviderName(config.visionProvider || process.env.VISION_PROVIDER || '');
+    // Runtime scene actions temporarily override VISION_PROVIDER (for example,
+    // manual retries route straight to Bedrock). Read the live environment
+    // before the startup snapshot in config so those scoped overrides work.
+    const overridePrimary = _normalizeVisionProviderName(process.env.VISION_PROVIDER || config.visionProvider || '');
     const fallbackOrder = _parseEnvList(process.env.VISION_FALLBACK_ORDER || '')
         .map(_normalizeVisionProviderName)
         .filter(Boolean);
@@ -3082,6 +3503,74 @@ function _configuredVisionOrder() {
     return chain;
 }
 
+// ── Permanently-dead vision providers ───────────────────────────────────────
+// A vision provider fails in two very different ways. A timeout, a 429 or a 5xx
+// is TRANSIENT — retry it, fall back, try again on the next frame. An
+// AccessDenied, a 403 or a bad model id is PERMANENT for this run: the account
+// has no entitlement, or the id doesn't exist, and no amount of retrying changes
+// that.
+//
+// Before this gate the two were indistinguishable — each just printed a warning
+// and fell through to the next provider. On a build that scores ~2000 frames a
+// permanent failure is 2000 identical warnings scrolling past at one per
+// candidate, while the real judge quietly becomes whatever sits second in the
+// chain. That happened for real (2026-08-04, `us.anthropic.claude-sonnet-5`,
+// which this account has never been entitled to): the stand-in judge scored 0/3
+// on footage a human would happily use, scenes came back as placeholder cards,
+// and nothing in the log read like an error.
+//
+// So: say it once, loudly, with the exact fix — then stop calling the dead
+// provider. Dropping it also removes a doomed roundtrip from every remaining
+// vision call, which is pure latency back.
+const _visionDead = new Map(); // normalized provider -> reason
+
+function _permanentVisionFailure(error) {
+    const msg = `${(error && error.name) || ''} ${(error && error.message) || ''}`;
+    if (/AccessDenied|not available for this account|\bhttp=403\b|don'?t have access to the model/i.test(msg)) {
+        return 'this AWS account is not entitled to that model';
+    }
+    if (/model identifier is invalid|invalid model|ResourceNotFound|NOT IN REGION/i.test(msg)) {
+        return 'that model id does not exist in this region';
+    }
+    if (/on-demand throughput isn.?t supported|inference profile/i.test(msg)) {
+        return "that model needs its cross-region 'us.*' inference-profile id, not the bare model id";
+    }
+    return null; // transient — leave it in the chain
+}
+
+function _visionProviderModelLabel(provider) {
+    const opts = _bedrockVisionOptions(provider);
+    if (!opts) return '';
+    return process.env[opts.modelEnv] || opts.defaultModel || '';
+}
+
+function _markVisionProviderDead(provider, reason, isPrimary) {
+    if (_visionDead.has(provider)) return;
+    _visionDead.set(provider, reason);
+    const model = _visionProviderModelLabel(provider);
+    const bar = '='.repeat(74);
+    console.error(`\n${bar}`);
+    console.error(`❌ VISION JUDGE UNUSABLE${isPrimary ? ' (this was the PRIMARY judge)' : ''}: ${provider}`);
+    if (model) console.error(`   model: ${model}`);
+    console.error(`   why:   ${reason}`);
+    if (isPrimary) {
+        console.error('   Footage scoring is now being done by the next judge in the chain.');
+        console.error('   A backup judge is not tuned for this job and tends to reject good');
+        console.error('   footage, which is what produces "no footage — placeholder" scenes.');
+    }
+    console.error('   fix:   node scripts/bedrock-vision-probe.js     (what can this account call?)');
+    console.error('          node scripts/vision-judge-bench.js       (which of those judges well?)');
+    console.error('          then set VISION_BEDROCK_PRIMARY_MODEL=<id> in the user .env');
+    console.error('   Dropping it from the vision chain for the rest of this run.');
+    console.error(`${bar}\n`);
+}
+
+function getDeadVisionProviders() {
+    return [..._visionDead.entries()].map(([provider, reason]) => ({
+        provider, reason, model: _visionProviderModelLabel(provider),
+    }));
+}
+
 function _getVisionChain() {
     // Default cost-safe route:
     //   1. qwen            — direct DashScope Qwen free-quota pool
@@ -3089,6 +3578,11 @@ function _getVisionChain() {
     //   3. bedrock-claude  — Claude Haiku 4.5 on Bedrock fallback
     //   4. bedrock-nova    — Amazon Nova Lite emergency fallback
     const chain = _configuredVisionOrder().filter(_visionProviderAvailable);
+    // Skip providers this run has already proven unusable. If that would empty the
+    // chain, keep the full one: a real error from a real call is far more useful
+    // than a synthetic "nothing available" thrown from a bookkeeping map.
+    const live = chain.filter((p) => !_visionDead.has(p));
+    if (live.length > 0) return live;
     if (chain.length > 0) return chain;
 
     throw new Error('No usable vision provider — Bedrock vision creds missing and direct Qwen pool unavailable');
@@ -3159,13 +3653,11 @@ async function _dispatchVision(provider, prompt, base64Image, mimeType, maxToken
 // vision providers (Nova, Anthropic Claude, Qwen, Meta Llama 3.2 Vision),
 // so the same call shape works for all three of our fallbacks. The image
 // is passed as raw bytes; mimeType is mapped to Bedrock's `format` enum.
-function _bedrockImageFormat(mimeType) {
-    const mt = String(mimeType || '').toLowerCase();
-    if (mt.includes('png')) return 'png';
-    if (mt.includes('gif')) return 'gif';
-    if (mt.includes('webp')) return 'webp';
-    return 'jpeg';
-}
+// NOTE: a `_bedrockImageFormat(mimeType)` helper used to live here, mapping a
+// *declared* mime type to Bedrock's format enum. It is deliberately gone: every
+// call site that trusted a label instead of the bytes produced the 400 described
+// below. Sniff the bytes with _detectImageFormatFromBytes and refuse the payload
+// when the signature is unknown — do not re-add a label-based fallback.
 
 // Detect image format from the leading bytes (magic numbers) so Bedrock's declared
 // `format` always matches the actual bytes. Returns null when unrecognized.
@@ -3193,26 +3685,137 @@ function _nextVisionMaxTokens(maxTokens) {
     return Math.min(cap, Math.max(current + 160, Math.ceil(current * 1.75)));
 }
 
-const _bedrockVisionCallTimes = [];
+// ── Bedrock vision pacing — per model, learned in-run ────────────────────────
+// Bedrock enforces requests-per-minute PER MODEL, and the ceiling differs by
+// model, by region and by account. One flat number cannot describe that.
+//
+// What this replaced, and what it cost (2026-08-04, log app-2026-08-04T21-03-06):
+// a single shared bucket at a flat BEDROCK_VISION_MAX_RPM=80 covering every
+// Bedrock vision model. Two failures compounded. Qwen-VL's calls spent Sonnet's
+// budget and Sonnet's spent Qwen-VL's, so neither model's pacing described its
+// own limit; and 80 was simply above what this account allows for Sonnet 4.6,
+// with nothing in the loop able to discover that. Result: 89 Throttling-
+// Exceptions in 11 minutes, and because the vision chain reads any thrown error
+// as "this provider failed", all 89 of those frames were handed to the weaker
+// fallback judge — the exact judge the run had been set up to stop using. Only
+// 36 of ~125 judgements were made by the model that was supposed to be judging.
+//
+// The shape here is additive-increase / multiplicative-decrease, the same
+// congestion control TCP uses, for the same reason: the real limit is not
+// knowable up front and does not stay put. Every throttle cuts the ceiling
+// hard; a sustained clean stretch *while saturated* eases it back up. It
+// converges on whatever the account actually allows, per model, inside the run,
+// with no per-model constant to maintain. BEDROCK_VISION_MAX_RPM stops being
+// the rate and becomes the upper bound the search starts from.
+const VISION_PACE_FLOOR_RPM = 4;      // never pace below this; a stall is worse than a throttle
+const VISION_PACE_EASE_MS = 45_000;   // clean stretch required before probing upward again
+const _visionPacers = new Map();      // model id -> { times, ceiling, lastThrottleAt, lastEaseAt, saturated }
 
-async function _throttleBedrockVision(tag = 'bedrock-vision') {
-    const maxRpm = parseInt(process.env.BEDROCK_VISION_MAX_RPM || '80', 10) || 0;
-    if (maxRpm <= 0) return;
+function _visionPaceCap() {
+    const raw = parseInt(process.env.BEDROCK_VISION_MAX_RPM || '80', 10);
+    return Number.isFinite(raw) ? raw : 80;
+}
+
+function _visionPacer(key) {
+    const id = String(key || 'default');
+    let p = _visionPacers.get(id);
+    if (!p) {
+        p = { times: [], ceiling: null, lastThrottleAt: 0, lastEaseAt: 0, saturated: false };
+        _visionPacers.set(id, p);
+    }
+    if (p.ceiling == null) p.ceiling = _visionPaceCap();
+    return p;
+}
+
+// AWS just said "too fast". That is the only measurement of the real ceiling we
+// will ever get, so treat it as authoritative and cut hard: guessing low costs a
+// few seconds of pacing, guessing high costs another frame judged by the wrong
+// model.
+function _noteVisionThrottle(tag, modelId) {
+    if (_visionPaceCap() <= 0) return;
+    const p = _visionPacer(modelId || tag);
+    const before = p.ceiling;
+    p.ceiling = Math.max(VISION_PACE_FLOOR_RPM, Math.floor(p.ceiling * 0.6));
+    p.lastThrottleAt = Date.now();
+    p.saturated = true;
+    if (p.ceiling !== before) {
+        console.log(`  [${tag}] pace: throttled at ${before}/min → tightening ${_shortBedrockModel(modelId || tag)} to ${p.ceiling}/min`);
+    }
+}
+
+async function _throttleBedrockVision(tag = 'bedrock-vision', modelId = '') {
+    if (_visionPaceCap() <= 0) return; // 0 disables pacing entirely, as before
+    const cap = _visionPaceCap();
+    const p = _visionPacer(modelId || tag);
 
     const windowMs = 60_000;
     while (true) {
         const now = Date.now();
-        while (_bedrockVisionCallTimes.length && now - _bedrockVisionCallTimes[0] >= windowMs) {
-            _bedrockVisionCallTimes.shift();
+        while (p.times.length && now - p.times[0] >= windowMs) p.times.shift();
+
+        // Probe upward only while actually pushing against the ceiling. Easing
+        // after an idle gap would "prove" headroom that was never tested, and
+        // the next burst would rediscover the limit the expensive way.
+        if (p.saturated && p.ceiling < cap
+            && now - p.lastThrottleAt > VISION_PACE_EASE_MS
+            && now - p.lastEaseAt > VISION_PACE_EASE_MS) {
+            p.ceiling = Math.min(cap, p.ceiling + 2);
+            p.lastEaseAt = now;
+            console.log(`  [${tag}] pace: clean for ${Math.round(VISION_PACE_EASE_MS / 1000)}s — easing ${_shortBedrockModel(modelId || tag)} up to ${p.ceiling}/min`);
         }
-        if (_bedrockVisionCallTimes.length < maxRpm) {
-            _bedrockVisionCallTimes.push(now);
+
+        if (p.times.length < p.ceiling) {
+            p.times.push(now);
             return;
         }
-        const waitMs = Math.max(250, _bedrockVisionCallTimes[0] + windowMs - now + 50);
-        console.log(`  [${tag}] RPM guard: waiting ${(waitMs / 1000).toFixed(1)}s (${_bedrockVisionCallTimes.length}/${maxRpm} vision calls in rolling minute)`);
+        p.saturated = true;
+        const waitMs = Math.max(250, p.times[0] + windowMs - now + 50);
+        console.log(`  [${tag}] RPM guard: waiting ${(waitMs / 1000).toFixed(1)}s (${p.times.length}/${p.ceiling} vision calls in rolling minute)`);
         await _sleep(waitMs);
     }
+}
+
+function _isVisionThrottleError(err) {
+    if ((err && err.$metadata && err.$metadata.httpStatusCode) === 429) return true;
+    return /Throttling|TooManyRequests|too many requests|rate ?limit|slow down/i
+        .test(`${(err && err.name) || ''} ${(err && err.message) || ''}`);
+}
+
+// A throttle is a "wait", not a "this model cannot do it".
+//
+// The vision chain treats any thrown error as "this provider failed, use the
+// next one". For a 403 that is exactly right. For a 429 it is exactly wrong:
+// the model is entitled, capable, and already chosen, and the only thing it
+// asked for was a moment. Falling back there trades the best judge in the chain
+// for the weakest one to save about a second.
+//
+// So absorb throttles here, in the transport, *below* the chain — retry the
+// same model with backoff and let the error out only when it genuinely will not
+// clear. From the chain's point of view nothing changed except that a throttled
+// call takes longer to fail, which is the one case where waiting is the correct
+// answer. Each retry re-enters the pacer, so it is already running at the
+// tightened rate rather than straight back into the wall.
+async function _withVisionThrottleRetry(tag, modelId, fn) {
+    const attempts = Math.max(1, parseInt(process.env.BEDROCK_VISION_THROTTLE_RETRIES || '4', 10) || 4);
+    let lastErr = null;
+    for (let i = 0; i < attempts; i++) {
+        try {
+            return await fn();
+        } catch (err) {
+            if (!_isVisionThrottleError(err)) throw err;
+            lastErr = err;
+            _noteVisionThrottle(tag, modelId);
+            if (i === attempts - 1) break;
+            // Jitter is not decoration here: the candidate race issues these in
+            // parallel, so a fixed delay would resynchronize every waiter into
+            // one burst and throttle the whole group again together.
+            const base = Math.min(15_000, 800 * Math.pow(2, i));
+            const waitMs = Math.round(base * (0.5 + Math.random()));
+            console.log(`  [${tag}] throttled — retrying same model in ${(waitMs / 1000).toFixed(1)}s (${i + 1}/${attempts - 1})`);
+            await _sleep(waitMs);
+        }
+    }
+    throw lastErr;
 }
 
 // Pace direct DashScope Qwen vision calls to stay under the free-tier RPM. Without it,
@@ -3251,11 +3854,23 @@ async function _bedrockVision(prompt, base64Image, mimeType, maxTokens, opts = {
 
     // Detect the REAL format from the byte signature (Bedrock Nova/Claude reject a
     // declared format that doesn't match the bytes — "octet-stream does not match
-    // image/jpeg"). Fall back to the mimeType only when the magic number is unknown.
-    const format = _detectImageFormatFromBytes(imageBytes) || _bedrockImageFormat(mimeType);
+    // image/jpeg").
+    //
+    // This used to be `_detectImageFormatFromBytes(bytes) || <mimeType-label fallback>`.
+    // That `||` re-asserted the lying label in the exact case the sniff exists to
+    // catch: bytes that are not a decodable image at ALL (truncated download, an
+    // HTML error page, a normalization that failed and passed the original through).
+    // The sniff only ever protected against a valid image of the *wrong* format.
+    // Bedrock's Converse API accepts exactly these four, so an unknown signature is
+    // never sendable — fail fast and locally instead of burning a paid call, the
+    // throttle wait, and every fallback behind it on a guaranteed 400.
+    const format = _detectImageFormatFromBytes(imageBytes);
+    if (!format) {
+        throw new Error(`[${tag}] image bytes are not a recognizable jpeg/png/gif/webp (${imageBytes.length}B, declared ${mimeType || 'unknown'})`);
+    }
 
     const invoke = async (tokenLimit, retryLabel = '') => {
-        await _throttleBedrockVision(tag);
+        await _throttleBedrockVision(tag, modelId);
         const started = Date.now();
         const command = new ConverseCommand({
         modelId,
@@ -3272,7 +3887,10 @@ async function _bedrockVision(prompt, base64Image, mimeType, maxTokens, opts = {
         },
         });
 
-        const response = await client.send(command);
+        // Same deadline rule as the text path. These are the vision FALLBACKS,
+        // so a stall here stalls footage scoring; the caller's provider chain
+        // already knows what to do with a thrown error, it just never got one.
+        const response = await client.send(command, { requestTimeout: _bedrockRequestTimeoutMs(tokenLimit) });
         const elapsed = ((Date.now() - started) / 1000).toFixed(1);
         const u = response.usage || {};
         const stopReason = response.stopReason || 'unknown';
@@ -3285,12 +3903,12 @@ async function _bedrockVision(prompt, base64Image, mimeType, maxTokens, opts = {
     };
 
     try {
-        const first = await invoke(maxTokens || 800);
+        const first = await _withVisionThrottleRetry(tag, modelId, () => invoke(maxTokens || 800));
         if (_isBedrockTruncated(first.stopReason)) {
             const retryMax = _nextVisionMaxTokens(maxTokens || 800);
             if (retryMax > (maxTokens || 800)) {
                 console.log(`  [${tag}] stop=${first.stopReason}; retrying with maxTokens=${retryMax}`);
-                const retry = await invoke(retryMax, ' retry');
+                const retry = await _withVisionThrottleRetry(tag, modelId, () => invoke(retryMax, ' retry'));
                 if (retry.text) return retry.text;
             }
         }
@@ -3323,23 +3941,39 @@ async function _bedrockVideoVision(prompt, frames, maxTokens, opts = {}) {
         ? usableFrames
         : Array.from({ length: maxFrames }, (_, i) => usableFrames[Math.round(i * (usableFrames.length - 1) / (maxFrames - 1))]);
 
-    const frameNotes = picked
-        .map((f, i) => `Frame ${i + 1}${Number.isFinite(Number(f.timestamp)) ? ` at ${Number(f.timestamp).toFixed(1)}s` : ''}`)
+    // Sniff each frame's REAL format before declaring it. This path had no byte
+    // check at all — it trusted `frame.mimeType`, so one corrupt/truncated frame
+    // made Bedrock reject the ENTIRE multi-frame call ("The detected file MIME
+    // type application/octet-stream does not match the expected type image/jpeg")
+    // and took every fallback provider down with it. Drop the bad frame instead:
+    // a clip judged on 3 good frames still beats a clip not judged at all.
+    const prepared = [];
+    for (const frame of picked) {
+        const bytes = Buffer.from(String(frame.base64 || ''), 'base64');
+        const format = _detectImageFormatFromBytes(bytes);
+        if (!format) {
+            console.log(`  [${tag}] dropping unreadable frame (${bytes.length}B, declared ${frame.mimeType || 'unknown'}) — not a jpeg/png/gif/webp`);
+            continue;
+        }
+        prepared.push({ frame, bytes, format });
+    }
+    if (prepared.length === 0) {
+        console.log(`  [${tag}] no usable frames after byte check (${picked.length} dropped) — skipping call`);
+        return '';
+    }
+
+    const frameNotes = prepared
+        .map(({ frame: f }, i) => `Frame ${i + 1}${Number.isFinite(Number(f.timestamp)) ? ` at ${Number(f.timestamp).toFixed(1)}s` : ''}`)
         .join('; ');
     const content = [
         { text: `${String(prompt || '')}\n\nEvaluate the provided video frames as one clip, not as unrelated still images. Frame order: ${frameNotes || 'unknown'}.` },
     ];
-    for (const frame of picked) {
-        content.push({
-            image: {
-                format: _bedrockImageFormat(frame.mimeType || 'image/jpeg'),
-                source: { bytes: Buffer.from(String(frame.base64 || ''), 'base64') },
-            },
-        });
+    for (const { bytes, format } of prepared) {
+        content.push({ image: { format, source: { bytes } } });
     }
 
     const invoke = async (tokenLimit, retryLabel = '') => {
-        await _throttleBedrockVision(tag);
+        await _throttleBedrockVision(tag, modelId);
         const started = Date.now();
         const command = new ConverseCommand({
             modelId,
@@ -3349,26 +3983,26 @@ async function _bedrockVideoVision(prompt, frames, maxTokens, opts = {}) {
                 temperature: 0.1,
             },
         });
-        console.log(`  [${tag}] multi-frame: ${picked.length}/${usableFrames.length} frame(s) via ${_shortBedrockModel(modelId)}${retryLabel}`);
-        const response = await client.send(command);
+        console.log(`  [${tag}] multi-frame: ${prepared.length}/${usableFrames.length} frame(s) via ${_shortBedrockModel(modelId)}${retryLabel}`);
+        const response = await client.send(command, { requestTimeout: _bedrockRequestTimeoutMs(tokenLimit) });
         const elapsed = ((Date.now() - started) / 1000).toFixed(1);
         const u = response.usage || {};
         const stopReason = response.stopReason || 'unknown';
         const blocks = response.output?.message?.content || [];
         const text = blocks.map(b => (typeof b?.text === 'string' ? b.text : '')).join('').trim();
-        console.log(`  [${tag}] ${_shortBedrockModel(modelId)}${retryLabel} ${elapsed}s frames=${picked.length} in=${u.inputTokens || 0} out=${u.outputTokens || 0} stop=${stopReason}`);
+        console.log(`  [${tag}] ${_shortBedrockModel(modelId)}${retryLabel} ${elapsed}s frames=${prepared.length} in=${u.inputTokens || 0} out=${u.outputTokens || 0} stop=${stopReason}`);
         recordUsage({ provider: tag, model: modelId, taskType: 'vision', kind: 'vision', usage: u });
         if (!text) console.log(`  [${tag}] EMPTY response`);
         return { text, stopReason };
     };
 
     try {
-        const first = await invoke(maxTokens || 800);
+        const first = await _withVisionThrottleRetry(tag, modelId, () => invoke(maxTokens || 800));
         if (_isBedrockTruncated(first.stopReason)) {
             const retryMax = _nextVisionMaxTokens(maxTokens || 800);
             if (retryMax > (maxTokens || 800)) {
                 console.log(`  [${tag}] stop=${first.stopReason}; retrying with maxTokens=${retryMax}`);
-                const retry = await invoke(retryMax, ' retry');
+                const retry = await _withVisionThrottleRetry(tag, modelId, () => invoke(retryMax, ' retry'));
                 if (retry.text) return retry.text;
             }
         }
@@ -3378,6 +4012,55 @@ async function _bedrockVideoVision(prompt, frames, maxTokens, opts = {}) {
         console.log(`  [${tag}] ${_shortBedrockModel(modelId)} ${err.name || 'Error'} http=${code} -> ${err.message}`);
         throw err;
     }
+}
+
+// ── Bedrock request deadlines ────────────────────────────────────────────────
+// The AWS SDK ships with NO request timeout: @smithy/node-http-handler's
+// `setRequestTimeout` defaults to 0 and returns without arming anything, so a
+// socket that stops producing bytes is waited on forever. Every text call in
+// this app routes through one client, and the router runs `attempt 1/1
+// fallback=none`, so a single stalled socket is a permanent build freeze — one
+// 58-scene run sat on Visual Planner batch 1 for over an hour with the process
+// alive and idle. Every stage already degrades gracefully on a THROWN error
+// (the planner drops to per-scene planning); the only thing missing was
+// something to throw.
+//
+// `requestTimeout` on its own is a trap: without `throwOnRequestTimeout` the
+// handler only prints "a request has exceeded the configured N ms" and lets the
+// call run to completion. Both are required.
+const BEDROCK_TIMEOUT_CEILING_MS = 240_000;
+
+// How fast Bedrock is actually generating during THIS run, in ms per output
+// token. A flat deadline is wrong in both directions — too tight for a large
+// plan on a slow day, useless for a small utility call — so the budget is
+// derived from the call's own token ceiling and from the pace we are measuring
+// as we go. Slow day, deadlines stretch; fast day, they tighten. Nothing here
+// is niche- or topic-specific.
+let _bedrockMsPerOutToken = 20;
+function _noteBedrockPace(elapsedMs, outTokens) {
+    // Only a call that actually generated something says anything about pace.
+    // A 2-token reply is almost entirely connect + prompt upload + time-to-
+    // first-token, and dividing that by 2 reports a wildly inflated ms/token
+    // that would drag every later deadline up to the ceiling. The fixed
+    // allowance in _bedrockRequestTimeoutMs is what covers that overhead.
+    if (!(elapsedMs > 0) || !(outTokens >= 200)) return;
+    const observed = elapsedMs / outTokens;
+    if (!Number.isFinite(observed) || observed <= 0) return;
+    // Cap a single sample's influence so one pathological call can't pin the
+    // deadline at the ceiling for the rest of the build.
+    _bedrockMsPerOutToken = (_bedrockMsPerOutToken * 0.7) + (Math.min(observed, 120) * 0.3);
+}
+function _bedrockRequestTimeoutMs(maxTokens) {
+    const override = parseInt(process.env.BEDROCK_REQUEST_TIMEOUT_MS || '', 10);
+    if (Number.isFinite(override) && override > 0) {
+        return Math.max(15_000, Math.min(BEDROCK_TIMEOUT_CEILING_MS, override));
+    }
+    const want = Math.max(1, Number(maxTokens) || 800);
+    // Fixed allowance covers connect + prompt upload + time-to-first-token
+    // (an 81k-char prompt is ~20k input tokens); the rest is generation at
+    // twice the pace we are currently observing.
+    const ms = 25_000 + (want * _bedrockMsPerOutToken * 2);
+    return Math.max(45_000, Math.min(BEDROCK_TIMEOUT_CEILING_MS, Math.round(ms)));
 }
 
 let _bedrockClient = null;
@@ -3393,6 +4076,15 @@ function _getBedrockClient() {
         credentials: {
             accessKeyId,
             secretAccessKey,
+        },
+        // Plain-object handler options; the SDK builds the NodeHttpHandler from
+        // them, which keeps @smithy/node-http-handler a transitive dependency
+        // instead of an undeclared direct require. The ceiling here is the
+        // backstop — each call passes its own tighter deadline to send().
+        requestHandler: {
+            connectionTimeout: 10_000,
+            requestTimeout: BEDROCK_TIMEOUT_CEILING_MS,
+            throwOnRequestTimeout: true,
         },
     });
     return _bedrockClient;
@@ -3426,11 +4118,31 @@ async function _bedrockText(prompt, maxTokens, temperature, systemPrompt, opts =
             },
             ...(systemPrompt ? { system: [{ text: systemPrompt }] } : {}),
         });
+        const deadlineMs = _bedrockRequestTimeoutMs(maxTokens);
         try {
-            const response = await client.send(command);
+            // A stalled socket must end as an error, not as a build that never
+            // finishes. One retry on the same model first: the deadline is a
+            // guess about the network, and dropping straight to the fallback
+            // path costs real quality (the planner re-plans scene-by-scene,
+            // which is the thing the batch call exists to avoid).
+            let response;
+            for (let attempt = 0; ; attempt++) {
+                try {
+                    response = await client.send(command, { requestTimeout: deadlineMs });
+                    break;
+                } catch (sendErr) {
+                    const timedOut = sendErr?.name === 'TimeoutError'
+                        || sendErr?.code === 'ETIMEDOUT'
+                        || /exceeded the configured .* requestTimeout/i.test(String(sendErr?.message || ''));
+                    if (!timedOut || attempt >= 1) throw sendErr;
+                    const waited = ((Date.now() - started) / 1000).toFixed(0);
+                    console.log(`  ${tag} ⏱️ ${shortModel(modelId)} task=${taskType || '?'} no response in ${waited}s (limit ${Math.round(deadlineMs / 1000)}s) — retrying once`);
+                }
+            }
             const elapsed = ((Date.now() - started) / 1000).toFixed(1);
             const u = response.usage || {};
             const stopReason = response.stopReason || 'unknown';
+            _noteBedrockPace(Date.now() - started, u.outputTokens);
             console.log(`  ${tag} ${shortModel(modelId)} task=${taskType || '?'} ${elapsed}s in=${u.inputTokens || 0} out=${u.outputTokens || 0} total=${u.totalTokens || 0} stop=${stopReason}`);
             recordUsage({ provider: 'bedrock', model: modelId, taskType, kind: 'text', usage: u });
             const blocks = response.output?.message?.content || [];
@@ -3562,6 +4274,10 @@ async function callVideoAI(prompt, frames, options = {}) {
                 if (text && text.trim()) return text;
             } catch (err) {
                 console.log(`  [${entry.tag}] Video fallback failed: ${err.message}`);
+                // Same permanent-vs-transient split as callVisionAI. The deep-clip
+                // check is the other place a dead model can hide behind a fallback.
+                const permanent = _permanentVisionFailure(err);
+                if (permanent) _markVisionProviderDead(entry.tag.replace(/-video$/, ''), permanent, false);
             }
         }
         return '';
@@ -3674,9 +4390,22 @@ module.exports = {
     revalidateExhaustedVisionModels,
     isVisionAIAvailable,
     getVisionProviderChain,
+    // Vision providers this run has proven permanently unusable (403 / bad model
+    // id). Lets a caller surface "your judge is dead" instead of quietly scoring
+    // with a backup.
+    getDeadVisionProviders,
+    // Exported so the gate can be tested without a network call. Returns a reason
+    // string for permanent entitlement/config failures, null for transient ones —
+    // and the "null for transient" half is the important half: an over-eager
+    // classifier would retire a healthy judge over one timeout.
+    classifyVisionFailure: _permanentVisionFailure,
     setAIThinking,
     setGeminiThinking,
     getAIThinking,
     getQwenVisionStatus,
     refreshQwenVisionHealth,
+    // Read-only view of how long a single vision judgement is allowed to take.
+    // The media race needs this to size its own per-candidate budget: a budget
+    // smaller than one judgement's deadline can never produce a verdict.
+    visionRequestTimeoutMs: _qwenVisionRequestTimeoutMs,
 };

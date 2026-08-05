@@ -5,7 +5,8 @@ over the SDK (no terminal pasting). Idempotent: safe to re-run.
 
 Bakes in the lessons learned:
   - isolated uv venv (avoids the base-env numpy.Inf crash)
-  - ensures the Studio is on the L4 GPU before installing/running (avoids the CPU device error)
+  - ensures the Studio is on its configured GPU (T4 by default) before installing/running
+    (avoids the CPU device error)
   - pushes the corrected serve-vision.sh (process-check, no duplicate vLLM)
   - warms the model once (downloads the ~6.5GB AWQ weights so future starts just load from disk)
 
@@ -30,15 +31,24 @@ try:
 except Exception:
     pass
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_ROOT = os.path.join(REPO_ROOT, "src")
+if SRC_ROOT not in sys.path:
+    sys.path.insert(0, SRC_ROOT)
+
 from lightning_sdk import Studio, Machine
+from lightning_compat import (
+    friendly_start_error,
+    start_studio_compat,
+    status_name,
+)
 
 
 def hydrate_from_pool(account_id):
     """Load one account's creds from lightning-accounts.json into the env, so the rest of the
     script (and the SDK auth) just works. This is the easy path: add the account in the app UI,
     then run `python tools/provision-lightning-studio.py <id>`."""
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    pool_path = os.path.join(here, "lightning-accounts.json")
+    pool_path = os.path.join(REPO_ROOT, "lightning-accounts.json")
     if not os.path.exists(pool_path):
         sys.exit("lightning-accounts.json not found — add the account in the app first, or use env vars.")
     pool = json.load(open(pool_path, "r", encoding="utf-8"))
@@ -53,6 +63,7 @@ def hydrate_from_pool(account_id):
         os.environ["LIGHTNING_TEAMSPACE"] = acct["teamspace"]
     if acct.get("user"):
         os.environ["LIGHTNING_USER"] = acct["user"]
+    os.environ["LIGHTNING_MACHINE"] = str(acct.get("machine") or "T4")
     print("Provisioning account '{}' (studio: {})".format(account_id, acct["studioName"]))
 
 
@@ -83,21 +94,58 @@ def get_studio():
     return Studio(name, **kw)
 
 
+def resolve_machine(name):
+    value = str(name or "T4").strip().upper().replace("-", "_")
+    machine = getattr(Machine, value, None)
+    if machine is None:
+        try:
+            machine = Machine.from_str(str(name))
+        except Exception:
+            machine = None
+    if machine is None:
+        raise ValueError("Unknown Lightning machine '{}'. Use an SDK name such as T4 or L4.".format(name))
+    return machine
+
+
 def main():
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         hydrate_from_pool(sys.argv[1])
     elif not os.environ.get("LIGHTNING_API_KEY"):
         sys.exit("Usage: python tools/provision-lightning-studio.py <account-id>   (id from lightning-accounts.json)")
     s = get_studio()
+    machine_name = str(os.environ.get("LIGHTNING_MACHINE") or "T4").strip()
+    target_machine = resolve_machine(machine_name)
 
-    # 1) Ensure running on L4 (GPU needed to install/download/run; CPU → 'Failed to infer device').
-    st = str(getattr(s, "status", ""))
-    if not st.endswith("Running"):
-        log("Starting Studio on L4…")
-        s.start(machine=Machine.L4)
-    if "l4" not in str(getattr(s, "machine", "")).lower():
-        log("Switching to L4 GPU…")
-        s.switch_machine(Machine.L4)
+    # 1) Ensure running on the configured GPU (CPU → 'Failed to infer device').
+    initial_status = status_name(s)
+    started_by_us = False
+    if initial_status.lower() != "running":
+        log("Starting Studio on {}…".format(machine_name))
+        try:
+            start_info = start_studio_compat(
+                s,
+                target_machine,
+                timeout=float(os.environ.get("LIGHTNING_START_TIMEOUT", "600")),
+                log=log,
+            )
+            started_by_us = bool(start_info.get("started"))
+            log("Studio started via {}.".format(start_info.get("method", "Lightning")))
+        except Exception as e:
+            log("❌ " + friendly_start_error(e))
+            log("Studio setup stopped before installing anything.")
+            return 2
+    if machine_name.lower() not in str(getattr(s, "machine", "")).lower():
+        log("Switching to {} GPU…".format(machine_name))
+        try:
+            s.switch_machine(target_machine)
+        except Exception as e:
+            log("❌ Could not switch the Studio to {}: {}".format(machine_name, e))
+            if started_by_us:
+                try:
+                    s.stop()
+                except Exception:
+                    pass
+            return 2
 
     run(s, "nvidia-smi --query-gpu=name --format=csv,noheader || echo NO_GPU", "Check GPU")
 
@@ -118,8 +166,7 @@ def main():
         "Install cloudflared")
 
     # 5) Push the corrected serve script (base64 → no quoting/paste issues).
-    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    serve = open(os.path.join(here, "lightning", "serve-vision.sh"), "rb").read()
+    serve = open(os.path.join(REPO_ROOT, "lightning", "serve-vision.sh"), "rb").read()
     b64 = base64.b64encode(serve).decode()
     run(s, "echo {} | base64 -d > $HOME/serve-vision.sh && chmod +x $HOME/serve-vision.sh && echo WROTE".format(b64), "Write serve-vision.sh")
 
@@ -142,16 +189,28 @@ def main():
         log("  loading… ({}s)".format(i * 15))
         time.sleep(15)
     if not ready:
-        log("  ⚠️ Not serving yet — check ~/vision-serve.log on the Studio")
+        log("  ❌ Model never became ready — check ~/vision-serve.log on the Studio")
+        if started_by_us:
+            try:
+                s.stop()
+                log("Studio stopped after the failed setup attempt (billing stopped).")
+            except Exception as e:
+                log("Could not auto-stop (%s) — stop it manually in Lightning to save credit." % e)
+        return 2
 
-    log("\nModel is cached on this Studio's disk now. Stopping the Studio to save credit")
-    log("(future builds/checks auto-start it on L4 and just load from disk)…")
-    try:
-        s.stop()
-        log("Studio stopped ✓ (billing stopped). Setup complete — run 🔍 Check to verify.")
-    except Exception as e:
-        log("Could not auto-stop (%s) — stop it manually in the Lightning UI to save credit." % e)
+    if started_by_us:
+        log("\nModel is cached on this Studio's disk now. Stopping the Studio to save credit")
+        log("(future builds/checks auto-start it on {} and just load from disk)…".format(machine_name))
+        try:
+            s.stop()
+            log("Studio stopped ✓ (billing stopped). Setup complete — run 🔍 Check to verify.")
+        except Exception as e:
+            log("Could not auto-stop (%s) — stop it manually in the Lightning UI to save credit." % e)
+            return 2
+    else:
+        log("\nSetup complete. The Studio was already running before setup, so it was left running.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

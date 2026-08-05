@@ -99,6 +99,30 @@ function _shiftTemplateContent(item, rangeStart, rangeEnd) {
     return item;
 }
 
+function _renderRangeClip(item, sourceWindow, clipped, rangeStart, rangeEnd, visibleDuration) {
+    const previous = item?._renderRangeClip && typeof item._renderRangeClip === 'object'
+        ? item._renderRangeClip
+        : null;
+    const clippedAtStart = sourceWindow.start < rangeStart - EPSILON;
+    const clippedAtEnd = sourceWindow.end > rangeEnd + EPSILON;
+    if (!previous && !clippedAtStart && !clippedAtEnd) return null;
+
+    const previousOffset = Math.max(0, _finite(previous?.sourceOffset, 0));
+    const sourceDuration = Math.max(
+        visibleDuration,
+        _finite(previous?.sourceDuration, sourceWindow.end - sourceWindow.start)
+    );
+    return {
+        sourceStartTime: _finite(previous?.sourceStartTime, sourceWindow.start),
+        sourceEndTime: _finite(previous?.sourceEndTime, sourceWindow.end),
+        sourceDuration,
+        sourceOffset: Math.min(sourceDuration, previousOffset + clipped.sourceOffset),
+        visibleDuration,
+        clippedAtStart: Boolean(previous?.clippedAtStart || clippedAtStart),
+        clippedAtEnd: Boolean(previous?.clippedAtEnd || clippedAtEnd),
+    };
+}
+
 function _clipTimedItem(item, rangeStart, rangeEnd, fps, options = {}) {
     const sourceWindow = _window(item, options.fallbackDuration);
     const clipped = _clipAbsolutePair(sourceWindow.start, sourceWindow.end, rangeStart, rangeEnd);
@@ -115,6 +139,11 @@ function _clipTimedItem(item, rangeStart, rangeEnd, fps, options = {}) {
     };
     delete out._hfTiming;
 
+    if (options.trackRenderRange) {
+        const rangeClip = _renderRangeClip(item, sourceWindow, clipped, rangeStart, rangeEnd, duration);
+        if (rangeClip) out._renderRangeClip = rangeClip;
+        else delete out._renderRangeClip;
+    }
     if (options.adjustMediaOffset) {
         out.mediaOffset = Math.max(0, _finite(item.mediaOffset, 0) + clipped.sourceOffset);
     }
@@ -189,16 +218,25 @@ function clipPlanForRange(plan, startSec, endSec) {
         .map((scene) => _clipTimedItem(scene, rangeStart, rangeEnd, fps, { adjustMediaOffset: true }))
         .filter(Boolean);
     clipped.mgScenes = normalized.mgScenes
-        .map((scene) => _clipTimedItem(scene, rangeStart, rangeEnd, fps, { fallbackDuration: 3 }))
+        .map((scene) => _clipTimedItem(scene, rangeStart, rangeEnd, fps, {
+            fallbackDuration: 3,
+            trackRenderRange: true,
+        }))
         .filter(Boolean);
     clipped.templateScenes = normalized.templateScenes
-        .map((scene) => _clipTimedItem(scene, rangeStart, rangeEnd, fps, { fallbackDuration: 4 }))
+        .map((scene) => _clipTimedItem(scene, rangeStart, rangeEnd, fps, {
+            fallbackDuration: 4,
+            trackRenderRange: true,
+        }))
         .filter(Boolean);
 
     for (const key of ['motionGraphics', 'overlayScenes']) {
         if (!Array.isArray(normalized[key])) continue;
         clipped[key] = normalized[key]
-            .map((item) => _clipTimedItem(item, rangeStart, rangeEnd, fps, { fallbackDuration: 0.5 }))
+            .map((item) => _clipTimedItem(item, rangeStart, rangeEnd, fps, {
+                fallbackDuration: 0.5,
+                trackRenderRange: true,
+            }))
             .filter(Boolean);
     }
 
@@ -245,6 +283,10 @@ function clipPlanForRange(plan, startSec, endSec) {
         }
     }
 
+    clipped.continuityHolds = timeline.buildContinuityHolds(clipped.scenes, {
+        fps,
+        totalDuration: clipped.totalDuration,
+    });
     return clipped;
 }
 

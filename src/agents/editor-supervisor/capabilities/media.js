@@ -2,6 +2,47 @@
 
 const { replaceScopedMedia } = require('../workers/media-editor');
 const { resolveSceneTargets } = require('../scope-utils');
+const { CANONICAL_SOURCE_HINTS } = require('../../../media/source-policy');
+const {
+    array,
+    boolean: booleanField,
+    object,
+    string,
+    tool,
+} = require('./capability-contract');
+
+const MEDIA_REPLACEMENT_ARGS = object({
+    query: string({ maxLength: 500 }),
+    replacementQuery: string({ maxLength: 500 }),
+    style: string({ maxLength: 240 }),
+    mediaType: string({ enum: ['', 'video', 'image'] }),
+    sourceHint: string({ enum: ['', ...CANONICAL_SOURCE_HINTS] }),
+    preferredSources: array(string({ enum: CANONICAL_SOURCE_HINTS }), { maxItems: 8, uniqueItems: true }),
+    bannedSources: array(string({ enum: CANONICAL_SOURCE_HINTS }), { maxItems: 8, uniqueItems: true }),
+    preferImages: booleanField(),
+    preferVideos: booleanField(),
+    preferReal: booleanField(),
+    avoidStock: booleanField(),
+    replace: booleanField(),
+    effort: string({ enum: ['', 'fast', 'smart'] }),
+});
+
+function tools() {
+    return [
+        tool('replace', 'Find, score, download, and transactionally stage replacement media.', MEDIA_REPLACEMENT_ARGS, {
+            risk: 'expensive',
+            visualImpact: true,
+        }),
+        tool('replace-media', 'Replace selected footage or images.', MEDIA_REPLACEMENT_ARGS, {
+            canonicalAction: 'replace',
+            risk: 'expensive',
+        }),
+        tool('find-alternative', 'Find a stronger alternative for selected media.', MEDIA_REPLACEMENT_ARGS, {
+            canonicalAction: 'replace',
+            risk: 'expensive',
+        }),
+    ];
+}
 
 function _safeMediaRef(scene) {
     const value = String(
@@ -79,6 +120,7 @@ function normalizeInvocation(invocation, context) {
 
 function manifest() {
     return {
+        contractVersion: 2,
         id: 'media',
         specialist: 'Media Editor',
         domain: 'media',
@@ -89,7 +131,7 @@ function manifest() {
         directiveKeys: ['footage'],
         vocabulary: {
             mediaTypes: ['video', 'image'],
-            sources: ['stock', 'youtube', 'web-image', 'reddit'],
+            sources: CANONICAL_SOURCE_HINTS,
         },
     };
 }
@@ -130,4 +172,4 @@ function inspect(plan, scope) {
     };
 }
 
-module.exports = { execute, inspect, manifest, normalizeInvocation, planFast };
+module.exports = { execute, inspect, manifest, normalizeInvocation, planFast, tools };

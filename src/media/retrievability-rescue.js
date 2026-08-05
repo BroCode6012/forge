@@ -26,12 +26,37 @@
 
 const { callAIJson } = require('../brain/strict-json');
 
+/**
+ * The background query of a TEMPLATE CARD, if that is what this scene is.
+ *
+ * Two shapes reach the downloader, and until now only one of them was judged
+ * here: a normal footage scene (searched by stockQuery/searchKeyword/keyword),
+ * and a template card, whose background is searched by `templateBgQuery`. Cards
+ * were excluded outright, and that exclusion had a measured price.
+ *
+ * When the orchestrator rejects a data chart it turns the chart into a template
+ * card and seeds the background search with the chart's own title. "Coefficient
+ * of Performance" is a metric, not a thing a camera can point at — so the scene
+ * spends its whole budget proving that stock libraries carry no footage of a
+ * metric. On the 2026-07-31 build five such scenes did exactly that, at 225
+ * seconds each, and took five of the nine coverage-rescue slots with them.
+ *
+ * A card background is real footage from a real search. It faces the identical
+ * un-findable-query failure, so it belongs in the identical judgement.
+ */
+function _templateBgQuery(scene) {
+    if (!scene || scene.fullscreenMG || !scene.templateHint) return '';
+    return String(scene.templateBgQuery || '').trim();
+}
+
 function _downloadLaneScenes(scenes) {
     return (scenes || []).filter((s) => {
         if (!s) return false;
-        if (s.fullscreenMG || s.templateHint) return false;
+        if (s.fullscreenMG) return false;
         const lane = s.mediaIntent?.lane;
-        if (lane === 'skip' || lane === 'template') return false;
+        if (lane === 'skip') return false;
+        if (s.templateHint) return !!_templateBgQuery(s);
+        if (lane === 'template') return false;
         return !!(s.stockQuery || s.searchKeyword || s.keyword);
     });
 }
@@ -42,14 +67,24 @@ function _shortText(text, words = 14) {
 
 async function applyRetrievabilityRescue(scenes, scriptContext = {}, options = {}) {
     const changes = [];
-    const lane = _downloadLaneScenes(scenes);
+    const tag = options.label ? `Retrievability Rescue · ${options.label}` : 'Retrievability Rescue';
+    let lane = _downloadLaneScenes(scenes);
+    // Delta mode: re-judge ONLY the scenes whose downloader query changed after
+    // this pass last ran (a later stage can invent brand-new queries this pass
+    // never saw). Same model, same prompt, smaller row set.
+    if (options.onlyIndices) {
+        const only = options.onlyIndices instanceof Set
+            ? options.onlyIndices
+            : new Set(options.onlyIndices);
+        lane = lane.filter((s) => only.has(s.index));
+    }
     if (lane.length === 0) return { changes, rescued: [] };
 
     const rows = lane
         .map((s) => ({
             i: s.index,
             type: s.mediaType || 'video',
-            q: String(s.stockQuery || s.searchKeyword || s.keyword || '').slice(0, 80),
+            q: String(_templateBgQuery(s) || s.stockQuery || s.searchKeyword || s.keyword || '').slice(0, 80),
             n: _shortText(s.text),
         }))
         .filter((r) => r.q);
@@ -83,7 +118,7 @@ Only include scenes you actually rewrote. If everything is findable, return {"re
     let parsed;
     try {
         parsed = await callAIJson(prompt, {
-            label: 'retrievability-rescue',
+            label: options.label ? `retrievability-rescue-${options.label}` : 'retrievability-rescue',
             maxRetries: 1,
             maxTokens: 1100,
             temperature: 0.2,
@@ -92,13 +127,13 @@ Only include scenes you actually rewrote. If everything is findable, return {"re
                 'You judge whether B-roll search queries are findable in real stock/web libraries and rewrite ONLY the un-findable ones into generic, findable, topically-honest phrases. Be conservative — most queries are fine. Output strict JSON only.',
         });
     } catch (e) {
-        console.log(`   [Retrievability Rescue] skipped (${e.message})`);
+        console.log(`   [${tag}] skipped (${e.message})`);
         return { changes, rescued: [] };
     }
 
     const rescued = Array.isArray(parsed?.rescued) ? parsed.rescued : [];
     if (rescued.length === 0) {
-        if (options.log !== false) console.log(`   [Retrievability Rescue] reviewed ${rows.length} scenes — all findable`);
+        if (options.log !== false) console.log(`   [${tag}] reviewed ${rows.length} scene(s) — all findable`);
         return { changes, rescued: [] };
     }
 
@@ -109,8 +144,22 @@ Only include scenes you actually rewrote. If everything is findable, return {"re
         if (!scene) continue;
         const newQ = String(r.q || '').replace(/^["']|["']$/g, '').trim();
         if (!newQ || newQ.length < 3) continue;
-        const before = scene.stockQuery || scene.searchKeyword || scene.keyword || '';
+        const cardBg = _templateBgQuery(scene);
+        const before = cardBg || scene.stockQuery || scene.searchKeyword || scene.keyword || '';
         if (newQ.toLowerCase() === String(before).toLowerCase()) continue;
+
+        // A template card searches by ONE field and has no locked lane to
+        // unlock, so rewriting that field is the entire change. Deliberately
+        // narrower than the footage path below: writing the downloader keyword
+        // fields here would turn a card into a footage scene, which is a
+        // different decision than the one this pass is allowed to make.
+        if (cardBg) {
+            scene.templateBgQuery = newQ;
+            scene._retrievabilityRescued = { before, after: newQ, why: r.why || '' };
+            applied.push({ index: scene.index, before, after: newQ, why: r.why || '' });
+            changes.push(`S${scene.index}: unfindable card background "${before}" → findable "${newQ}" (${r.why || 'rescue'})`);
+            continue;
+        }
 
         // Rewrite every downloader-facing query to the findable phrase (the narration keeps
         // the specifics). Relax an unfindable internal-only lock so downstream stops treating
@@ -147,7 +196,7 @@ Only include scenes you actually rewrote. If everything is findable, return {"re
     }
 
     if (options.log !== false) {
-        console.log(`   [Retrievability Rescue] rewrote ${applied.length}/${rows.length} unfindable scene quer${applied.length === 1 ? 'y' : 'ies'} into findable B-roll`);
+        console.log(`   [${tag}] rewrote ${applied.length}/${rows.length} unfindable scene quer${applied.length === 1 ? 'y' : 'ies'} into findable B-roll`);
     }
     return { changes, rescued: applied };
 }

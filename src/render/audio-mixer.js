@@ -40,7 +40,14 @@ function _resolveFfmpeg(explicit) {
 
 function _probe(ffmpeg, file) {
     try {
-        const r = spawnSync(ffmpeg, ['-hide_banner', '-i', file, '-f', 'null', '-'], {
+        // `-frames:v 0` stops ffmpeg after it parses the container header. Both fields we
+        // read below (`Duration:` and the `Audio:` stream line) are printed at input-open
+        // time from the moov atom, so decoding is pure waste: on a 4-minute 1080p render
+        // the old `-f null -` form decoded all 7,789 video frames and took ~35s where this
+        // takes ~0.6s. It also removes a scaling landmine — the 60s timeout below is fixed
+        // while a full decode grows with video length, and a timeout here would silently
+        // report hasAudio:false and skip loudness normalization on long videos.
+        const r = spawnSync(ffmpeg, ['-hide_banner', '-i', file, '-frames:v', '0', '-f', 'null', '-'], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
         });
         const out = `${r.stdout || ''}\n${r.stderr || ''}`;

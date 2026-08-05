@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { spawnSync } = require('child_process');
 const config = require('../../settings/config');
 const { normalizeUrlForDedup } = require('../../util/url-utils');
 const { createByteLimitTransform, requestSafeStream } = require('../../security/safe-download');
@@ -25,9 +25,50 @@ const WATERMARK_URL_PATTERNS = [
     '/thumb/', 'stock-photo-', '/editorial-',
 ];
 
-// Minimum acceptable image dimensions for 1080p video
+// Preferred image dimensions. NOT a floor — see filterResults(): an image below
+// this is de-ranked to the back of the queue, never discarded. Retrieval is a
+// capability floor ("find something for every scene in every niche"); resolution
+// is a preference. A soft 640x507 photo beats a black frame.
 const MIN_IMAGE_WIDTH = 1280;
 const MIN_IMAGE_HEIGHT = 720;
+
+// Ceiling for a still, expressed as a COVER box (see _sanitizeImage).
+// 1.5x the 1920x1080 render frame. Unlike video — which the render transcode caps
+// at 1080p before anything can magnify it — stills really do get blown up: Ken Burns
+// is hard-gated to images (up to ~1.24x) and a zoom-punch transition stacks up to
+// 1.16x on top, so the worst realistic case shows a still at ~1.44x. 2880x1620
+// covers that ceiling with margin. It is deliberately generous: on a real 40-image
+// project exactly ONE file exceeded it, so a tighter box would buy almost nothing
+// while risking a visibly soft frame.
+const STILL_COVER_WIDTH = 2880;
+const STILL_COVER_HEIGHT = 1620;
+
+// Pixel formats we can PROVE carry no alpha channel.
+// This is an allowlist on purpose. Anything not on it — a new format, an unparsable
+// banner, or `pal8`, whose transparency lives in an optional tRNS chunk and is
+// genuinely undecidable from the format name — falls back to PNG, which is exactly
+// what this function has always done. An unknown format therefore costs disk, never
+// correctness: the failure mode is "we kept the big lossless file", not "we flattened
+// someone's transparency onto black".
+const OPAQUE_PIX_FMTS = new Set([
+    'rgb24', 'bgr24', 'rgb0', 'bgr0', '0rgb', '0bgr',
+    'rgb48', 'rgb48be', 'rgb48le', 'bgr48', 'bgr48be', 'bgr48le',
+    'rgb444be', 'rgb444le', 'rgb555be', 'rgb555le', 'rgb565be', 'rgb565le',
+    'bgr444be', 'bgr444le', 'bgr555be', 'bgr555le', 'bgr565be', 'bgr565le',
+    'rgb4', 'rgb8', 'bgr4', 'bgr8', 'monob', 'monow',
+    'yuv410p', 'yuv411p', 'yuv420p', 'yuv422p', 'yuv440p', 'yuv444p',
+    'yuvj411p', 'yuvj420p', 'yuvj422p', 'yuvj440p', 'yuvj444p',
+    'gbrp', 'gbrp9be', 'gbrp9le', 'gbrp10be', 'gbrp10le',
+    'gbrp12be', 'gbrp12le', 'gbrp14be', 'gbrp14le', 'gbrp16be', 'gbrp16le',
+]);
+
+function _isOpaquePixFmt(pixFmt) {
+    if (!pixFmt) return false;
+    // gray / gray8 / gray10le / gray16be … all opaque. `ya8` and `ya16` are the
+    // grayscale-WITH-alpha formats and deliberately do not match this pattern.
+    if (/^gray(\d{1,2}(be|le)?)?$/.test(pixFmt)) return true;
+    return OPAQUE_PIX_FMTS.has(pixFmt);
+}
 
 function _sleep(ms, signal) {
     return new Promise((resolve, reject) => {
@@ -128,6 +169,13 @@ class BaseProvider {
         // Pass 3: everything is used and overused — last resort
         if (results.length > 0) {
             console.log(`  ⚠️ [${this.name}] All results used & overused, reusing least recent`);
+            // Walk back past the undersized reserve tail filterResults parks at the
+            // end. Without this, "pick last" would mean "pick the smallest" — the
+            // exact inversion of the size preference, in the one branch where the
+            // pick is already a compromise.
+            for (let i = results.length - 1; i >= 0; i--) {
+                if (results[i] && !results[i]._undersized) return results[i];
+            }
             return results[results.length - 1]; // pick last (least likely to be the repeated one)
         }
         return null;
@@ -249,10 +297,76 @@ class BaseProvider {
     }
 
     /**
-     * Sanitize web images to PNG using ffmpeg.
-     * Web images (especially from Google/Bing) are often WebP disguised as .jpg,
-     * or have broken headers. This re-encodes everything as proper PNG.
-     * Returns the final file path (may differ from input if extension changed).
+     * Read dimensions + pixel format out of ffmpeg's own stream banner.
+     *
+     * We deliberately do NOT use ffprobe: _sanitizeImage only ever resolves the
+     * ffmpeg binary (FFMPEG_PATH / the pinned Windows path), and installs exist
+     * that ship one without the other. Asking ffmpeg to open a file with no output
+     * makes it print the banner and exit non-zero — that non-zero is expected, so
+     * we read stderr rather than the exit status.
+     *
+     * spawnSync, not execSync, because execSync throws away stderr on a non-zero
+     * exit and the banner is the entire point of the call.
+     *
+     * Returns null whenever anything is unclear. Every caller treats null as
+     * "keep the old PNG behaviour".
+     */
+    _probeImage(filePath, ffmpeg) {
+        try {
+            const res = spawnSync(ffmpeg, ['-hide_banner', '-i', filePath], {
+                encoding: 'utf8', timeout: 15000, windowsHide: true,
+            });
+            const line = String(res.stderr || '').split('\n').find(l => l.includes('Video:'));
+            if (!line) return null;
+
+            // "Stream #0:0: Video: png, rgb24(pc, gbr/unknown/unknown), 1880x1253 [SAR …]"
+            const fmt = line.match(/Video:\s*[^,]+,\s*([a-z0-9]+)/i);
+            const dim = line.match(/\b(\d{2,5})x(\d{2,5})\b/);
+            if (!fmt || !dim) return null;
+
+            return {
+                pixFmt: fmt[1].toLowerCase(),
+                width: Number(dim[1]),
+                height: Number(dim[2]),
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /**
+     * Re-encode a downloaded image through ffmpeg.
+     * Returns the final file path (may differ from input if the extension changed).
+     *
+     * WHY THIS EXISTS AT ALL (unchanged): web images, especially scraped ones, are
+     * routinely WebP or AVIF wearing a .jpg extension, or carry broken headers.
+     * Pushing every one through ffmpeg guarantees the bytes and the extension agree
+     * before anything downstream tries to decode them.
+     *
+     * WHAT CHANGED: it used to write PNG unconditionally, which is lossless and
+     * therefore enormous — a photo has no flat regions for PNG to compress, so this
+     * step INFLATED most downloads. Measured on a real 40-image project: 131.3 MB of
+     * PNG, one single photo at 22.2 MB.
+     *
+     * Now: provably-opaque images become JPEG at -q:v 2; everything else stays PNG.
+     * Same real project, same 34 opaque images:
+     *
+     *     PNG (before)   131.3 MB
+     *     JPEG -q:v 2     18.6 MB      7.1x smaller, average PSNR 50.0 dB
+     *
+     * 50 dB is well inside visually-lossless territory for photographic content, and
+     * these images then get scaled, graded, grain-overlaid and re-encoded by the video
+     * render anyway — that final encode is a far bigger quality term than this step.
+     *
+     * On chroma: we do NOT pass -pix_fmt. ffmpeg's mjpeg encoder already picks 4:4:4
+     * for an RGB source (verified: the output reports yuvj444p, and forcing yuvj444p
+     * produces a byte-identical file). That matters because the web-image lane
+     * deliberately fetches images with text baked into them, and 4:2:0 smears coloured
+     * text edges. Letting it auto-select also keeps a 4:2:0 source at 4:2:0 instead of
+     * paying to upsample chroma that was never there.
+     *
+     * Transparency is never guessed — see OPAQUE_PIX_FMTS. Unknown or undecidable
+     * (notably pal8, whose tRNS chunk is invisible from the format name) keeps PNG.
      */
     _sanitizeImage(filePath) {
         const ext = path.extname(filePath).toLowerCase();
@@ -261,21 +375,36 @@ class BaseProvider {
         const ffmpeg = process.env.FFMPEG_PATH || (process.platform === 'win32' ? 'C:\\ffmg\\bin\\ffmpeg.exe' : 'ffmpeg');
         if (!fs.existsSync(ffmpeg)) return filePath;
 
-        const tmpPath = filePath + '.sanitize.png';
+        const probe = this._probeImage(filePath, ffmpeg);
+        const opaque = !!probe && _isOpaquePixFmt(probe.pixFmt);
+        const outExt = opaque ? '.jpg' : '.png';
+        const tmpPath = `${filePath}.sanitize${outExt}`;
+
+        // COVER, not fit: scale by max(boxW/w, boxH/h) so the still still fills a
+        // 16:9 frame after cropping. Only ever shrinks — the guard requires BOTH
+        // dimensions to exceed the box, so a tall or wide image is never touched and
+        // nothing is ever upscaled.
+        const args = ['-y', '-i', filePath, '-frames:v', '1'];
+        if (probe && probe.width > STILL_COVER_WIDTH && probe.height > STILL_COVER_HEIGHT) {
+            const factor = Math.max(STILL_COVER_WIDTH / probe.width, STILL_COVER_HEIGHT / probe.height);
+            const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+            args.push('-vf', `scale=${even(probe.width * factor)}:${even(probe.height * factor)}:flags=lanczos`);
+        }
+        if (opaque) args.push('-q:v', '2');
+        args.push(tmpPath);
 
         try {
-            execSync(`"${ffmpeg}" -y -i "${filePath}" -frames:v 1 "${tmpPath}"`, {
-                stdio: 'pipe', timeout: 15000
-            });
+            const res = spawnSync(ffmpeg, args, { stdio: 'pipe', timeout: 20000, windowsHide: true });
+            if (res.error) throw res.error;
 
             if (fs.existsSync(tmpPath) && fs.statSync(tmpPath).size > 1000) {
-                const finalPath = filePath.replace(/\.[^.]+$/, '.png');
+                const finalPath = filePath.replace(/\.[^.]+$/, outExt);
                 fs.copyFileSync(tmpPath, finalPath);
                 fs.unlinkSync(tmpPath);
                 if (finalPath !== filePath && fs.existsSync(filePath)) {
                     fs.unlinkSync(filePath);
                 }
-                console.log(`  🔧 Sanitized to PNG: ${path.basename(finalPath)}`);
+                console.log(`  🔧 Sanitized to ${opaque ? 'JPEG' : 'PNG'}: ${path.basename(finalPath)}`);
                 return finalPath;
             } else {
                 if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
@@ -303,24 +432,54 @@ class BaseProvider {
     }
 
     /**
-     * Check if an image result is too small for 1080p video use
+     * Is this image below the preferred resolution? A PREFERENCE test, not a
+     * reject test — filterResults uses it to sort, not to drop.
+     *
+     * Unknown dimensions deliberately answer "no". Bing and Brave — the two
+     * keyless providers that carry the long tail of retrieval — usually report
+     * no size at all, and Pexels/Pixabay report the ORIGINAL's size while
+     * serving a smaller rendition. Treating "unknown" as small would demote
+     * exactly the providers that find the hard scenes, for a reason that has
+     * nothing to do with pixels.
      */
     isTooSmall(result) {
         if (this.mediaType !== 'image') return false;
-        if (!result.width || !result.height) return false; // unknown size, let it through
+        if (!result || !result.width || !result.height) return false; // unknown size → neutral
         return result.width < MIN_IMAGE_WIDTH || result.height < MIN_IMAGE_HEIGHT;
     }
 
     /**
-     * Filter out low-quality results (watermarked, too small)
-     * Called by footage-manager after search()
+     * Drop unusable results (watermarked) and DE-RANK undersized ones.
+     * Called by footage-manager after search().
+     *
+     * Small images are moved to the back of the queue, not removed: everything
+     * downstream (the race pool cut at footage-manager, pickUnused, the hunter
+     * rank) reads this list as a priority order and takes from the front, so a
+     * full-size image wins whenever one exists — but when the only thing on the
+     * web for a scene is a 640px photo, the scene still gets media instead of
+     * nothing. Watermarks stay a hard reject: a watermarked frame is unusable
+     * at any resolution.
+     *
+     * Order among the accepted (full-size) group is untouched, so a search that
+     * turns up no small images returns exactly what it returned before.
      */
     filterResults(results) {
-        return results.filter(r => {
-            if (this.isWatermarked(r.url)) return false;
-            if (this.isTooSmall(r)) return false;
-            return true;
-        });
+        if (!Array.isArray(results)) return [];
+        const preferred = [];
+        const reserve = [];
+        for (const r of results) {
+            if (!r) continue;
+            if (this.isWatermarked(r.url)) continue;
+            if (this.isTooSmall(r)) {
+                r._undersized = true;
+                reserve.push(r);
+            } else {
+                preferred.push(r);
+            }
+        }
+        if (!reserve.length) return preferred;
+        console.log(`  ↓ [${this.name}] ${reserve.length} small image(s) moved to the back of the queue (reserve — used only if nothing bigger works)`);
+        return preferred.concat(reserve);
     }
 
     /**

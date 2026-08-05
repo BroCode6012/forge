@@ -122,12 +122,34 @@ function _scopeForCurrentPlan(scopeValue, plan) {
     return null;
 }
 
+function _contextTimestamp(value) {
+    const timestamp = Date.parse(String(value?.createdAt || ''));
+    return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function _latestEditContext(session) {
+    const lastPlan = session?.context?.lastPlan || null;
+    const lastExecution = session?.context?.lastExecution || null;
+    if (!lastPlan) {
+        return lastExecution ? { value: lastExecution, kind: 'result' } : null;
+    }
+    if (!lastExecution) return { value: lastPlan, kind: 'plan' };
+
+    const planTimestamp = _contextTimestamp(lastPlan);
+    const executionTimestamp = _contextTimestamp(lastExecution);
+    if (planTimestamp > executionTimestamp) {
+        return { value: lastPlan, kind: 'plan' };
+    }
+    return { value: lastExecution, kind: 'result' };
+}
+
 function resolveContextualPayload(payloadValue, session, plan) {
     const payload = payloadValue && typeof payloadValue === 'object'
         ? _clone(payloadValue)
         : {};
     const originalText = String(payload.text || '').trim();
-    const previous = session?.context?.lastExecution || session?.context?.lastPlan || null;
+    const previousContext = _latestEditContext(session);
+    const previous = previousContext?.value || null;
     const currentScope = normalizeScope(payload.scope);
     const explicitCapabilities = _explicitCapabilities(originalText);
     const previousCapabilities = [...new Set(
@@ -167,7 +189,9 @@ function resolveContextualPayload(payloadValue, session, plan) {
     const resolvedScope = inheritScope ? previousScope : currentScope;
     const contextLine = [
         `Continue the previously discussed ${noun}.`,
-        previous.summary ? `Previous result: ${String(previous.summary).slice(0, 800)}.` : '',
+        previous.summary
+            ? `Previous ${previousContext.kind}: ${String(previous.summary).slice(0, 800)}.`
+            : '',
         'Change only what this follow-up requests and preserve every unrelated property.',
     ].filter(Boolean).join(' ');
 
@@ -180,6 +204,7 @@ function resolveContextualPayload(payloadValue, session, plan) {
             applied: true,
             inheritedScope: Boolean(inheritScope),
             capabilityIds,
+            source: previousContext.kind,
             note: inheritScope
                 ? `Continued the previous ${noun} target.`
                 : `Used the previous ${noun} edit as conversational context.`,

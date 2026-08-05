@@ -7,6 +7,7 @@ const { MG_REGISTRY } = require('../render/mg-registry');
 const { getLanguageBlock } = require('../data/language-helper');
 const { pickPack: pickMapPack, DEFAULT_PACK_ID: DEFAULT_MAP_PACK_ID } = require('../map/map-style-packs');
 const { validateOverlayHintPlacement } = require('./planner-display-guards');
+const { recoverDataPairs } = require('./mg-data-recovery');
 
 // Track placed MG types to avoid repetition
 let placedTypes = [];
@@ -2140,18 +2141,34 @@ async function processMotionGraphics(scenes, scriptContext, visualAnalysis, aiIn
         let mgText = mgContent;
         let mgSubtext = scene.text;
         if (DATA_MGS.has(mgType)) {
-            const segs = mgContent.split(/\s*\|\s*|\s*;\s*/).map(v => v.trim()).filter(Boolean);
-            const firstIsPair = segs.length > 0 && /^[^:]+:\s*[\d.,%$+\-]+/.test(segs[0]);
-            const pairSegs = (segs.length > 1 && !firstIsPair) ? segs.slice(1) : segs;
-            const pairs = pairSegs.filter(v => /^[^:]+:\s*[\d.,%$+\-]+/.test(v));
             const isBullet = mgType === 'bulletList';
-            const enough = isBullet ? pairSegs.length >= 2 : pairs.length >= 2;
-            if (!enough) {
+            const readPairs = (raw) => {
+                const segs = String(raw || '').split(/\s*\|\s*|\s*;\s*/).map(v => v.trim()).filter(Boolean);
+                const firstIsPair = segs.length > 0 && /^[^:]+:\s*[\d.,%$+\-]+/.test(segs[0]);
+                const pairSegs = (segs.length > 1 && !firstIsPair) ? segs.slice(1) : segs;
+                const pairs = pairSegs.filter(v => /^[^:]+:\s*[\d.,%$+\-]+/.test(v));
+                return { segs, firstIsPair, pairSegs, enough: isBullet ? pairSegs.length >= 2 : pairs.length >= 2 };
+            };
+
+            let parsed = readPairs(mgContent);
+            if (!parsed.enough) {
+                // The digits are usually one field away — sitting in this scene's
+                // own narration, which the planner simply didn't copy across.
+                // Look there before throwing the graphic away. Recovery returns
+                // null unless the pairs are unambiguous, so the rejection below
+                // still fires unchanged for everything it cannot prove.
+                const recovered = recoverDataPairs(scene, mgType, mgContent);
+                if (recovered) {
+                    console.log(`  Scene ${i}: [fullscreenMG] "${mgType}" data recovered from ${recovered.source} — "${recovered.content}"`);
+                    parsed = readPairs(recovered.content);
+                }
+            }
+            if (!parsed.enough) {
                 console.log(`  Scene ${i}: [fullscreenMG] "${mgType}" rejected — no real data pairs in "${mgContent.slice(0, 60)}". Skipping (scene will have no MG here).`);
                 continue;
             }
-            mgText = (!firstIsPair && segs.length > 1) ? segs[0] : '';
-            mgSubtext = pairSegs.join(', ');
+            mgText = (!parsed.firstIsPair && parsed.segs.length > 1) ? parsed.segs[0] : '';
+            mgSubtext = parsed.pairSegs.join(', ');
         } else if (mgType === 'comparisonCard') {
             if (!/\s+vs\.?\s+|\s+versus\s+/i.test(mgContent)) {
                 console.log(`  Scene ${i}: [fullscreenMG] "comparisonCard" rejected — missing "A vs B" pattern in "${mgContent.slice(0, 60)}". Skipping.`);

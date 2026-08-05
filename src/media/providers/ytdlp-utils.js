@@ -358,6 +358,12 @@ function heightFilter(maxHeight) {
     return h ? `[height<=${h}]` : '';
 }
 
+// The trailing bare `best` is a capability floor, not an oversight. Every selector
+// above it carries the [height<=N] filter, so a video whose streams are ALL taller
+// than the cap has no match and yt-dlp aborts with "Requested format is not
+// available" — a height cap would then be silently removing candidates from the
+// running instead of just making them cheaper. The uncapped rung can only ever fire
+// after all the capped ones missed, so it costs nothing in the normal case.
 function buildBestVideoFormat(maxHeight = null) {
     const h = heightFilter(maxHeight);
     const formats = [
@@ -366,6 +372,7 @@ function buildBestVideoFormat(maxHeight = null) {
         `best${h}[ext=mp4]`,
         `best${h}`,
     ];
+    if (h) formats.push('best');
     return formats.join('/');
 }
 
@@ -377,6 +384,7 @@ function buildBestVideoOnlyFormat(maxHeight = null) {
         `best${h}[ext=mp4]`,
         `best${h}`,
     ];
+    if (h) formats.push('best');
     return formats.join('/');
 }
 

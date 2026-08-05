@@ -55,33 +55,51 @@ const path = require('path');
 const { execFile } = require('child_process');
 const config = require('../settings/config');
 const { classifyStrictRawVisual } = require('../media/relevant-person-rules');
+const { packagingPenalty, noteGateObservation } = require('../media/packaging-intent');
 const { applyVisionScoreSanity, clampSelfReportedDefects } = require('../vision/vision-score-sanity');
 
 function applyMediaHunterFrameGate(result, context, keyword = '', options = {}) {
     // Defect clamp first: if the scorer's own description admits burned-in
     // broadcast packaging, the score cannot exceed the rubric cap.
-    let gated = clampSelfReportedDefects(result);
+    let gated = clampSelfReportedDefects(result, context);
     gated = applyVisionScoreSanity(gated, keyword, context, options);
     if (!context?.mediaHunter?.strictRaw || context.mediaHunter.allowGraphics) return gated;
     const description = String(gated?.description || result?.description || '');
     const strictRawVisual = classifyStrictRawVisual(description, keyword, context?.sceneText || '', context);
+    // Every strict-raw candidate we look at is one data point on the question
+    // "is clean raw footage even findable for this topic?" — that is what the
+    // relief below is learned from, in-run, per build.
+    noteGateObservation(strictRawVisual.reject);
     if (!strictRawVisual.reject) return gated;
     // Graceful degradation (global, all niches): "packaged" footage (overlays,
     // maps, lower-thirds, presenters) is a soft NEGATIVE, not a death sentence.
     // Hard-capping to 2 used to nuke topically-perfect clips (e.g. a satellite of
     // the very strait the video is about) → the scene then reused a neighbour
-    // clip, which is strictly worse. Instead apply a penalty + ceiling: a strongly
-    // relevant packaged clip survives ABOVE the accept floor but stays BELOW clean
-    // raw footage, so raw still wins whenever it exists — and a packaged clip only
-    // wins over continuity when nothing cleaner was found. Relevance (the base
-    // vision score) still decides, not a per-niche word list.
+    // clip, which is strictly worse.
+    //
+    // The replacement for the old `min(6, base - 2)` is straight subtraction,
+    // scaled by how bad the packaging actually is. The ceiling was the real
+    // defect: it FLATTENED the top of the range (8, 9 and 10 all became exactly
+    // 6, so the best packaged clip in the race was indistinguishable from the
+    // worst one that still passed) while a plain 7 — the most common good score
+    // there is — became 5 and died under an accept floor of 6. One point of raw
+    // difference decided accept-vs-reject; three points decided nothing.
+    //
+    // Straight subtraction keeps the order intact, and a packaged clip still
+    // cannot outrank a clean clip that scored the same, because the clean one is
+    // not demoted at all. Relevance (the base vision score) still decides, not a
+    // per-niche word list.
     const base = Number(gated.score || 0);
-    const penalized = Math.min(6, Math.max(0, base - 2));
+    const { penalty, relief, buckets } = packagingPenalty(strictRawVisual.buckets);
+    const penalized = Math.max(0, base - penalty);
+    const reliefNote = relief ? `, −${relief} relief: clean raw footage not retrievable this run` : '';
     return {
         ...gated,
         score: penalized,
         _strictRawPenalized: true,
-        description: `${description} [strict raw penalty −2 → ${penalized}/10: ${strictRawVisual.reason}]`,
+        _strictRawPenalty: penalty,
+        _strictRawBuckets: buckets,
+        description: `${description} [strict raw penalty −${penalty} → ${penalized}/10: ${strictRawVisual.reason}${reliefNote}]`,
     };
 }
 

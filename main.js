@@ -8,7 +8,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { fileURLToPath, pathToFileURL } = require('url');
-const { execSync, spawn, exec, execFile } = require('child_process');
+const { execSync, execFileSync, spawn, exec, execFile } = require('child_process');
 const { Readable } = require('stream');
 const projectStore = require('./src/project/project-store');
 
@@ -900,6 +900,55 @@ function getShortcutIconPath() {
     return getIcoIconPath() || process.execPath;
 }
 
+function createWindowsAppShortcuts() {
+    if (process.platform !== 'win32') {
+        throw new Error('Windows only');
+    }
+
+    const shortcutName = 'YTA Empire WEBGL.lnk';
+    const desktopShortcutPath = path.join(app.getPath('desktop'), shortcutName);
+    const startMenuProgramsDir = path.join(
+        app.getPath('appData'),
+        'Microsoft',
+        'Windows',
+        'Start Menu',
+        'Programs'
+    );
+    const startMenuShortcutPath = path.join(startMenuProgramsDir, shortcutName);
+    fs.mkdirSync(startMenuProgramsDir, { recursive: true });
+
+    const shortcutDetails = {
+        target: process.execPath,
+        args: app.isPackaged ? '' : '"' + APP_ROOT + '"',
+        cwd: APP_ROOT,
+        description: 'YTA Empire WEBGL - AI Video Studio',
+        icon: getShortcutIconPath(),
+        iconIndex: 0,
+        appUserModelId: 'YTA Empire WEBGL'
+    };
+
+    for (const shortcutPath of [desktopShortcutPath, startMenuShortcutPath]) {
+        const operation = fs.existsSync(shortcutPath) ? 'replace' : 'create';
+        if (!shell.writeShortcutLink(shortcutPath, operation, shortcutDetails)) {
+            throw new Error('Could not create shortcut at ' + shortcutPath);
+        }
+    }
+
+    const legacyShortcutPaths = [
+        path.join(app.getPath('desktop'), 'YTA Empire.lnk'),
+        path.join(startMenuProgramsDir, 'YTA Empire.lnk')
+    ];
+    for (const legacyShortcutPath of legacyShortcutPaths) {
+        try {
+            if (fs.existsSync(legacyShortcutPath)) fs.unlinkSync(legacyShortcutPath);
+        } catch (error) {
+            console.warn('Could not remove legacy shortcut:', legacyShortcutPath, error.message);
+        }
+    }
+
+    return { desktopShortcutPath, startMenuShortcutPath };
+}
+
 function ensureIcoFromPng() {
     const sourcePngPath = getIconSourcePng();
     if (!sourcePngPath) {
@@ -1099,19 +1148,16 @@ async function createWindow() {
             label: 'Help',
             submenu: [
                 {
-                    label: 'Create Desktop Shortcut', click: async () => {
-                        const result = await ipcMain.emit('create-desktop-shortcut') || {};
-                        // Call directly instead of through IPC
+                    label: 'Create App Shortcuts', click: async () => {
                         try {
-                            const desktopDir = path.join(require('os').homedir(), 'Desktop');
-                            const shortcutPath = path.join(desktopDir, 'YTA Empire WEBGL.lnk');
-                            const electronExe = process.execPath;
-                            const icon = getShortcutIconPath();
-                            const ps = `$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut('${shortcutPath.replace(/'/g, "''")}'); $sc.TargetPath = '${electronExe.replace(/'/g, "''")}'; $sc.Arguments = '""${APP_ROOT.replace(/'/g, "''")}""'; $sc.WorkingDirectory = '${APP_ROOT.replace(/'/g, "''")}'; $sc.IconLocation = '${icon.replace(/'/g, "''")}'; $sc.Description = 'YTA Empire WEBGL'; $sc.Save();`;
-                            execSync(`powershell -Command "${ps.replace(/"/g, '\\"')}"`, { stdio: 'ignore' });
-                            dialog.showMessageBox(mainWindow, { title: 'Shortcut Created', message: 'Desktop shortcut created successfully!', type: 'info' });
+                            createWindowsAppShortcuts();
+                            dialog.showMessageBox(mainWindow, {
+                                title: 'App Shortcuts Created',
+                                message: 'Desktop and Start menu shortcuts created. You can now find YTA Empire WEBGL in Windows Search.',
+                                type: 'info'
+                            });
                         } catch (e) {
-                            dialog.showMessageBox(mainWindow, { title: 'Error', message: `Failed to create shortcut: ${e.message}`, type: 'error' });
+                            dialog.showMessageBox(mainWindow, { title: 'Error', message: 'Failed to create shortcuts: ' + e.message, type: 'error' });
                         }
                     }
                 },
@@ -1146,7 +1192,20 @@ async function createWindow() {
     }
 
     mainWindow.on('closed', () => {
+        console.warn(`[Lifecycle] Main window closed (activeProcess=${activeProcessType || 'none'}).`);
         mainWindow = null;
+    });
+
+    mainWindow.on('unresponsive', () => {
+        console.error(`[Lifecycle] Main window became unresponsive (activeProcess=${activeProcessType || 'none'}).`);
+    });
+
+    mainWindow.webContents.on('render-process-gone', (_event, details = {}) => {
+        console.error(
+            `[Lifecycle] Main renderer exited: reason=${details.reason || 'unknown'}`
+            + ` exitCode=${details.exitCode ?? 'unknown'}`
+            + ` activeProcess=${activeProcessType || 'none'}`
+        );
     });
 
     // Forward renderer console messages to main process log (critical for diagnostics)
@@ -1183,13 +1242,17 @@ async function createWindow() {
 // access ANGLE's EGL display for D3D11 shared texture interop.
 // --disable-gpu-compositing prevents blank window by using software UI compositing
 // while keeping GPU available for WebGL rendering.
-// Disable with EXPORT_V2=0 if it causes problems.
-if (process.env.EXPORT_V2 !== '0') {
+// This mode deliberately removes Chromium's normal GPU-process crash boundary.
+// Keep it opt-in for the legacy V2 native export only; HyperFrames and the
+// regular preview/render paths must retain an out-of-process GPU so a driver
+// reset cannot terminate the Electron main process.
+const _v2InProcessGpuEnabled = /^(1|true|on)$/i.test(String(process.env.EXPORT_V2 || '').trim());
+if (_v2InProcessGpuEnabled) {
     app.commandLine.appendSwitch('in-process-gpu');
     app.commandLine.appendSwitch('disable-gpu-compositing');
-    console.log('[V2] --in-process-gpu + --disable-gpu-compositing ENABLED');
+    console.log('[V2] in-process GPU ENABLED (explicit EXPORT_V2 opt-in)');
 } else {
-    console.log('[V2] --in-process-gpu DISABLED (EXPORT_V2=0)');
+    console.log('[V2] in-process GPU disabled; Chromium GPU crash isolation is active');
 }
 
 // ========================================
@@ -1207,6 +1270,12 @@ protocol.registerSchemesAsPrivileged([
 
 app.whenReady().then(async () => {
     if (!_hasPrimaryInstanceLock) return;
+
+    try {
+        createWindowsAppShortcuts();
+    } catch (error) {
+        console.warn('Could not register Windows app shortcuts:', error.message);
+    }
     // Register asset:// for project media only. Arbitrary filesystem reads are
     // rejected even if a renderer bug manages to request a crafted URL.
     protocol.handle('asset', (request) => {
@@ -1325,7 +1394,7 @@ app.whenReady().then(async () => {
     }
 
     // Auto-probe V2 on startup to log GPU capabilities
-    if (typeof _gpuExportAddon !== 'undefined' && _gpuExportAddon && process.env.EXPORT_V2 !== '0') {
+    if (typeof _gpuExportAddon !== 'undefined' && _gpuExportAddon && _v2InProcessGpuEnabled) {
         try {
             const probe = _gpuExportAddon.probeAngleD3D11();
             if (probe.ok) {
@@ -1344,6 +1413,7 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
+    console.warn(`[Lifecycle] All windows closed (activeProcess=${activeProcessType || 'none'}); quitting.`);
     killLogTailWindows();
     releaseProjectLock();
     if (process.platform !== 'darwin') {
@@ -1352,8 +1422,22 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+    console.warn(`[Lifecycle] before-quit (activeProcess=${activeProcessType || 'none'}).`);
     killLogTailWindows();
     releaseProjectLock();
+});
+
+app.on('child-process-gone', (_event, details = {}) => {
+    const type = details.type || 'unknown';
+    const reason = details.reason || 'unknown';
+    const level = reason === 'clean-exit' ? 'log' : 'error';
+    console[level](
+        `[Lifecycle] Electron child exited: type=${type}`
+        + ` reason=${reason}`
+        + ` exitCode=${details.exitCode ?? 'unknown'}`
+        + `${details.serviceName ? ` service=${details.serviceName}` : ''}`
+        + ` activeProcess=${activeProcessType || 'none'}`
+    );
 });
 
 app.on('activate', () => {
@@ -1460,14 +1544,8 @@ let activeProcess = null;
 let activeProcessType = null; // 'build' or 'render'
 let processCancelled = false;
 let activeRenderCancelled = false;
-let activeAiVideoJob = null;
 
 ipcMain.handle('cancel-process', async (event) => {
-
-    if (activeAiVideoJob && activeAiVideoJob.ownerWebContentsId === event.sender.id) {
-        activeAiVideoJob.controller.abort();
-        return { success: true, message: 'AI Video generation cancellation requested' };
-    }
 
     if (activeProcess && _rendererRoles.get(event.sender.id) === 'main') {
         const type = activeProcessType || 'process';
@@ -1512,186 +1590,17 @@ ipcMain.handle('cancel-process', async (event) => {
 async function _prepareVisionForBuild(options) {
     if (options && options.visionBackend) {
         const vb = String(options.visionBackend).toLowerCase();
-        if (String(process.env.VISION_BACKEND || 'aws').toLowerCase() !== vb) {
-            process.env.VISION_BACKEND = vb;
-            try { updateEnvFile('VISION_BACKEND', vb); } catch (_) {}
+        const changed = String(process.env.VISION_BACKEND || 'aws').toLowerCase() !== vb;
+        process.env.VISION_BACKEND = vb;
+        // Record it every time, not only on a change: a project whose .env has never
+        // carried the key would otherwise keep no record of the choice at all, and the
+        // dropdown would read back a default that does not match what builds are using.
+        try { updateEnvFile('VISION_BACKEND', vb); } catch (_) {}
+        if (changed) {
             try { require('./src/settings/config').resolveVisionBackend(); } catch (_) {}
         }
     }
 }
-
-ipcMain.handle('read-ai-script-file', async (event, filePath) => {
-    try {
-        const grantedFile = _resolveGrantedFile(event, filePath);
-        if (!grantedFile) return { success: false, error: 'Choose the story file with Import file first' };
-        const { loadScriptFile } = require('./src/categories/ai-videos/source-loader');
-        const loaded = loadScriptFile(grantedFile);
-        return { success: true, ...loaded };
-    } catch (error) {
-        console.warn(`[AI Videos] Story file import failed: ${error.message}`);
-        return { success: false, error: error.message || String(error) };
-    }
-});
-
-ipcMain.handle('load-ai-script-url', async (_event, rawUrl) => {
-    try {
-        const url = String(rawUrl || '').trim();
-        if (!url || url.length > 4096) return { success: false, error: 'Enter a valid public story URL' };
-        const { loadScriptUrl } = require('./src/categories/ai-videos/source-loader');
-        const loaded = await loadScriptUrl(url);
-        return { success: true, ...loaded };
-    } catch (error) {
-        console.warn(`[AI Videos] Story URL import failed: ${error.message}`);
-        return { success: false, error: error.message || String(error) };
-    }
-});
-
-function _applyAiVideoGeneratorOptions(opts = {}) {
-    const envKeys = ['VEO_AI_VIDEO', 'VEO_SCOPE', 'VEO_RESOLUTION', 'KLING_VIDEO_RESOLUTION', 'AI_VIDEO_BACKEND', 'VEO_BACKEND'];
-    const previous = Object.fromEntries(envKeys.map((key) => [
-        key,
-        Object.prototype.hasOwnProperty.call(process.env, key) ? { present: true, value: process.env[key] } : { present: false },
-    ]));
-    const resolution = String(opts.resolution || '720p').toLowerCase() === '1080p' ? '1080p' : '720p';
-    const selected = String(opts.backend || 'kling').trim().toLowerCase();
-    process.env.VEO_AI_VIDEO = '1';
-    process.env.VEO_SCOPE = 'all';
-    process.env.VEO_RESOLUTION = resolution;
-    process.env.KLING_VIDEO_RESOLUTION = resolution;
-    if (selected === 'veo-fal') {
-        process.env.AI_VIDEO_BACKEND = 'veo';
-        process.env.VEO_BACKEND = 'fal';
-    } else if (selected === 'veo-gemini') {
-        process.env.AI_VIDEO_BACKEND = 'veo';
-        process.env.VEO_BACKEND = 'gemini';
-    } else {
-        process.env.AI_VIDEO_BACKEND = 'kling';
-    }
-    return {
-        selected: ['veo-fal', 'veo-gemini'].includes(selected) ? selected : 'kling',
-        engine: process.env.AI_VIDEO_BACKEND,
-        resolution,
-        restore() {
-            for (const key of envKeys) {
-                if (previous[key].present) process.env[key] = previous[key].value;
-                else delete process.env[key];
-            }
-        },
-    };
-}
-
-function _cleanupSupersededAiVideoClips(clips = []) {
-    try {
-        const keep = new Set((clips || [])
-            .map((clip) => clip?.file)
-            .filter(Boolean)
-            .map((filePath) => path.resolve(filePath).toLowerCase()));
-        for (const filename of fs.readdirSync(PUBLIC_PATH)) {
-            if (!/^ai-video-scene-\d+(?:-[a-f0-9]{14})?\.mp4$/i.test(filename)) continue;
-            const candidate = path.resolve(PUBLIC_PATH, filename);
-            if (!keep.has(candidate.toLowerCase())) fs.unlinkSync(candidate);
-        }
-    } catch (error) {
-        console.warn(`[AI Videos] Could not clean superseded generated clips: ${error.message}`);
-    }
-}
-
-// Script-driven AI Videos pipeline. Narration-driven AI Videos use run-build so
-// they keep transcription timing, Director/Planner decisions, subtitles, and audio.
-ipcMain.handle('run-ai-videos', async (event, opts = {}) => {
-    let generator = null;
-    let job = null;
-    try {
-        if (activeAiVideoJob) return { success: false, error: 'Another AI Video build is already running' };
-        const script = String((opts && opts.script) || '').trim();
-        if (!script) return { success: false, error: 'No script provided' };
-        if (Buffer.byteLength(script, 'utf8') > 4 * 1024 * 1024) {
-            return { success: false, error: 'Script exceeds the 4 MB build limit' };
-        }
-        generator = _applyAiVideoGeneratorOptions({
-            backend: opts.backend,
-            resolution: opts.resolution,
-        });
-        job = {
-            ownerWebContentsId: event.sender.id,
-            controller: new AbortController(),
-        };
-        activeAiVideoJob = job;
-        const { buildAiVideosProject } = require('./src/categories/ai-videos/pipeline');
-        if (!fs.existsSync(PUBLIC_PATH)) fs.mkdirSync(PUBLIC_PATH, { recursive: true });
-        const notify = (percent, message) => {
-            try { event.sender.send('build-progress', { percent, message }); } catch (_) {}
-        };
-        notify(8, 'Preparing script-driven AI Video build...');
-        const ctx = await buildAiVideosProject(
-            { script },
-            {
-                generate: opts.generate !== false,
-                outDir: PUBLIC_PATH,
-                aspectRatio: opts.aspectRatio || '16:9',
-                backend: generator.selected,
-                resolution: generator.resolution,
-                qualityTier: opts.qualityTier || 'standard',
-                themeId: opts.themeId || 'auto',
-                themeLabel: opts.themeLabel || '',
-                nicheId: opts.nicheId || 'auto',
-                nicheLabel: opts.nicheLabel || '',
-                videoTitle: String(opts.videoTitle || '').trim().slice(0, 500),
-                aiInstructions: String(opts.aiInstructions || '').trim().slice(0, 4000),
-                signal: job.controller.signal,
-                log: (m) => console.log(m),
-                onProgress: ({ completed, total, message }) => {
-                    const ratio = total > 0 ? completed / total : 0;
-                    notify(Math.min(88, Math.round(18 + ratio * 70)), message || `Generating scene ${completed}/${total}`);
-                },
-            }
-        );
-        if (job.controller.signal.aborted) throw new Error('Cancelled');
-        if (!ctx.plan) return { success: false, error: 'Pipeline produced no plan (empty script?)' };
-        const current = _loadUnifiedProjectState({ reconcile: false });
-        const nextSettings = {
-            ...(current?.settings || {}),
-            aiVideosScript: script,
-            aiVideosInputMode: 'script',
-            aiVideosScriptSource: {
-                type: ['file', 'url'].includes(String(opts.scriptSource?.type || ''))
-                    ? String(opts.scriptSource.type)
-                    : 'paste',
-                label: String(opts.scriptSource?.label || '').slice(0, 500),
-            },
-        };
-        const saved = _persistUnifiedProjectState({
-            settings: nextSettings,
-            videoPlan: ctx.plan,
-            revision: current?.revision || 0,
-        });
-        _cleanupSupersededAiVideoClips(ctx.clips);
-        const generatedCount = ctx.clips.filter((clip) => !!clip.file).length;
-        const failedCount = ctx.clips.filter((clip) => !clip.file && !clip.dryRun).length;
-        notify(100, failedCount
-            ? `AI Video plan ready with ${failedCount} generation warning(s)`
-            : 'AI Video build ready');
-        console.log(`✅ AI Videos: ${ctx.plan.scenes.length} scene(s), ${ctx.plan.totalDuration}s → ${saved.fvpPath}${opts.generate === false ? ' (dry-run)' : ''}`);
-        return {
-            success: true,
-            sceneCount: ctx.plan.scenes.length,
-            totalDuration: ctx.plan.totalDuration,
-            generatedCount,
-            failedCount,
-            planPath: path.join(PUBLIC_PATH, 'video-plan.json'),
-            dryRun: opts.generate === false,
-            revision: saved.revision,
-            planHash: saved.planHash,
-        };
-    } catch (e) {
-        console.error('AI Videos pipeline failed:', e);
-        const cancelled = job?.controller.signal.aborted || e?.message === 'Cancelled';
-        return { success: false, error: cancelled ? 'Cancelled' : (e.message || String(e)) };
-    } finally {
-        if (activeAiVideoJob === job) activeAiVideoJob = null;
-        generator?.restore?.();
-    }
-});
 
 // Run the build pipeline
 ipcMain.handle('run-build', async (event, options) => {
@@ -2464,10 +2373,10 @@ ipcMain.handle('scene-action', async (event, payload = {}) => {
     const result = { success: false, ok: 0, fail: 0, scenes: [], errors: [] };
     let visionBox = null;
     let weStarted = false;
-    // Retry vision routing (RETRY_VISION): 'auto' (default) = use the GPU box ONLY if it's
-    // already running, else Bedrock — NEVER boots the box for a retry. 'box' = always wake
-    // the box. 'bedrock' = always Bedrock. The box is otherwise for the real build only.
-    const retryVisionMode = String(process.env.RETRY_VISION || 'auto').toLowerCase();
+    // Retry vision routing (RETRY_VISION): 'bedrock' (default) keeps one-off scene
+    // retries off Lightning/AWS GPU machines. 'auto' may reuse an already-ready box;
+    // 'box' explicitly wakes the configured AWS box.
+    const retryVisionMode = String(process.env.RETRY_VISION || 'bedrock').toLowerCase();
     const _savedVisionEnv = {};
     const _restoreVisionEnv = () => {
         for (const k of Object.keys(_savedVisionEnv)) {
@@ -2506,7 +2415,7 @@ ipcMain.handle('scene-action', async (event, payload = {}) => {
             // Route the vision chain straight to Bedrock (skip the box) for this retry only.
             for (const k of ['VISION_PROVIDER', 'VISION_FALLBACK_ORDER', 'VISION_EXCLUDE_QWEN']) _savedVisionEnv[k] = process.env[k];
             process.env.VISION_PROVIDER = process.env.RETRY_VISION_PROVIDER || 'bedrock-claude';
-            process.env.VISION_FALLBACK_ORDER = 'bedrock-nova,bedrock-qwen-vl';
+            process.env.VISION_FALLBACK_ORDER = 'bedrock-qwen-vl,bedrock-nova';
             process.env.VISION_EXCLUDE_QWEN = '1';
             send(-1, `Vision: using Bedrock (${process.env.VISION_PROVIDER}) for retry — no GPU-box boot needed`);
         }
@@ -2526,7 +2435,18 @@ ipcMain.handle('scene-action', async (event, payload = {}) => {
                 if (kind === 'retry') {
                     const mediaFilePath = _resolveSceneMediaPathMain(scene);
                     const r = await sceneActions.retrySceneMedia(scene, scriptContext, { mediaFilePath, onProgress });
-                    if (r.success) { result.ok++; result.scenes.push({ si, clipId, reload: true, keyword: r.keyword, sourceHint: r.sourceHint }); }
+                    if (r.success) {
+                        result.ok++;
+                        result.scenes.push({
+                            si,
+                            clipId,
+                            reload: true,
+                            keyword: r.keyword,
+                            sourceHint: r.sourceHint,
+                            scene: r.scene || scene,
+                            change: `media replaced via ${r.provider || scene.sourceProvider || 'retry'}`,
+                        });
+                    }
                     else { result.fail++; result.errors.push({ si, error: r.error }); send(si, `❌ ${r.error}`); }
                 } else if (kind === 'ceo') {
                     const arrIdx = scenes.indexOf(scene);
@@ -2704,6 +2624,8 @@ ipcMain.handle('agent-plan', async (_event, rawPayload = {}) => {
             return {
                 success: false,
                 conflict: true,
+                retryable: true,
+                code: 'AGENT_PLAN_VERSION_CONFLICT',
                 error: 'The project changed. Agent scope was refreshed; send the request again.',
                 revision: loaded.revision,
                 planHash: loaded.planHash,
@@ -2714,6 +2636,8 @@ ipcMain.handle('agent-plan', async (_event, rawPayload = {}) => {
             return {
                 success: false,
                 conflict: true,
+                retryable: true,
+                code: 'AGENT_PLAN_VERSION_CONFLICT',
                 error: 'The project changed. Agent scope was refreshed; send the request again.',
                 revision: loaded.revision,
                 planHash: loaded.planHash,
@@ -2794,6 +2718,7 @@ ipcMain.handle('agent-execute', async (event, rawPayload = {}) => {
             publicDir: PUBLIC_PATH,
             inputDir: INPUT_PATH,
             browserPath: findHyperframesBrowserPath(),
+            allowStableScopeRebase: true,
         });
         if (!result.success) return result;
 
@@ -2903,6 +2828,7 @@ ipcMain.handle('agent-execute', async (event, rawPayload = {}) => {
             operationResults: result.operationResults,
             recoveries: result.recoveries,
             decisionLog: result.decisionLog,
+            versionRebase: result.versionRebase,
             transactionId: transaction.id,
             sessionId,
             sessionWarning,
@@ -3006,6 +2932,22 @@ ipcMain.handle('agent-history', async () => {
     try {
         const history = require('./src/agents/editor-supervisor/history-store');
         return { success: true, ...history.listHistory(PROJECT_DIR) };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
+ipcMain.handle('agent-capabilities', async () => {
+    try {
+        const registry = require('./src/agents/editor-supervisor/capabilities/registry');
+        const capabilities = registry.listManifests();
+        return {
+            success: true,
+            contractVersion: Math.max(0, ...capabilities.map((entry) => Number(entry.contractVersion) || 0)),
+            capabilityCount: capabilities.length,
+            toolCount: capabilities.reduce((sum, entry) => sum + (entry.tools?.length || 0), 0),
+            capabilities,
+        };
     } catch (error) {
         return { success: false, error: error.message };
     }
@@ -3122,7 +3064,7 @@ ipcMain.handle('lightning-provision', async (event, id) => {
         proc.on('close', (code) => { send(code === 0 ? '✅ Provisioning finished.' : `⚠️ Exited with code ${code}.`); resolve({ ok: code === 0, code }); });
     });
 });
-// Health-check a Studio: boot on L4 → vision test → stop → report. Streams progress on the
+// Health-check a Studio: boot on its configured GPU → vision test → stop → report. Streams progress on the
 // same channel as provisioning; returns the parsed JSON verdict.
 ipcMain.handle('lightning-check', async (event, id) => {
     return new Promise((resolve) => {
@@ -3140,6 +3082,17 @@ ipcMain.handle('lightning-check', async (event, id) => {
             const last = stdout.trim().split(/\r?\n/).filter(Boolean).pop() || '';
             let res;
             try { res = JSON.parse(last); } catch (_) { res = { ok: false, error: 'bad output: ' + last.slice(0, 200) }; }
+            try {
+                const rotation = require('./src/vision/lightning-rotation');
+                const acct = rotation.loadAccounts().find((item) => item.id === acctId);
+                if (acct) {
+                    if (res.ok) rotation.markHealthy(acct);
+                    else if (res.retryable === false) rotation.markExhausted(acct, res.error || 'Lightning check failed');
+                    else rotation.markFailure(acct, res.error || 'Lightning check failed');
+                }
+            } catch (stateError) {
+                send(`Could not update account health: ${stateError.message}`);
+            }
             send(res.ok ? '✅ Check PASSED — vision works' : `⚠️ Check failed: ${res.error || (res.steps && res.steps.visionReply) || 'unknown'}`);
             resolve(res);
         });
@@ -3179,6 +3132,25 @@ ipcMain.handle('open-external', async (event, url) => {
         if (/^https?:\/\//i.test(String(url || ''))) { await shell.openExternal(url); return { ok: true }; }
         return { ok: false, error: 'not an http(s) url' };
     } catch (e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('clipboard-write-text', async (event, value) => {
+    if (_rendererRoles.get(event.sender.id) !== 'main') {
+        return { success: false, error: 'Clipboard access is not available in this window' };
+    }
+    const text = String(value ?? '').slice(0, 4 * 1024 * 1024);
+    clipboard.writeText(text);
+    return { success: true, length: text.length };
+});
+
+ipcMain.handle('clipboard-read-text', async (event) => {
+    if (_rendererRoles.get(event.sender.id) !== 'main') {
+        return { success: false, error: 'Clipboard access is not available in this window', text: '' };
+    }
+    return {
+        success: true,
+        text: String(clipboard.readText() || '').slice(0, 4 * 1024 * 1024),
+    };
 });
 
 // ── QA Results persistence ──────────────────────────────────────────────────
@@ -4019,14 +3991,30 @@ ipcMain.handle('cancel-webgl-export', async (event, exportId) => {
 });
 
 function sendRenderProgress(percent, message) {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('render-progress', { percent, message });
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const contents = mainWindow.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    try {
+        contents.send('render-progress', { percent, message });
+    } catch (error) {
+        console.warn(`[HyperFrames] Could not deliver render progress: ${error.message}`);
     }
 }
 
 function checkHyperframesNodeRuntime() {
     try {
-        const version = execSync('node -v', {
+        const configuredPath = String(
+            process.env.HYPERFRAMES_NODE_PATH
+            || process.env.HF_MOTION_QA_NODE_PATH
+            || ''
+        ).trim();
+        const command = configuredPath || 'node';
+        const version = execFileSync(command, ['-v'], {
+            cwd: PROJECT_ROOT,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim();
+        const resolvedPath = execFileSync(command, ['-p', 'process.execPath'], {
             cwd: PROJECT_ROOT,
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'ignore'],
@@ -4036,6 +4024,7 @@ function checkHyperframesNodeRuntime() {
             ok: Number.isFinite(major) && major >= 22,
             version,
             major,
+            path: resolvedPath || command,
         };
     } catch (err) {
         return {
@@ -4152,6 +4141,104 @@ function runHyperframesLint(projectDir) {
     return { ok: data.ok !== false, errorCount: errs, warningCount: warns, findings: data.findings };
 }
 
+// The CLI guards frame capture with a stall watchdog (HF_DE_STALL_MS, default
+// 60s). Its clock starts the moment capture is requested -- BEFORE the workers
+// launch their browsers, navigate the page and inject every clip -- and only
+// resets on real frame progress. On a heavy project that setup legitimately
+// costs more than 60s, so the watchdog fires mid-setup and kills a render that
+// was never stalled. Measured 2026-07-31 (79 clips, 4 workers): the four
+// workers reported "media + fonts + tailwind ready" at 44s, 45s, 64s and 82s;
+// the watchdog aborted at 0/7789 frames and main.js fell all the way back to
+// the 1-worker software tier for the whole render. This is deterministic, not
+// bad luck: the longer the video, the more clips, the more certain the failure.
+//
+// Every worker loads every media file, so setup cost tracks the project's own
+// media count -- budget from that rather than a flat number, and never go below
+// the CLI default. The ceiling bounds how long a genuinely hung capture can
+// burn before the fallback tiers take over.
+function resolveCaptureStallBudgetMs(projectDir) {
+    let mediaCount = 0;
+    try {
+        mediaCount = fs.readdirSync(path.join(projectDir, 'media')).length;
+    } catch (_) { /* no media dir -- the floor still applies */ }
+    const budget = 120000 + (mediaCount * 2000);
+    return Math.max(180000, Math.min(600000, budget));
+}
+
+// Extracting frames from the scene clips is one of the most expensive phases of
+// a render (measured 2026-07-31: videoExtractMs 74634 for 44 clips / 265 MB).
+// The CLI caches those frames, and the cache works -- but two things stopped it
+// from ever paying off across renders:
+//
+//  1. Its key hashed the ABSOLUTE media path, and every render writes a fresh
+//     yta-hf-<timestamp> project dir, so the key changed every time. Proof from
+//     that render, with nothing changed in between: the first capture attempt
+//     logged cacheHits 0 / cacheMisses 48, and the retry -- on the SAME project
+//     dir -- logged 48 / 0. Fixed in scripts/patch-hyperframes-extract-cache.js.
+//
+//  2. The cache defaults to the OS temp dir with a 2 GB cap, and ONE render of
+//     that project produced 1.9 GB of frames. Even with a stable key it would
+//     evict itself before the next render could use it -- and it sat on the
+//     system drive whose exhaustion the CLI's own preflight warns about.
+//
+// So place it on the roomiest writable home we have and size the cap from THAT
+// drive's free space: a 20-minute video extracts several times the frames a
+// 4-minute one does, and the machine rendering it may have any amount of room,
+// so a flat number is wrong in both directions. Returns null when nothing has
+// space to spare, which leaves the CLI's own defaults untouched.
+function resolveExtractCacheSettings(projectDir) {
+    const GB = 1024 ** 3;
+    const RESERVE_BYTES = 15 * GB;   // headroom we will never plan to spend
+    const MIN_USEFUL_BYTES = 4 * GB; // below this a cache cannot hold one render
+    const MAX_CAP_BYTES = 64 * GB;
+
+    // Free space on the nearest ancestor that actually exists, so a candidate
+    // can be measured before its directory is created.
+    const freeBytesNear = (target) => {
+        let dir = target;
+        for (let i = 0; i < 12; i++) {
+            try {
+                const st = fs.statfsSync(dir);
+                return st.bavail * st.bsize;
+            } catch (_) { /* walk up */ }
+            const parent = path.dirname(dir);
+            if (!parent || parent === dir) break;
+            dir = parent;
+        }
+        return null;
+    };
+
+    const candidates = [];
+    // The project's own volume: the same drive the media and the render output
+    // already live on. Sibling of the yta-hf-* dirs, which the bridge's prune
+    // matches by /^yta-hf-/ -- so it is never swept up by housekeeping.
+    if (projectDir) candidates.push(path.join(path.dirname(projectDir), '.hf-extract-cache'));
+    // The app's own volume. Writable when running from source; inside an asar
+    // in a packaged build, where the write test below rejects it.
+    candidates.push(path.join(PROJECT_ROOT, '.hf-extract-cache'));
+    // Always writable, including packaged builds.
+    try { candidates.push(path.join(app.getPath('userData'), 'hf-extract-cache')); } catch (_) {}
+
+    const ranked = candidates
+        .map((dir) => ({ dir, free: freeBytesNear(dir) }))
+        .filter((c) => Number.isFinite(c.free) && c.free - RESERVE_BYTES >= MIN_USEFUL_BYTES)
+        .sort((a, b) => b.free - a.free);
+
+    for (const { dir, free } of ranked) {
+        try {
+            fs.mkdirSync(dir, { recursive: true });
+            fs.accessSync(dir, fs.constants.W_OK);
+        } catch (_) { continue; }  // not writable -- try the next-roomiest
+        const capBytes = Math.min(
+            MAX_CAP_BYTES,
+            free - RESERVE_BYTES,
+            Math.max(MIN_USEFUL_BYTES, Math.floor(free * 0.15))
+        );
+        return { dir, maxMb: Math.floor(capBytes / (1024 ** 2)), freeGb: free / GB };
+    }
+    return null;
+}
+
 function runHyperframesCli(projectDir, outputFile, options = {}) {
     return new Promise((resolve) => {
         const localCliJs = path.join(PROJECT_ROOT, 'node_modules', 'hyperframes', 'dist', 'cli.js');
@@ -4160,12 +4247,25 @@ function runHyperframesCli(projectDir, outputFile, options = {}) {
             resolve({ success: false, error: 'Bundled HyperFrames CLI is missing; reinstall application dependencies' });
             return;
         }
-        const cliCmd = 'node';
+        const cliCmd = options.nodePath || 'node';
         const workerCountRaw = Number(options.workers);
         const workerCount = Number.isFinite(workerCountRaw) && workerCountRaw > 0
             ? Math.max(1, Math.min(8, Math.floor(workerCountRaw)))
             : 1;
         const browserGpu = options.browserGpu === true;
+        // Streaming encode: run the encoder alongside frame capture instead of
+        // encoding only after every frame has landed on disk. Measured on a
+        // 4m20s / 7789-frame project: capture+encode 833.7s sequential -> 596.9s
+        // overlapped, with 845 frames bit-identical and mean PSNR 51.5 dB vs the
+        // sequential render (i.e. ordinary encoder variance, not a quality change
+        // -- every capture setting is untouched, only the frame delivery route
+        // differs). Requires the interleaved distributor, which needs >1 worker,
+        // so the 1-worker software fallback tier deliberately stays sequential.
+        // Depends on scripts/patch-hyperframes-streaming.js; see that file.
+        // Kill switch: HF_STREAMING_ENCODE=0 restores the sequential path.
+        const streamingEncodeOff = String(process.env.HF_STREAMING_ENCODE ?? '').trim() === '0'
+            || String(process.env.HF_CAPTURE_PARALLEL_STREAM ?? '').trim() === 'false';
+        const useStreamingEncode = !streamingEncodeOff && workerCount > 1;
         const args = [
             localCliJs,
             'render',
@@ -4184,8 +4284,22 @@ function runHyperframesCli(projectDir, outputFile, options = {}) {
         args.push(browserGpu ? '--browser-gpu' : '--no-browser-gpu');
         if (options.strict) args.push('--strict');
 
+        // Explicit env wins: if the operator pinned a budget, never override it.
+        const stallBudgetMs = Number(process.env.HF_DE_STALL_MS) > 0
+            ? Math.floor(Number(process.env.HF_DE_STALL_MS))
+            : resolveCaptureStallBudgetMs(projectDir);
+
+        // Same rule for the frame cache: a pinned directory is the operator's.
+        const extractCache = process.env.HYPERFRAMES_EXTRACT_CACHE_DIR
+            ? null
+            : resolveExtractCacheSettings(projectDir);
+
         console.log(`[HyperFrames] Running: ${cliCmd} ${args.join(' ')}`);
         console.log(`[HyperFrames] Browser: ${browserPath || 'HyperFrames default browser resolution'}`);
+        console.log(`[HyperFrames] Capture stall budget: ${Math.round(stallBudgetMs / 1000)}s (page setup + between frames)`);
+        if (extractCache) {
+            console.log(`[HyperFrames] Frame cache: ${extractCache.dir} (cap ${Math.round(extractCache.maxMb / 1024)}GB of ${Math.round(extractCache.freeGb)}GB free)`);
+        }
         const workerLabel = workerCount === 1 ? '1 worker' : `${workerCount} workers`;
         sendRenderProgress(18, `[HyperFrames] Rendering ${options.gpu === false ? 'CPU' : 'GPU'} HTML/MG composition (${workerLabel}, browser ${browserGpu ? 'GPU' : 'software'})...`);
 
@@ -4199,6 +4313,27 @@ function runHyperframesCli(projectDir, outputFile, options = {}) {
                 PRODUCER_PUPPETEER_PROTOCOL_TIMEOUT_MS: String(options.protocolTimeoutMs || 900000),
                 PRODUCER_PLAYER_READY_TIMEOUT_MS: String(options.playerReadyTimeoutMs || 180000),
                 PRODUCER_RENDER_READY_TIMEOUT_MS: String(options.renderReadyTimeoutMs || 180000),
+                // See resolveCaptureStallBudgetMs: the CLI's 60s default is
+                // shorter than page setup on a heavy project, which silently
+                // demotes every long render to the slowest tier.
+                HF_DE_STALL_MS: String(stallBudgetMs),
+                // See resolveExtractCacheSettings: the CLI's default cache is a
+                // 2GB dir in the system temp folder, and one render of a real
+                // project writes ~1.9GB of frames -- so it evicts itself before
+                // the next render can reuse anything.
+                ...(extractCache ? {
+                    HYPERFRAMES_EXTRACT_CACHE_DIR: extractCache.dir,
+                    HYPERFRAMES_EXTRACT_CACHE_MAX_MB: String(extractCache.maxMb),
+                } : {}),
+                ...(useStreamingEncode ? {
+                    PRODUCER_ENABLE_STREAMING_ENCODE: 'true',
+                    // Default cap is 240s, which silently excluded anything over
+                    // 4 minutes -- i.e. almost every real video.
+                    PRODUCER_STREAMING_ENCODE_MAX_DURATION_SECONDS: String(
+                        options.streamingEncodeMaxSeconds || 36000
+                    ),
+                    HF_CAPTURE_PARALLEL_STREAM: 'true',
+                } : {}),
                 ...(browserPath ? {
                     HYPERFRAMES_BROWSER_PATH: browserPath,
                     PRODUCER_HEADLESS_SHELL_PATH: browserPath,
@@ -4229,6 +4364,11 @@ function runHyperframesCli(projectDir, outputFile, options = {}) {
 
         const appendTail = (current, text) => (current + text).slice(-50000);
         const isCancellationError = () => activeRenderCancelled === true;
+        // A stall is a timing verdict, not a capability verdict: the browser and
+        // the GPU were fine, capture just never got going in the allotted time.
+        // Distinguishing it lets the caller retry with less parallelism instead
+        // of dropping the GPU too and taking the slowest path available.
+        const sawCaptureStall = () => /capture stalled: no frame progress/i.test(`${stdout}\n${stderr}`);
 
         const handleCliOutput = (raw, streamName) => {
             const text = raw.toString();
@@ -4236,7 +4376,12 @@ function runHyperframesCli(projectDir, outputFile, options = {}) {
             else stderr = appendTail(stderr, text);
 
             const clean = stripAnsi(text).replace(/\r/g, '\n');
-            const frameMatches = [...clean.matchAll(/Streaming frame\s+(\d+)\s*\/\s*(\d+)/g)];
+            // The CLI labels this line by capture route: "Streaming frame" on the
+            // overlapped streaming path, "Capturing frame" on the sequential disk
+            // path (single-worker fallback, or HF_STREAMING_ENCODE=0). Matching
+            // only the former left the progress bar frozen on the disk path for
+            // the whole capture phase.
+            const frameMatches = [...clean.matchAll(/(?:Streaming|Capturing) frame\s+(\d+)\s*\/\s*(\d+)/g)];
             if (frameMatches.length) {
                 const lastMatch = frameMatches[frameMatches.length - 1];
                 const frame = Number(lastMatch[1]);
@@ -4296,6 +4441,7 @@ function runHyperframesCli(projectDir, outputFile, options = {}) {
                 const tail = `${stdout}\n${stderr}`.trim().slice(-2000);
                 resolve({
                     success: false,
+                    stalled: sawCaptureStall(),
                     error: `HyperFrames exited with code ${code}${tail ? `\n${tail}` : ''}`,
                     stdout,
                     stderr,
@@ -4528,6 +4674,7 @@ ipcMain.handle('hyperframes-render', async (_event, payload = {}) => {
             sendRenderProgress(0, `[HyperFrames] ${message}`);
             return { success: false, error: message, nodeRuntime };
         }
+        console.log(`[HyperFrames] CLI Node runtime: ${nodeRuntime.path} (${nodeRuntime.version})`);
         if (!fs.existsSync(OUTPUT_PATH)) fs.mkdirSync(OUTPUT_PATH, { recursive: true });
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
         const outputFile = path.join(OUTPUT_PATH, `hyperframes-${stamp}.mp4`);
@@ -4555,6 +4702,7 @@ ipcMain.handle('hyperframes-render', async (_event, payload = {}) => {
             appRoot: APP_ROOT,
             reportDir: PUBLIC_PATH,
             browserPath: qaBrowserPath,
+            nodePath: nodeRuntime.path,
             quick: _isPartial,
             log: (message) => console.log(message),
             onProgress: sendRenderProgress,
@@ -4638,8 +4786,27 @@ ipcMain.handle('hyperframes-render', async (_event, payload = {}) => {
             workers: payload.workers || 4,
             browserGpu: payload.browserGpu !== false,
             strict: payload.strict === true,
+            nodePath: nodeRuntime.path,
         };
         let rendered = await runHyperframesCli(project.projectDir, outputFile, renderOptions);
+
+        if (rendered.cancelled) {
+            activeRenderCancelled = false;
+            return { ...rendered, projectDir: project.projectDir };
+        }
+
+        // A capture stall means setup outran its budget, not that the browser or
+        // the GPU is unusable -- so step parallelism down one rung and KEEP the
+        // GPU rather than collapsing straight to 1-worker software, which is the
+        // slowest path we have and used to be where every heavy render ended up.
+        if (!rendered.success && rendered.stalled && Number(renderOptions.workers) > 2) {
+            console.warn('[HyperFrames] Capture stalled during setup. Retrying with less parallelism (2 workers, browser GPU).');
+            sendRenderProgress(22, '[HyperFrames] Capture stalled, retrying with 2 workers...');
+            rendered = await runHyperframesCli(project.projectDir, outputFile, {
+                ...renderOptions,
+                workers: 2,
+            });
+        }
 
         if (rendered.cancelled) {
             activeRenderCancelled = false;
@@ -7048,30 +7215,13 @@ ipcMain.handle('open-existing-project-file', async () => {
 // Desktop Shortcut & Start Menu
 // ========================================
 ipcMain.handle('create-desktop-shortcut', async () => {
-    if (process.platform !== 'win32') return { success: false, error: 'Windows only' };
     try {
-        const desktopDir = path.join(require('os').homedir(), 'Desktop');
-        const shortcutPath = path.join(desktopDir, 'YTA Empire WEBGL.lnk');
-        const electronExe = process.execPath;
-        const icon = getShortcutIconPath();
-
-        // Use PowerShell to create a .lnk shortcut
-        const ps = `
-$ws = New-Object -ComObject WScript.Shell;
-$sc = $ws.CreateShortcut('${shortcutPath.replace(/'/g, "''")}');
-$sc.TargetPath = '${electronExe.replace(/'/g, "''")}';
-$sc.Arguments = '"${APP_ROOT.replace(/'/g, "''")}"';
-$sc.WorkingDirectory = '${APP_ROOT.replace(/'/g, "''")}';
-$sc.IconLocation = '${icon.replace(/'/g, "''")}';
-$sc.Description = 'YTA Empire WEBGL - AI Video Generator';
-$sc.Save();
-        `.trim();
-
-        execSync(`powershell -Command "${ps.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`, { stdio: 'ignore' });
-        console.log('✅ Desktop shortcut created:', shortcutPath);
-        return { success: true, path: shortcutPath };
+        const { desktopShortcutPath, startMenuShortcutPath } = createWindowsAppShortcuts();
+        console.log('Desktop shortcut created:', desktopShortcutPath);
+        console.log('Start menu shortcut created:', startMenuShortcutPath);
+        return { success: true, path: desktopShortcutPath, startMenuPath: startMenuShortcutPath };
     } catch (e) {
-        console.error('❌ Failed to create shortcut:', e.message);
+        console.error('Failed to create app shortcuts:', e.message);
         return { success: false, error: e.message };
     }
 });

@@ -16,6 +16,107 @@ const {
     inspectEffects,
     normalizeEffectEditArgs,
 } = require('../workers/effects-editor');
+const {
+    array,
+    boolean: booleanField,
+    number,
+    object,
+    string,
+    tool,
+} = require('./capability-contract');
+
+function _effectPropertyFields() {
+    const fields = {};
+    for (const schema of Object.values(EFFECT_PARAMETER_SCHEMA)) {
+        for (const [property, descriptor] of Object.entries(schema || {})) {
+            if (fields[property]) continue;
+            fields[property] = descriptor.type === 'color'
+                ? string({ format: 'color' })
+                : number({ min: descriptor.min, max: descriptor.max });
+        }
+    }
+    return fields;
+}
+
+const EFFECT_ID_FIELD = string({ enum: [...EFFECT_IDS] });
+const GRADE_ID_FIELD = string({ enum: [...GRADE_IDS] });
+const PRESET_ID_FIELD = string({ enum: Object.keys(EFFECT_PRESETS) });
+const CATEGORY_ID_FIELD = string({ enum: Object.keys(EFFECT_CATEGORIES) });
+const EFFECT_PROPERTIES_ARGS = object(_effectPropertyFields(), { minProperties: 1 });
+const EFFECT_ENTRY_ARGS = object({
+    id: EFFECT_ID_FIELD,
+    ..._effectPropertyFields(),
+}, { required: ['id'] });
+const EFFECT_PATCH_ARGS = object({
+    id: EFFECT_ID_FIELD,
+    properties: EFFECT_PROPERTIES_ARGS,
+}, { required: ['id', 'properties'] });
+const EFFECT_TUNE_ARGS = object({
+    targets: array(EFFECT_ID_FIELD, { maxItems: 32, uniqueItems: true }),
+    mode: string({ enum: ['set', 'scale'] }),
+    value: number({ min: 0, max: 3 }),
+}, { required: ['value'] });
+
+const EDIT_LOOK_ARGS = object({
+    add: array(EFFECT_ENTRY_ARGS, { maxItems: 32 }),
+    patches: array(EFFECT_PATCH_ARGS, { maxItems: 32 }),
+    remove: array(EFFECT_ID_FIELD, { maxItems: 32, uniqueItems: true }),
+    removeCategories: array(CATEGORY_ID_FIELD, { maxItems: 16, uniqueItems: true }),
+    grade: GRADE_ID_FIELD,
+    preset: PRESET_ID_FIELD,
+    tune: EFFECT_TUNE_ARGS,
+    clearAll: booleanField(),
+    reset: booleanField(),
+    removeGrade: booleanField(),
+    preserveGrade: booleanField(),
+});
+
+function tools() {
+    return [
+        tool('add-effects', 'Add renderer-backed effects to selected footage.', object({
+            effects: array(EFFECT_ENTRY_ARGS, { minItems: 1, maxItems: 32 }),
+            add: array(EFFECT_ENTRY_ARGS, { minItems: 1, maxItems: 32 }),
+        }, { anyOfRequired: [['effects'], ['add']] }), { canonicalAction: 'edit-look' }),
+        tool('remove-effects', 'Remove named effects or effect categories.', object({
+            effects: array(EFFECT_ID_FIELD, { maxItems: 32, uniqueItems: true }),
+            remove: array(EFFECT_ID_FIELD, { maxItems: 32, uniqueItems: true }),
+            categories: array(CATEGORY_ID_FIELD, { maxItems: 16, uniqueItems: true }),
+            removeCategories: array(CATEGORY_ID_FIELD, { maxItems: 16, uniqueItems: true }),
+        }, {
+            anyOfRequired: [['effects'], ['remove'], ['categories'], ['removeCategories']],
+        }), { canonicalAction: 'edit-look' }),
+        tool('set-effect-properties', 'Edit supported properties on existing renderer effects.', object({
+            effectId: EFFECT_ID_FIELD,
+            effect: EFFECT_ID_FIELD,
+            id: EFFECT_ID_FIELD,
+            properties: EFFECT_PROPERTIES_ARGS,
+            patches: array(EFFECT_PATCH_ARGS, { minItems: 1, maxItems: 32 }),
+        }, {
+            anyOfRequired: [['effectId', 'properties'], ['effect', 'properties'], ['id', 'properties'], ['patches']],
+        }), { canonicalAction: 'edit-look' }),
+        tool('tune-effects', 'Set or scale effect intensity.', object({
+            effects: array(EFFECT_ID_FIELD, { maxItems: 32, uniqueItems: true }),
+            targets: array(EFFECT_ID_FIELD, { maxItems: 32, uniqueItems: true }),
+            mode: string({ enum: ['set', 'scale'] }),
+            value: number({ min: 0, max: 3 }),
+        }, { required: ['value'] }), { canonicalAction: 'edit-look' }),
+        tool('apply-preset', 'Apply a renderer-backed effect preset.', object({
+            preset: PRESET_ID_FIELD,
+            preserveGrade: booleanField(),
+        }, { required: ['preset'] }), { canonicalAction: 'edit-look' }),
+        tool('set-grade', 'Set the project color grade for selected footage.', object({
+            grade: GRADE_ID_FIELD,
+        }, { required: ['grade'] }), { canonicalAction: 'edit-look' }),
+        tool('remove-grade', 'Remove color grading from selected footage.', object(), { canonicalAction: 'edit-look' }),
+        tool('clear-effects', 'Clear effects while optionally preserving the grade.', object({
+            preserveGrade: booleanField(),
+        }), { canonicalAction: 'edit-look' }),
+        tool('reset-look', 'Restore the automated base look.', object(), { canonicalAction: 'edit-look' }),
+        tool('edit-look', 'Apply a normalized combination of effect, grade, preset, and tuning changes.', EDIT_LOOK_ARGS, {
+            visualRepair: true,
+        }),
+    ];
+}
 
 const EFFECT_ALIASES = [
     ['lightStreaks', /\blight\s+streaks?\b|\bprojector\s+light\b/i],
@@ -449,6 +550,7 @@ function normalizeInvocation(invocation, context) {
 
 function manifest() {
     return {
+        contractVersion: 2,
         id: 'effects',
         specialist: 'Effects Agent',
         domain: 'look',
@@ -502,4 +604,5 @@ module.exports = {
     manifest,
     normalizeInvocation,
     planFast,
+    tools,
 };

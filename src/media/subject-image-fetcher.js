@@ -45,8 +45,15 @@ async function fetchSubjectImage({ query, destDir, log = console.log }) {
     if (!slug) return null;
     try { fs.mkdirSync(destDir, { recursive: true }); } catch (_) { /* exists */ }
 
-    const cached = path.join(destDir, `subject-${slug}.png`);
-    if (fs.existsSync(cached)) return cached;
+    // Probe every extension the sanitizer can emit, not just .png. The download
+    // below asks for `subject-<slug>.png`, but base-provider._sanitizeImage returns
+    // a possibly-different path — an opaque image comes back as .jpg. A .png-only
+    // probe would therefore never hit the cache and would silently re-download and
+    // re-score the same subject on every run.
+    for (const cachedExt of ['.png', '.jpg']) {
+        const cached = path.join(destDir, `subject-${slug}${cachedExt}`);
+        if (fs.existsSync(cached)) return cached;
+    }
 
     for (const provider of getProviders()) {
         let results = [];

@@ -1,5 +1,21 @@
 const path = require('path');
 
+// ── What this build explicitly chose, before any file can touch it ───────────
+// build-env.js lists the env keys the creator picked in the UI for THIS build
+// under YTA_ENV_LOCK. Snapshot them NOW: the user .env below loads with
+// override:true and would otherwise replace a live dropdown choice with a stale
+// line in a file (2026-08-04 — a build ran footage scoring on the wrong judge for
+// exactly this reason, with nothing in the log to show it). Restored at the end of
+// the env stack so the final precedence is:
+//     this build's UI choices > project .env > user .env > repo .env
+const _lockedEnv = new Map(
+    String(process.env.YTA_ENV_LOCK || '')
+        .split(',')
+        .map((k) => k.trim())
+        .filter((k) => k && process.env[k] !== undefined)
+        .map((k) => [k, process.env[k]])
+);
+
 // Load app root .env first (has all API keys — single source of truth for credentials)
 const appRootEnv = path.join(__dirname, '..', '..', '.env');
 require('dotenv').config({ path: appRootEnv, quiet: true });
@@ -43,6 +59,12 @@ if (process.env.DOTENV_PATH
     } catch (e) {} // project .env missing is fine
 }
 
+// Last word goes to the UI: put this build's own choices back on top of every file
+// that just loaded. See the YTA_ENV_LOCK note at the top of this file.
+for (const [key, value] of _lockedEnv) {
+    if (process.env[key] !== value) process.env[key] = value;
+}
+
 // Project directory for isolated data (input/output/temp)
 const PROJECT_DIR = process.env.PROJECT_DIR || path.join(__dirname, '..', '..');
 const LOW_BANDWIDTH_MODE = ['1', 'true', 'yes', 'slow', '3g', 'mobile']
@@ -76,9 +98,16 @@ const _RAW_VISION_ENV = {
     QWEN_IMAGE_MODELS: process.env.QWEN_IMAGE_MODELS,
     QWEN_OMNI_MODELS: process.env.QWEN_OMNI_MODELS,
     QWEN_VISION_API_KEY: process.env.QWEN_VISION_API_KEY,
+    QWEN_IMAGE_API_KEY: process.env.QWEN_IMAGE_API_KEY,
+    QWEN_VL_API_KEY: process.env.QWEN_VL_API_KEY,
+    QWEN_OMNI_API_KEY: process.env.QWEN_OMNI_API_KEY,
     VISION_PROVIDER: process.env.VISION_PROVIDER,
     VISION_EXCLUDE_QWEN: process.env.VISION_EXCLUDE_QWEN,
     QWEN_VISION_MAX_CONCURRENCY: process.env.QWEN_VISION_MAX_CONCURRENCY,
+    // Set by the 'bedrock' branch below. Listed here so switching back to aws/lightning
+    // restores the cheap fallback-tier model instead of leaving Sonnet stacked on a path
+    // where Claude is only the emergency fallback.
+    BEDROCK_VISION_CLAUDE_MODEL: process.env.BEDROCK_VISION_CLAUDE_MODEL,
 };
 function _restoreRawVisionEnv() {
     for (const [k, v] of Object.entries(_RAW_VISION_ENV)) {
@@ -97,18 +126,61 @@ function resolveVisionBackend() {
             process.env.QWEN_IMAGE_MODELS = model;
             process.env.QWEN_OMNI_MODELS = model;
         }
-        if (process.env.LIGHTNING_VISION_API_KEY) process.env.QWEN_VISION_API_KEY = process.env.LIGHTNING_VISION_API_KEY;
+        // A Lightning Studio is one self-hosted endpoint, not a pool of independent
+        // DashScope keys. Force every vision lane onto one logical credential so the
+        // runtime cannot multiply retries against the same T4 when the root .env has
+        // several hosted-Qwen keys. vLLM normally ignores Authorization, but the client
+        // still needs a non-empty bearer value when no tunnel auth key is configured.
+        const lightningVisionKey = String(process.env.LIGHTNING_VISION_API_KEY || '').trim() || 'lightning-local';
+        process.env.QWEN_VISION_API_KEY = lightningVisionKey;
+        process.env.QWEN_IMAGE_API_KEY = lightningVisionKey;
+        process.env.QWEN_VL_API_KEY = lightningVisionKey;
+        process.env.QWEN_OMNI_API_KEY = lightningVisionKey;
         // Lightning serves through a cloudflared tunnel that rate-limits/times-out under the
         // build's parallel vision flood — cap concurrency so we don't trip 429/524/529 (which
         // would cool the single self-hosted combo and cascade to Bedrock). Tunable; unset/0=off.
-        // A NAMED tunnel (CF_TUNNEL_TOKEN set) has no 200-request limit, so only the single L4's
-        // compute caps us → allow more in flight. A quick tunnel stays conservative (6).
-        if (!process.env.QWEN_VISION_MAX_CONCURRENCY) process.env.QWEN_VISION_MAX_CONCURRENCY = process.env.CF_TUNNEL_TOKEN ? '12' : '6';
+        // The bundled server runs with MAX_NUM_SEQS=4. A named tunnel removes the tunnel's
+        // request cap, but it does not add GPU capacity, so never default above the server.
+        if (!process.env.QWEN_VISION_MAX_CONCURRENCY) process.env.QWEN_VISION_MAX_CONCURRENCY = '4';
         console.log(`👁️  Vision backend: Lightning.ai (${process.env.QWEN_BASE_URL}, ${process.env.CF_TUNNEL_TOKEN ? 'named tunnel' : 'quick tunnel'}, max-concurrency ${process.env.QWEN_VISION_MAX_CONCURRENCY})`);
     } else if (backend === 'bedrock') {
-        if (!process.env.VISION_PROVIDER) process.env.VISION_PROVIDER = 'bedrock-claude';
+        // Every provider in this mode is a Bedrock one, so a VISION_PROVIDER left over from
+        // GPU-box config (typically 'qwen') is not merely inert — VISION_EXCLUDE_QWEN drops
+        // it from the chain, which silently hands the primary slot to whatever happens to be
+        // next in VISION_PROVIDER_ORDER (bedrock-qwen-vl). Honour an explicit *Bedrock*
+        // choice; ignore a stale non-Bedrock one. VISION_PROVIDER is in _RAW_VISION_ENV, so
+        // the .env value comes back untouched when the user switches away.
+        if (!/^bedrock/.test(String(process.env.VISION_PROVIDER || '').toLowerCase())) {
+            process.env.VISION_PROVIDER = 'bedrock-claude';
+        }
+        // Bedrock mode promotes Claude from emergency fallback to PRIMARY judge for every
+        // candidate, so it runs at the reasoning tier. The scoring rulebook in
+        // vision/ai-vision.js is ~20 rules with an override hierarchy plus one genuinely
+        // subtle call (truthful proxy evidence vs symbolism); that call decides the 5-vs-7
+        // band, and the 5-vs-7 band decides whether a scene gets footage or a placeholder
+        // card. A wrong verdict costs a rebuild, the upgrade costs about a dollar.
+        // BEDROCK_VISION_CLAUDE_MODEL is deliberately NOT consulted as the input here: it
+        // carries the cheap fallback-tier value the aws/lightning chains want, where
+        // bedrock-claude is only an emergency backstop. Override the primary with
+        // VISION_BEDROCK_PRIMARY_MODEL. Writing the resolved value back into
+        // BEDROCK_VISION_CLAUDE_MODEL is safe because that key is in _RAW_VISION_ENV.
+        //
+        // 2026-08-04: the default was `us.anthropic.claude-sonnet-5`, which this account
+        // has NO entitlement for — every call 403'd and silently fell back to
+        // bedrock-qwen-vl. Measured on 9 labelled real race frames
+        // (scripts/vision-judge-bench.js), that stand-in judge scored 0/3 on footage a
+        // human would happily use, which is exactly the "no footage — placeholder stands
+        // in" symptom. Sonnet 4.6 was the only probed model that both keeps good footage
+        // and catches all three rule-traps. Re-measure with the bench before changing it;
+        // scripts/bedrock-vision-probe.js proves entitlement, `ListFoundationModels`
+        // does not.
+        process.env.BEDROCK_VISION_CLAUDE_MODEL =
+            process.env.VISION_BEDROCK_PRIMARY_MODEL || 'us.anthropic.claude-sonnet-4-6';
         process.env.VISION_EXCLUDE_QWEN = '1';
-        console.log('👁️  Vision backend: AWS Bedrock');
+        const _primary = process.env.VISION_PROVIDER === 'bedrock-claude'
+            ? process.env.BEDROCK_VISION_CLAUDE_MODEL
+            : process.env.VISION_PROVIDER;
+        console.log(`👁️  Vision backend: AWS Bedrock (primary ${_primary}, fallback Qwen3 VL 235B → Nova)`);
     } else if (backend === 'dashscope') {
         process.env.QWEN_BASE_URL = process.env.QWEN_DASHSCOPE_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
         console.log('👁️  Vision backend: DashScope (hosted Qwen-VL)');

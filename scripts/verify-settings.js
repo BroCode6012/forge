@@ -5,7 +5,7 @@
 'use strict';
 const path = require('path');
 const assert = require('assert');
-const { applyOptionsToEnv } = require('../src/settings/build-env');
+const { applyOptionsToEnv, ENV_LOCK_VAR } = require('../src/settings/build-env');
 const schema = require('../src/settings/schema');
 
 let pass = 0, fail = 0;
@@ -14,7 +14,7 @@ const ok = (n, c) => c ? (pass++, console.log(`  ✅ ${n}`)) : (fail++, console.
 // ── REFERENCE CONTRACT: options → build environment ──
 function referenceBuildEnv(options, PROJECT_DIR) {
     const buildEnv = { FORCE_COLOR: '0', PROJECT_DIR };
-    const aiVideosMode = String(options.buildProductionMode || '').toLowerCase() === 'aivideos';
+    if (options.visionBackend) buildEnv.VISION_BACKEND = options.visionBackend;
     if (options.audioFileName) buildEnv.BUILD_AUDIO_FILE = options.audioFileName;
     if (options.footageSources) buildEnv.FOOTAGE_SOURCES = JSON.stringify(options.footageSources);
     buildEnv.VIDEO_TITLE = String(options.videoTitle || '').trim();
@@ -25,16 +25,15 @@ function referenceBuildEnv(options, PROJECT_DIR) {
     if (options.buildTheme) buildEnv.BUILD_THEME = options.buildTheme;
     if (options.buildMapStylePack) buildEnv.BUILD_MAP_STYLE_PACK = options.buildMapStylePack;
     if (options.buildProductionMode) buildEnv.BUILD_PRODUCTION_MODE = options.buildProductionMode;
-    if (aiVideosMode) buildEnv.BUILD_FORMAT = 'auto';
     if (options.presenterImage) buildEnv.BUILD_PRESENTER_IMAGE = options.presenterImage;
     if (options.klingAvatar) {
         buildEnv.KLING_AVATAR = '1';
         buildEnv.KLING_RESOLUTION = options.klingResolution || '1080p';
         if (options.klingAvatarPrompt) buildEnv.KLING_AVATAR_PROMPT = options.klingAvatarPrompt;
     }
-    if (options.veoAiVideo || aiVideosMode) {
+    if (options.veoAiVideo) {
         buildEnv.VEO_AI_VIDEO = '1';
-        buildEnv.VEO_SCOPE = aiVideosMode ? 'all' : (options.veoScope || 'directives');
+        buildEnv.VEO_SCOPE = options.veoScope || 'directives';
         const gen = String(options.veoBackend || 'kling').toLowerCase();
         if (gen === 'veo-fal') { buildEnv.AI_VIDEO_BACKEND = 'veo'; buildEnv.VEO_BACKEND = 'fal'; }
         else if (gen === 'veo-gemini') { buildEnv.AI_VIDEO_BACKEND = 'veo'; buildEnv.VEO_BACKEND = 'gemini'; }
@@ -44,7 +43,7 @@ function referenceBuildEnv(options, PROJECT_DIR) {
             buildEnv.KLING_VIDEO_RESOLUTION = options.veoResolution;
         }
     }
-    if (options.fastMedia && !aiVideosMode) buildEnv.BUILD_FAST_MEDIA = 'true';
+    if (options.fastMedia) buildEnv.BUILD_FAST_MEDIA = 'true';
     if (options.buildLanguage) buildEnv.BUILD_LANGUAGE = options.buildLanguage;
     if (options.buildStyleProfile && options.buildStyleProfile !== 'none') buildEnv.BUILD_STYLE_PROFILE = options.buildStyleProfile;
     const isSmartAI = options.smartAI !== false && options.smartAI !== 'false';
@@ -63,6 +62,10 @@ function referenceBuildEnv(options, PROJECT_DIR) {
     const thinkMode = options.aiThinking || options.geminiThinking || 'off';
     buildEnv.AI_THINKING = thinkMode;
     buildEnv.DOTENV_PATH = path.join(PROJECT_DIR, '.env');
+    // Everything above is a choice made in the UI for THIS build, so it must outrank
+    // every .env file the child loads. build-env.js publishes the key list; config.js
+    // restores those values after its dotenv loads. See ENV_LOCK_VAR in build-env.js.
+    buildEnv[ENV_LOCK_VAR] = Object.keys(buildEnv).sort().join(',');
     return { buildEnv, isSmartAI };
 }
 
@@ -72,7 +75,7 @@ const COMBOS = [
     { audioFileName: 'a.mp3', videoTitle: 'T', aiInstructions: 'hard cuts', footageSources: { pexels: true, youtube: false } },
     { buildQuality: 'pro', buildFormat: 'documentary', buildNiche: 'crime', buildTheme: 'crime', buildMapStylePack: 'neon', buildProductionMode: 'faceless', buildLanguage: 'en' },
     { buildProductionMode: 'talkingHead', presenterImage: 'C:/p.png', klingAvatar: true, klingResolution: '720p', klingAvatarPrompt: 'calm' },
-    { buildProductionMode: 'aiVideos', buildFormat: 'listicle', veoAiVideo: false, veoBackend: 'veo-fal', veoResolution: '1080p', fastMedia: true },
+    { buildProductionMode: 'faceless', buildFormat: 'listicle', veoAiVideo: false, veoResolution: '1080p', fastMedia: true },
     { klingAvatar: true }, // resolution default
     { veoAiVideo: true, veoBackend: 'veo-fal', veoScope: 'all', veoResolution: '1080p' },
     { veoAiVideo: true, veoBackend: 'veo-gemini', veoResolution: '720p' },
@@ -85,9 +88,15 @@ const COMBOS = [
     { repeatFromStep: 'media', forceFreshFootage: true },
     { repeatFromStep: 'media', forceFreshFootage: false },
     { repeatFromStep: 'visual-planner', forceFreshFootage: true },
+    { repeatFromStep: 'motion-graphics', forceFreshFootage: true },
     { aiThinking: 'high' },
     { geminiThinking: 'low' },
     { veoAiVideo: false, klingAvatar: false, smartAI: true, clipAnalyzer: true },
+    // The Vision Backend dropdown decides which judge scores every candidate clip.
+    // It reached the app but never the build until 2026-08-04; these combos keep it
+    // in the child env contract.
+    { visionBackend: 'bedrock' },
+    { visionBackend: 'lightning', buildTheme: 'crime', smartAI: false },
 ];
 
 console.log('\n=== build-env.js === main.js reference (across ' + COMBOS.length + ' option combos) ===');

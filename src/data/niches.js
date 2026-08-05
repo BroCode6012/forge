@@ -501,15 +501,28 @@ const NICHES = {
             'TIME RULE: Every time a specific time/date/hour is mentioned (e.g. "5:27 local time", "March 15", "Tuesday") → MUST use typewriter with the time/date as text. Timestamps anchor the news narrative.',
         ],
 
+        // YouTube first. Political news is EVENT footage — a specific speech, a
+        // specific hearing, a specific press conference. Stock libraries have no
+        // clip of the thing the script is actually about; YouTube does.
+        //
+        // This used to be stock-first with `scoutDemote: ['youtube']`, which was
+        // a triple lock: YouTube ranked last here, forced to the back of the
+        // scout's empirical order even when it scored highest, AND hidden from
+        // the Visual Planner so the AI could not pick it. The stated reason was
+        // that broadcast packages fail the raw-footage vision gate (anchor
+        // heads, network watermarks). That was a real observation, but the cure
+        // was a permanent ban that no evidence could lift.
+        //
+        // It is now handled where it belongs, by two live mechanisms instead of
+        // a static table: the Storyboard Scout localises the clean 5–15s window
+        // inside a long YouTube video, and `media/provider-scoreboard.js` sinks
+        // any provider that keeps losing IN THIS BUILD. If YouTube really is
+        // the wrong source for a given video, the run discovers that in three
+        // scenes and re-ranks itself — per topic, from data.
         footagePriority: {
-            video: ['storyblocks', 'reddit', 'youtube'],
+            video: ['youtube', 'reddit', 'storyblocks'],
             image: ['storyblocks']
         },
-        // Scout empirical scoring favors YouTube's keyword-rich titles, but
-        // news packages fail strictRaw vision gates (anchors, watermarks, CGI).
-        // Force YouTube to the back of the empirical providerOrder so cleaner
-        // sources (storyblocks/reddit) get the budget first.
-        scoutDemote: ['youtube'],
 
         preferredMediaType: 'video',
 
@@ -563,8 +576,11 @@ const NICHES = {
             'typewriter'
         ],
 
+        // YouTube first. Celebrity coverage IS video: red carpets, interviews,
+        // award stages, press junkets. Reddit stays second (it mirrors a lot of
+        // the same clips and is fast), stock last — it has models, not people.
         footagePriority: {
-            video: ['reddit', 'storyblocks', 'youtube'],
+            video: ['youtube', 'reddit', 'storyblocks'],
             image: ['storyblocks']
         },
 
@@ -614,8 +630,14 @@ const NICHES = {
             'focusWord', 'typewriter'
         ],
 
+        // YouTube first. Economy news is the closest call in this family —
+        // trading floors and currency close-ups are genuinely well covered by
+        // stock — but the SPECIFIC event (this crash, this rate decision, this
+        // central banker at this podium) is only on YouTube. Stock stays in the
+        // ladder for generic b-roll, and the live scoreboard will lift it back
+        // up on any build where it actually wins.
         footagePriority: {
-            video: ['reddit', 'storyblocks', 'youtube'],
+            video: ['youtube', 'reddit', 'storyblocks'],
             image: ['storyblocks']
         },
 
@@ -673,15 +695,14 @@ const NICHES = {
             'TIME RULE: Every time a specific time/date/hour is mentioned (e.g. "5:27 local time", "March 15", "0600 hours") → MUST use typewriter with the time/date as text. Timestamps anchor the news narrative.',
         ],
 
+        // YouTube first — see the note on news.politics. Military news is the
+        // strongest case of all: stock has generic soldiers and generic jets,
+        // but the specific strike, the specific fleet, the specific border
+        // incident only exists as real footage.
         footagePriority: {
-            video: ['storyblocks', 'reddit', 'youtube'],
+            video: ['youtube', 'reddit', 'storyblocks'],
             image: ['storyblocks']
         },
-        // Scout empirical scoring favors YouTube's keyword-rich titles, but
-        // news packages fail strictRaw vision gates (anchors, watermarks, CGI).
-        // Force YouTube to the back of the empirical providerOrder so cleaner
-        // sources (storyblocks/reddit) get the budget first.
-        scoutDemote: ['youtube'],
 
         defaultPacing: 'moderate',
 
@@ -745,8 +766,11 @@ const NICHES = {
             'typewriter'
         ],
 
+        // YouTube first. Tech news is launch keynotes, teardowns, demos and
+        // conference footage — all natively YouTube. Stock gives you a generic
+        // server room when the script is about one specific product.
         footagePriority: {
-            video: ['reddit', 'storyblocks', 'youtube'],
+            video: ['youtube', 'reddit', 'storyblocks'],
             image: ['storyblocks']
         },
 
@@ -1056,14 +1080,13 @@ const NICHES = {
             'barChart', 'comparisonCard'
         ],
 
+        // YouTube first — same reasoning as news.military (see news.politics for
+        // the full note). This niche carried the identical stock-first +
+        // scoutDemote lock and had the identical problem.
         footagePriority: {
-            video: ['storyblocks', 'reddit', 'youtube'],
+            video: ['youtube', 'reddit', 'storyblocks'],
             image: ['storyblocks']
         },
-        // Same scout problem as news.military — YouTube titles dominate empirical
-        // scoring but documentary news clips fail vision gates (anchor heads,
-        // network watermarks). Push YouTube to the back of providerOrder.
-        scoutDemote: ['youtube'],
 
         excludeVideoProviders: [],
 
@@ -1202,13 +1225,12 @@ const NICHES = {
             'barChart', 'comparisonCard'
         ],
 
+        // YouTube first — same reasoning as news.politics, where the full note
+        // lives. This niche carried the identical stock-first + scoutDemote lock.
         footagePriority: {
-            video: ['storyblocks', 'reddit', 'youtube'],
+            video: ['youtube', 'reddit', 'storyblocks'],
             image: ['storyblocks']
         },
-        // Same scout problem as news.politics — YouTube wins empirical scoring
-        // but anchor-heavy news clips fail strictRaw vision gates. Demote it.
-        scoutDemote: ['youtube'],
 
         excludeVideoProviders: [],
 
@@ -1278,8 +1300,11 @@ const NICHES = {
             'headline', 'lowerThird', 'statCounter', 'focusWord', 'typewriter'
         ],
 
+        // YouTube first. Sport is highlights — the specific goal, the specific
+        // finish, the specific press conference. Reddit stays a strong second
+        // (r/sports mirrors clips fast); stock has anonymous stadium b-roll.
         footagePriority: {
-            video: ['reddit', 'storyblocks', 'youtube'],
+            video: ['youtube', 'reddit', 'storyblocks'],
             image: ['storyblocks']
         },
 
@@ -2331,7 +2356,22 @@ function rewriteQuery(keyword, nicheId, providerKey, scene) {
             'diagram', 'chart', 'infographic', 'illustration', 'schematic',
             'showing', 'featuring', 'real', 'actual',
         ]);
-        const words = query.split(/\s+/).filter(w => !YOUTUBE_STRIP.has(w.toLowerCase()));
+        // Words that name a KIND OF EXPLANATION rather than a non-video medium.
+        // A scene whose own brief asks for a cutaway is searching for exactly
+        // these, and deleting them is how the Jul-29 build searched for a heat
+        // exchanger when the scene needed a heat-exchanger DIAGRAM and shipped
+        // with no media. The decision comes from the scene's Media Hunter
+        // profile (media/packaging-intent.js) — no niche is named here, and with
+        // no profile attached the behaviour is byte-identical to before.
+        const KEEP_IF_REQUESTED = new Set([
+            'diagram', 'chart', 'infographic', 'illustration', 'schematic',
+        ]);
+        const wantsGraphic = !!scene?._mediaHunterProfile?.requestedPackaging?.graphic;
+        const words = query.split(/\s+/).filter((w) => {
+            const lw = w.toLowerCase();
+            if (!YOUTUBE_STRIP.has(lw)) return true;
+            return wantsGraphic && KEEP_IF_REQUESTED.has(lw);
+        });
         // Target 3-6 words for YouTube search
         if (words.length > 6) {
             query = words.slice(0, 6).join(' ');

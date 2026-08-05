@@ -308,10 +308,27 @@ async function analyzeArticleHighlights(imagePath) {
  */
 async function scoreVideoFrame(base64Image, mimeType, keyword, context) {
     try {
-        const contextBlock = context
-            ? `${context.videoTopic ? `\nVideo topic: "${context.videoTopic}"` : ''}${context.sceneText ? `\nScene narration: "${context.sceneText}"` : ''}${context.niche ? `\nContent niche: ${context.niche}` : ''}${context.theme ? `\nVisual theme: ${context.theme}` : ''}${context.tone ? `\nTone: ${context.tone}` : ''}${context.sourceTitle ? `\nSource title/page: "${context.sourceTitle}"` : ''}${context.entities?.length ? `\nKey entities: ${context.entities.slice(0, 5).join(', ')}` : ''}${context.entityContext?.length ? `\nEntity context for relevance (not search terms): ${context.entityContext.slice(0, 8).join(', ')}` : ''}${context.mediaAgent?.viewerNeed ? `\nMedia agent viewer need: ${context.mediaAgent.viewerNeed}` : ''}${context.mediaAgent?.minimumAcceptable || context.mediaAgent?.searchStrategy?.minimumAcceptable ? `\nMedia agent minimum acceptable: ${context.mediaAgent.minimumAcceptable || context.mediaAgent.searchStrategy.minimumAcceptable}` : ''}${context.mediaAgent?.acceptanceTest ? `\nMedia agent acceptance test: ${context.mediaAgent.acceptanceTest}` : ''}${context.mediaAgent?.mandatoryIdentity?.length ? `\nMANDATORY IDENTITY: ${context.mediaAgent.mandatoryIdentity.slice(0, 8).join(', ')} (${context.mediaAgent.identityEvidenceMode || 'frame-visible'})` : ''}${context.mediaAgent?.mandatoryVisible?.length ? `\nMANDATORY FRAME-VISIBLE ENTITY: ${context.mediaAgent.mandatoryVisible.slice(0, 8).join(', ')}` : ''}${context.mediaAgent?.mustShow?.length ? `\nMedia agent must show: ${context.mediaAgent.mustShow.slice(0, 8).join(', ')}` : ''}${context.mediaAgent?.mustAvoid?.length ? `\nMedia agent must avoid: ${context.mediaAgent.mustAvoid.slice(0, 8).join(', ')}` : ''}`
-            : '';
         const hunter = context?.mediaHunter || null;
+        const mediaAgent = context?.mediaAgent || null;
+        const sourceTitle = String(context?.sourceTitle || '').trim();
+        const sourceTitleMayProveIdentity = sourceTitle
+            && /source-proven/i.test(String(mediaAgent?.identityEvidenceMode || ''))
+            && Array.isArray(mediaAgent?.mandatoryIdentity)
+            && mediaAgent.mandatoryIdentity.length > 0;
+        const sourceTitleBlock = sourceTitleMayProveIdentity
+            ? `\nSOURCE METADATA ONLY (NOT PIXELS / NOT VISIBLE TEXT): "${sourceTitle}". Use this only to establish source-proven identity. Never quote it as text seen in the frame and never use it as evidence of an editorial overlay.`
+            : '';
+        // What the editor actually asked to see, in full. Providers only accept a
+        // short query, so the keyword line further down is a shortened version of
+        // this — grading a frame against the shortened form is how a correct clip
+        // gets rejected for "not matching" half of a compound noun.
+        const requestedVisual = String(context?.visualIntent || '').trim();
+        const requestedVisualBlock = requestedVisual && requestedVisual.toLowerCase() !== String(keyword || '').trim().toLowerCase()
+            ? `\nWHAT WAS ACTUALLY REQUESTED (the full request; the search keyword below is a shortened form of this): "${requestedVisual}"`
+            : '';
+        const contextBlock = context
+            ? `${context.videoTopic ? `\nVideo topic: "${context.videoTopic}"` : ''}${requestedVisualBlock}${context.sceneText ? `\nScene narration: "${context.sceneText}"` : ''}${context.niche ? `\nContent niche: ${context.niche}` : ''}${context.theme ? `\nVisual theme: ${context.theme}` : ''}${context.tone ? `\nTone: ${context.tone}` : ''}${sourceTitleBlock}${context.entities?.length ? `\nKey entities: ${context.entities.slice(0, 5).join(', ')}` : ''}${context.entityContext?.length ? `\nEntity context for relevance (not search terms): ${context.entityContext.slice(0, 8).join(', ')}` : ''}${context.mediaAgent?.viewerNeed ? `\nMedia agent viewer need: ${context.mediaAgent.viewerNeed}` : ''}${context.mediaAgent?.minimumAcceptable || context.mediaAgent?.searchStrategy?.minimumAcceptable ? `\nMedia agent minimum acceptable: ${context.mediaAgent.minimumAcceptable || context.mediaAgent.searchStrategy.minimumAcceptable}` : ''}${context.mediaAgent?.acceptanceTest ? `\nMedia agent acceptance test: ${context.mediaAgent.acceptanceTest}` : ''}${context.mediaAgent?.mandatoryIdentity?.length ? `\nMANDATORY IDENTITY: ${context.mediaAgent.mandatoryIdentity.slice(0, 8).join(', ')} (${context.mediaAgent.identityEvidenceMode || 'frame-visible'})` : ''}${context.mediaAgent?.mandatoryVisible?.length ? `\nMANDATORY FRAME-VISIBLE ENTITY: ${context.mediaAgent.mandatoryVisible.slice(0, 8).join(', ')}` : ''}${context.mediaAgent?.mustShow?.length ? `\nMedia agent must show: ${context.mediaAgent.mustShow.slice(0, 8).join(', ')}` : ''}${context.mediaAgent?.mustAvoid?.length ? `\nMedia agent must avoid: ${context.mediaAgent.mustAvoid.slice(0, 8).join(', ')}` : ''}`
+            : '';
         const hunterBlock = hunter
             ? `
 
@@ -335,6 +352,7 @@ If strict raw footage is YES: score 7+ ONLY for clean live-action footage that v
         // overlay defect. The Agent owns this call; we just honor it so the text cap lifts
         // for THAT scene only. Vision still judges whether the right object is clearly shown.
         const allowEditorialText = Boolean(context?.mediaAgent?.textIsSubject || hunter?.allowEditorialText);
+        const overlayVerifiedAbsent = context?.overlayVerifiedAbsent === true;
         const isBackgroundRole = /template-background|generic-broll|background/.test(agentRole);
         const backgroundLiteralBlock = isBackgroundRole
             ? `
@@ -360,6 +378,11 @@ Frames showing FINISHED PRODUCTS in a static/staged way (a single motorcycle, a 
             : '';
         const imageQualityBlock = !(mediaType === 'image' || sourceHint === 'web-image' || /image|still|reference/.test(agentRole))
             ? ''
+            : overlayVerifiedAbsent
+            ? `
+
+INDEPENDENT PIXEL/OCR RECHECK:
+An isolated pixel-only check found NO large editorial headline/banner text in this image. Do not repeat a source caption, provider title, search-result description, filename, or metadata as visible text. Score only the actual pixels and scene relevance.`
             : allowEditorialText
             ? `
 
@@ -387,6 +410,8 @@ IF EDITORIAL OVERLAY IS PRESENT — STRICT OUTPUT CONTRACT:
 For appliance/device error-code scenes specifically: the error text must appear on the appliance's own screen or control panel, not as a rendered headline. A photo of an oven with a "JENN-AIR ERROR CODES" title plastered across the top is editorial overlay — NOT a "touchscreen showing an error code".`;
 
         const prompt = `You are an agentic video editor deciding whether THIS frame works as B-roll for THIS scene.${contextBlock}${hunterBlock}${backgroundLiteralBlock}${imageQualityBlock}
+
+PIXEL-EVIDENCE RULE: A source title, provider caption, search-result description, filename, URL, or prompt text is metadata — it is NOT text visible in the image. Report an editorial text overlay only when the letters themselves are visibly rendered in the supplied pixels.
 
 Search keyword that found this clip (a HINT, not a hard requirement): "${keyword}"
 
@@ -442,7 +467,9 @@ AUTOMATIC PENALTIES (hard caps, override all other scoring):
 - YouTuber/presenter/commentator talking to camera or standing in front of subject → MAX score 3 unless they are the named subject of the scene and the footage is clean
 - Studio set with desk, microphones, teleprompter → MAX score 3
 - Text-heavy screen (headlines, tickers, lower thirds filling >30% of frame) → MAX score 3
-${allowEditorialText
+${overlayVerifiedAbsent
+    ? '- Independent pixel/OCR verification found no editorial overlay. Do not apply an editorial-text cap.'
+    : allowEditorialText
     ? '- This is a TEXTUAL-OBJECT scene: a book/album/poster cover, sign, or document is the subject. Its OWN printed/cover text is fine. Cap (max 4) ONLY external article-header/banner/watermark text added ON TOP of the object photo by a web page.'
     : '- Web/reference image with external editorial/title/banner text pasted over the photo → MAX score 4'}
 - Large/centered/prominent watermark, channel logo, or agency stamp (e.g., IRNA, AFP, Getty, Reuters logo) → MAX score 3
@@ -466,13 +493,24 @@ Reply format (exactly 2 lines):
         const response = await callVisionAI(prompt, base64Image, mimeType);
         const lines = response.trim().split('\n').filter(l => l.trim());
         let description = '';
-        let score = 0;
+        // null = "not parsed yet" — NEVER 0. Every parse path below clamps with
+        // Math.max(1, …), so a successfully parsed score can never BE 0. Using 0
+        // as the sentinel made "I could not read the answer" indistinguishable
+        // from a real verdict: the caller reported it upward as "vision API
+        // unavailable", and one working model rejecting junk could abort an
+        // entire footage race. 1 in 5 judged candidates were binned this way.
+        let score = null;
 
         // Parse: last line with a number is the score, everything before is description
         for (let i = lines.length - 1; i >= 0; i--) {
-            const numMatch = lines[i].trim().match(/^(\d+)$/);
-            if (numMatch) {
-                score = Math.min(10, Math.max(1, parseInt(numMatch[1])));
+            const rawLine = lines[i].trim();
+            // Strict original form FIRST, so every response that parsed before
+            // still parses to exactly the same value; the tolerant form only
+            // ever rescues lines that used to fall through as unparseable.
+            const numMatch = rawLine.match(/^(\d+)$/);
+            const parsed = numMatch ? parseInt(numMatch[1]) : _scoreFromScoreLine(rawLine);
+            if (parsed !== null) {
+                score = Math.min(10, Math.max(1, parsed));
                 description = lines.slice(0, i).join(' ').trim();
                 break;
             }
@@ -480,35 +518,58 @@ Reply format (exactly 2 lines):
 
         // Fallback: find an explicit score-looking number. Do not grab random
         // visual numbers like "4K", model numbers, years, or quantities.
-        if (score === 0) {
+        if (score === null) {
             const scoreLike = response.match(/(?:score|rating)\D{0,16}(10|[0-9])\s*(?:\/\s*10)?/i)
                 || response.match(/(?:^|\n)\s*(10|[0-9])\s*(?:\/\s*10)?\s*$/m);
             if (scoreLike) score = Math.min(10, Math.max(1, parseInt(scoreLike[1])));
             description = lines[0] || response.trim();
         }
 
-        if (score === 0 && description) {
+        // Last resort before paying for a retry: the model merged both lines and
+        // appended the score to its description ("… at dusk. 7" / "… at dusk — 7/10").
+        // A punctuation separator is REQUIRED so this can never lift a number out
+        // of prose ("7 floors", "Route 66.", "capacity 80,000").
+        if (score === null && lines.length) {
+            const tail = lines[lines.length - 1].replace(/[*_`]/g, '').trim();
+            const merged = tail.match(/[.!?:;—–-]\s*(10|\d)\s*(?:\/\s*10)?\s*[.!]?$/);
+            if (merged) {
+                score = Math.min(10, Math.max(1, parseInt(merged[1])));
+                description = lines.slice(0, -1).join(' ').trim()
+                    || tail.slice(0, merged.index).trim();
+            }
+        }
+
+        if (score === null) {
             // Score-less response (model rambled or quota-degraded into prose).
             // 30 candidates per build were thrown away "unjudged" because this
             // returned parseError without ever retrying. ONE strict retry —
             // same provider chain, format-only nudge — recovers most of them.
-            try {
-                const strict = await callVisionAI(
-                    `${prompt}\n\nIMPORTANT: your previous answer omitted the score. Reply with EXACTLY two lines — line 1: one-sentence description; line 2: a single digit score 0-10. Nothing else.`,
-                    base64Image, mimeType
-                );
-                const sLines = strict.trim().split('\n').filter(l => l.trim());
-                for (let i = sLines.length - 1; i >= 0; i--) {
-                    const m = sLines[i].trim().match(/^(10|[0-9])\b/);
-                    if (m) {
-                        return {
-                            score: Math.min(10, Math.max(1, parseInt(m[1]))),
-                            description: sLines.slice(0, i).join(' ').trim() || description,
-                            scoreRetried: true,
-                        };
+            if (description) {
+                try {
+                    const strict = await callVisionAI(
+                        `${prompt}\n\nIMPORTANT: your previous answer omitted the score. Reply with EXACTLY two lines — line 1: one-sentence description; line 2: a single digit score 0-10. Nothing else.`,
+                        base64Image, mimeType
+                    );
+                    const sLines = strict.trim().split('\n').filter(l => l.trim());
+                    for (let i = sLines.length - 1; i >= 0; i--) {
+                        const rawLine = sLines[i].trim();
+                        // Original loose form first (accepts "7 - strong fit"),
+                        // then the decoration-tolerant form ("**7**", "7/10").
+                        const m = rawLine.match(/^(10|[0-9])\b/);
+                        const parsed = m ? parseInt(m[1]) : _scoreFromScoreLine(rawLine);
+                        if (parsed !== null) {
+                            return {
+                                score: Math.min(10, Math.max(1, parsed)),
+                                description: sLines.slice(0, i).join(' ').trim() || description,
+                                scoreRetried: true,
+                            };
+                        }
                     }
-                }
-            } catch (_) { /* fall through to parseError */ }
+                } catch (_) { /* fall through to parseError */ }
+            }
+            // Externally the contract is unchanged: score 0 + parseError true.
+            // Callers MUST keep treating this as "not judged", never as "bad" —
+            // and never as "the service is down" (that is apiError).
             return {
                 score: 0,
                 description,
@@ -519,10 +580,93 @@ Reply format (exactly 2 lines):
 
         return { score, description };
     } catch (err) {
+        // A frame no decoder can read is a DEFECT IN THIS CANDIDATE, not an
+        // outage. Reporting it as apiError would make callers keep the clip
+        // (apiError means "the service broke, don't blame the footage") and a
+        // broken image could win its scene. Third distinct outcome, alongside
+        // parseError ("not judged") and apiError ("service down").
+        if (err?.visionImageUnreadable) {
+            return {
+                score: 0,
+                description: 'Frame could not be decoded by any image reader',
+                imageUnreadable: true,
+                errorMessage: err?.message?.slice(0, 200) || 'undecodable image',
+            };
+        }
         // Surface API failures distinctly from "model said this is bad".
         // Callers can detect apiError=true and refuse to reject the clip
         // (the API was broken, not the candidate).
         return { score: 0, description: 'Vision AI error', apiError: true, errorMessage: err?.message?.slice(0, 200) || 'unknown' };
+    }
+}
+
+/**
+ * Read a score out of a single line that is *meant to be* the score line.
+ *
+ * Tolerates the decoration models actually emit around it — markdown emphasis
+ * ("**7**"), list markers ("- 7"), a label ("Score: 7"), the "/10" suffix and
+ * trailing punctuation ("7.") — while still refusing any line carrying extra
+ * words or digits, so "7 floors", "4K", "2019" and "100" can never be misread
+ * as a score.
+ *
+ * Returns an integer 0-10, or null when the line is not a score line.
+ */
+function _scoreFromScoreLine(line) {
+    const cleaned = String(line || '')
+        .replace(/[*_`~#>[\]]/g, '')
+        .replace(/^[\s\-•–—]+/, '')
+        .trim();
+    if (!cleaned) return null;
+    const m = cleaned.match(/^(?:(?:final|overall)\s+)?(?:score|rating)?\s*[:=-]?\s*(10|\d)\s*(?:\/\s*10)?\s*[.!]?$/i);
+    if (!m) return null;
+    const n = parseInt(m[1], 10);
+    return Number.isFinite(n) ? n : null;
+}
+
+function _parseEditorialOverlayVerification(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return null;
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        const transcript = String(parsed.text || '').trim();
+        const confidence = Math.max(0, Math.min(10, Number(parsed.confidence) || 0));
+        const hasTranscript = transcript.length >= 3
+            && !/^(?:none|no|n\/a|not present|unreadable)$/i.test(transcript);
+        return {
+            present: parsed.present === true && confidence >= 7 && hasTranscript,
+            text: hasTranscript ? transcript : '',
+            confidence,
+            raw: text,
+        };
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * Pixel-only OCR confirmation for editorial overlays. This deliberately omits
+ * source titles, provider captions, keywords, and scene text so metadata cannot
+ * leak into the verdict. A rejection requires both high confidence and an
+ * actual transcription of visible letters.
+ */
+async function verifyEditorialTextOverlay(base64Image, mimeType = 'image/jpeg') {
+    try {
+        const raw = await callVisionAI(`Inspect ONLY the supplied image pixels.
+
+Question: Is there a large editorial headline, title banner, article-cover caption, or supplier watermark digitally overlaid on top of the underlying photo?
+
+Do not count native text physically belonging to the photographed subject, such as a real sign, product label, device screen, document, map label, or building lettering.
+Do not infer or copy any filename, source caption, search-result title, metadata, or prompt wording.
+
+If present=true, transcribe the exact visible overlay letters. If you cannot transcribe at least 3 visible characters, present MUST be false.
+
+Reply with JSON only:
+{"present":false,"text":"","confidence":0}`, base64Image, mimeType, { maxTokens: 120 });
+        return _parseEditorialOverlayVerification(raw);
+    } catch (_) {
+        return null;
     }
 }
 
@@ -649,4 +793,17 @@ async function detectSubjectFocusTrajectory(frames) {
     return out;
 }
 
-module.exports = { analyzeSceneVisuals, analyzeSingleScene, createDefaultAnalysis, analyzeArticleHighlights, scoreVideoFrame, detectSubjectFocus, detectSubjectFocusTrajectory, isVisionAvailable, checkFfmpegAvailable };
+module.exports = {
+    analyzeSceneVisuals,
+    analyzeSingleScene,
+    createDefaultAnalysis,
+    analyzeArticleHighlights,
+    scoreVideoFrame,
+    verifyEditorialTextOverlay,
+    _parseEditorialOverlayVerification,
+    _scoreFromScoreLine,
+    detectSubjectFocus,
+    detectSubjectFocusTrajectory,
+    isVisionAvailable,
+    checkFfmpegAvailable,
+};

@@ -26,7 +26,12 @@ async function main() {
     assert(
         authorSource.includes('!overlaysDisabled() && !fastTest')
         && authorSource.includes('directIcons && !fastTest')
-        && authorSource.includes('if (!fastTest && !openMode)'),
+        // Anchor on the guard's meaning, not its exact punctuation. The check is
+        // "the semantic subject search is gated behind BOTH fastTest and openMode";
+        // extra conjuncts (e.g. && !graphicsOnly) only narrow it further, which
+        // still satisfies the contract. Pinning the full `if (...)` made an
+        // unrelated feature flag fail this gate.
+        && authorSource.includes('!fastTest && !openMode'),
         'Fast Test must keep stage authoring while skipping repeated overlay authoring and semantic icon/subject searches'
     );
 

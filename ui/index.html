@@ -9,6 +9,7 @@
     <title>YTA Empire WEBGL</title>
     <link rel="stylesheet" href="css/style.css?v=16">
     <link rel="stylesheet" href="css/editor-agent.css?v=1">
+    <link rel="stylesheet" href="css/redesign.css?v=1">
     <!-- ── Multi-language font declarations ──
          Local fonts shipped in assets/fonts/. Add new @font-face blocks here
          when adding a language that needs a non-Latin script. Name the file
@@ -36,10 +37,25 @@
 </head>
 
 <body>
+    <!--
+    THESIS: YTA Empire is an edit decision ledger, not a generic purple dashboard.
+    OWN-WORLD: Matte carbon consoles, warm paper text, ruled timecode, lime selection, and amber processing marks.
+    STORY: Import narration, configure the build, inspect the cut, refine it, and render without losing editing context.
+    FIRST VIEWPORT: Compact studio bar above a dominant program monitor, quiet settings bays at both sides, and a sharply ruled timeline below.
+    FORM: Cut Ledger, fourth grounded direction, seed 7c103cde.
+    FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
+    -->
     <div class="app-container">
         <!-- Header -->
         <header class="header">
-            <h1><img src="../assets/icon.png" alt="" class="app-logo">YTA Empire WEBGL <span id="project-name-label" class="project-name-label"></span></h1>
+            <h1>
+                <img src="../assets/icon.png" alt="" class="app-logo">
+                <span class="brand-lockup">
+                    <span class="brand-name">YTA Empire</span>
+                    <span class="brand-edition">WebGL Studio</span>
+                </span>
+                <span id="project-name-label" class="project-name-label"></span>
+            </h1>
             <div class="header-actions">
                 <div class="notif-center" id="notif-center">
                     <button class="notif-bell" id="notif-bell" title="Notifications">
@@ -81,10 +97,14 @@
             <!-- Left Panel - Controls -->
             <aside class="left-panel" id="left-panel">
                 <div class="panel-section source-import-card" id="audio-import-card">
-                    <h3 id="input-source-heading">📁 Import Audio</h3>
+                    <h3 id="input-source-heading">Import narration</h3>
                     <div class="drop-zone" id="drop-zone">
-                        <p>Drag & drop your voiceover here</p>
-                        <p class="small">or click to browse</p>
+                        <svg class="drop-zone-icon" width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+                            <path d="M14 18V5M14 5L9.5 9.5M14 5L18.5 9.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M6 16.5V21.5C6 22.6046 6.89543 23.5 8 23.5H20C21.1046 23.5 22 22.6046 22 21.5V16.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                        </svg>
+                        <p>Drop your voiceover here</p>
+                        <p class="small">MP3 or WAV · click to browse</p>
                         <input type="file" id="file-input" accept=".mp3,.wav" hidden>
                     </div>
                     <div id="audio-info" class="audio-info hidden">
@@ -106,9 +126,8 @@
                     <!-- Production Mode FIRST — it gates which downstream settings apply -->
                     <label style="margin-top:12px">Production Mode:</label>
                     <select id="build-production-mode">
-                        <option value="faceless" selected>🎞️ Faceless (B-roll only)</option>
-                        <option value="talkingHead">🧑‍💼 Talking Head (presenter)</option>
-                        <option value="aiVideos">🤖 AI Videos (all footage AI-generated)</option>
+                        <option value="faceless" selected>Faceless (B-roll only)</option>
+                        <option value="talkingHead">Talking Head (presenter)</option>
                     </select>
                     <div id="production-mode-summary" class="production-mode-summary" aria-live="polite">
                         <div class="production-mode-summary-head">
@@ -122,14 +141,14 @@
                         <label>Presenter Image:</label>
                         <div style="display:flex;gap:6px;align-items:center">
                             <input id="presenter-image-path" type="text" readonly placeholder="Using built-in placeholder" style="flex:1;font-size:11px;padding:4px 6px;background:#1a1a1a;color:#ccc;border:1px solid #333;border-radius:4px" />
-                            <button id="btn-pick-presenter" class="btn-small" style="padding:4px 10px;font-size:11px;background:#1a3a2a;color:#8fc;border:1px solid #2a5a4a;border-radius:4px;cursor:pointer;font-weight:600;" title="Choose the presenter's photo (a clear, front-facing face works best)">📷 Browse</button>
+                            <button id="btn-pick-presenter" class="btn-small" style="padding:4px 10px;font-size:11px;background:#1a3a2a;color:#8fc;border:1px solid #2a5a4a;border-radius:4px;cursor:pointer;font-weight:600;" title="Choose the presenter's photo (a clear, front-facing face works best)">Browse</button>
                             <button id="btn-clear-presenter" class="btn-small" style="padding:4px 8px;font-size:11px;background:#2a1a1a;color:#f88;border:1px solid #5a2a2a;border-radius:4px;cursor:pointer;" title="Clear (use the built-in placeholder)">✕</button>
                         </div>
                         <small style="display:block; margin-top:4px; color:#888">A person photo used as the on-camera presenter. Leave empty to use the built-in placeholder.</small>
                         <div id="kling-avatar-row" style="margin-top:10px;padding:8px;background:#141414;border:1px solid #2a2a2a;border-radius:6px">
                             <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;margin:0">
                                 <input id="kling-avatar-enabled" type="checkbox" style="width:auto" />
-                                🎤 Animate presenter with Kling AI (lip-synced avatar)
+                                Animate presenter with Kling AI (lip-synced avatar)
                             </label>
                             <small style="display:block; margin-top:4px; color:#c99">Uses your Kling web credits (~20 per presenter clip). OFF = static presenter photo. Run <code>npm run kling-cookies</code> once to log in.</small>
                             <div id="kling-avatar-opts" style="display:none;margin-top:8px">
@@ -143,38 +162,6 @@
                                 <small style="display:block; margin-top:4px; color:#888">Optional style direction for HOW the presenter delivers (tone, energy, gestures). Kling layers it over your narration audio.</small>
                             </div>
                         </div>
-                    </div>
-                    <!-- AI Videos: narration or script/file/URL source -->
-                    <div id="ai-videos-script-group" class="ai-story-card mode-hidden">
-                        <div class="ai-story-card-head">
-                            <div>
-                                <strong>Story source</strong>
-                                <small>Choose whether narration audio or written text drives the production.</small>
-                            </div>
-                            <span id="ai-videos-source-badge" class="mode-badge">Auto</span>
-                        </div>
-                        <label for="ai-videos-input-mode">Build from:</label>
-                        <select id="ai-videos-input-mode">
-                            <option value="auto" selected>Auto — use audio when loaded, otherwise script</option>
-                            <option value="audio">Narration audio</option>
-                            <option value="script">Story / script text</option>
-                        </select>
-                        <div id="ai-videos-routing-status" class="source-routing-status"></div>
-                        <div class="ai-story-editor-head">
-                            <label for="ai-videos-script">Story / Script:</label>
-                            <span id="ai-videos-script-count">0 words</span>
-                        </div>
-                        <div class="script-source-actions">
-                            <button type="button" id="btn-import-ai-script" class="btn-small">Import file</button>
-                            <button type="button" id="btn-toggle-ai-script-url" class="btn-small">Load URL</button>
-                            <button type="button" id="btn-clear-ai-script" class="btn-small btn-muted">Clear</button>
-                        </div>
-                        <div id="ai-videos-url-row" class="script-url-row hidden">
-                            <input id="ai-videos-script-url" type="url" inputmode="url" placeholder="https://example.com/story.txt">
-                            <button type="button" id="btn-load-ai-script-url" class="btn-small">Fetch</button>
-                        </div>
-                        <textarea id="ai-videos-script" rows="8" placeholder="Paste a story or script here, import a document, or load a public text URL. The text is split into visual beats and sent to the selected AI video generator."></textarea>
-                        <div id="ai-videos-script-source-status" class="script-source-status">Paste text, import TXT/Markdown/DOCX/ODT/subtitle files, or load a public URL.</div>
                     </div>
                     <div id="quality-group">
                     <label>Quality Tier:</label>
@@ -202,7 +189,7 @@
                     <div id="language-group">
                     <label style="margin-top:12px">Language:</label>
                     <select id="build-language">
-                        <option value="auto" selected>🌐 Auto-Detect (from audio)</option>
+                        <option value="auto" selected>Auto-Detect (from audio)</option>
                         <!-- Options populated dynamically from src/languages.js registry.
                              Adding a language = add one entry to languages.js; dropdown
                              updates automatically on app reload. -->
@@ -210,7 +197,7 @@
                     <small style="display:block; margin-top:4px; color:#888">Auto-detect reads the language from your narration audio. Override to force a specific language or re-run a build in another language.</small>
                     </div>
                 <div class="panel-section" id="subtitles-group">
-                    <h3>💬 Subtitles</h3>
+                    <h3>Subtitles</h3>
                     <label class="source-toggle">
                         <input type="checkbox" id="subtitles-enabled"> Burn-in Subtitles
                     </label>
@@ -223,29 +210,29 @@
                     <div id="niche-style-group">
                     <label style="margin-top:12px">Niche Preset:</label>
                     <select id="build-niche">
-                        <option value="auto" selected>🤖 Auto-Detect</option>
+                        <option value="auto" selected>Auto-Detect</option>
                         <optgroup label="── Explainer / Documentary ──">
-                            <option value="explainer">📽️ Explainer / Documentary</option>
-                            <option value="trueCrime">🔪 True Crime Documentary</option>
-                            <option value="documentary">🎬 Nature Documentary</option>
-                            <option value="finance">💰 Finance / Business</option>
-                            <option value="luxury">💎 Luxury / Fashion</option>
+                            <option value="explainer">Explainer / Documentary</option>
+                            <option value="trueCrime">True Crime Documentary</option>
+                            <option value="documentary">Nature Documentary</option>
+                            <option value="finance">Finance / Business</option>
+                            <option value="luxury">Luxury / Fashion</option>
                             <option value="sports">⚽ Sports Documentary</option>
-                            <option value="history">📜 History Documentary</option>
-                            <option value="motivation">🔥 Motivation</option>
-                            <option value="food">🍎 Food / Health</option>
-                            <option value="diy">🔧 DIY / Lifehacks</option>
-                            <option value="militaryDoc">🪖 Military Documentary</option>
-                            <option value="techExplainer">🔬 Tech Explainer</option>
+                            <option value="history">History Documentary</option>
+                            <option value="motivation">Motivation</option>
+                            <option value="food">Food / Health</option>
+                            <option value="diy">DIY / Lifehacks</option>
+                            <option value="militaryDoc">Military Documentary</option>
+                            <option value="techExplainer">Tech Explainer</option>
                         </optgroup>
                         <optgroup label="── Breaking News ──">
-                            <option value="news">📰 News (Auto)</option>
-                            <option value="newsPolitics">🏛️ News / Politics</option>
-                            <option value="newsEconomy">📈 News / Economy</option>
-                            <option value="military">🎖️ Military / Geopolitics</option>
+                            <option value="news">News (Auto)</option>
+                            <option value="newsPolitics">News / Politics</option>
+                            <option value="newsEconomy">News / Economy</option>
+                            <option value="military">Military / Geopolitics</option>
                             <option value="newsCelebrity">⭐ News / Celebrity</option>
-                            <option value="tech">💻 Tech News</option>
-                            <option value="newsSport">🏆 Sports News</option>
+                            <option value="tech">Tech News</option>
+                            <option value="newsSport">Sports News</option>
                         </optgroup>
                     </select>
                     <small style="display:block; margin-top:4px; color:#888">Sets niche, footage strategy, MG types &amp; search policy</small>
@@ -253,26 +240,26 @@
                     <div id="theme-style-group">
                     <label style="margin-top:12px">Theme / Style:</label>
                     <select id="build-theme">
-                        <option value="auto" selected>🤖 Auto (Niche Default)</option>
-                        <option value="crime">🔪 Crime / Dark</option>
-                        <option value="history">📜 History / Elegant</option>
+                        <option value="auto" selected>Auto (Niche Default)</option>
+                        <option value="crime">Crime / Dark</option>
+                        <option value="history">History / Elegant</option>
                         <option value="modern">⚡ Modern / Vibrant</option>
-                        <option value="minimal">🌿 Minimal / Organic</option>
+                        <option value="minimal">Minimal / Organic</option>
                         <option value="standard">⚪ Standard / Clean</option>
-                        <option value="warm-editorial">🍂 Warm Editorial / Paper</option>
-                        <option value="luxury">👑 Luxury / Gold</option>
-                        <option value="nature">🌲 Nature / Forest</option>
+                        <option value="warm-editorial">Warm Editorial / Paper</option>
+                        <option value="luxury">Luxury / Gold</option>
+                        <option value="nature">Nature / Forest</option>
                     </select>
                     <small style="display:block; margin-top:4px; color:#888">Controls background, colors, MG style, fonts</small>
                     </div>
                     <div id="map-style-group">
                     <label style="margin-top:12px">Map Style Pack:</label>
                     <select id="build-map-style-pack">
-                        <option value="auto" selected>🤖 Auto (Niche/Theme Default)</option>
-                        <option value="neon">💠 Neon — cyan/gold overlays (classic)</option>
+                        <option value="auto" selected>Auto (Niche/Theme Default)</option>
+                        <option value="neon">Neon — cyan/gold overlays (classic)</option>
                         <option value="invasions">⚔️ Invasions — red vs blue, white outlines, grayscale satellite</option>
-                        <option value="editorial">📰 Editorial — orange-red gradient, black outlines, label pills</option>
-                        <option value="geopolitical">🗺️ Geopolitical — solid color-coded political basemap</option>
+                        <option value="editorial">Editorial — orange-red gradient, black outlines, label pills</option>
+                        <option value="geopolitical">Geopolitical — solid color-coded political basemap</option>
                     </select>
                     <small style="display:block; margin-top:4px; color:#888">Visual overlay style for map scenes (polygons, route, pins, labels, basemap filter)</small>
                     </div>
@@ -364,7 +351,7 @@
                     <div id="veo-ai-video-row" style="margin-top:12px;padding:8px;background:#141414;border:1px solid #2a2a2a;border-radius:6px">
                         <label id="veo-ai-video-toggle-row" style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;margin:0">
                             <input id="veo-ai-video-enabled" type="checkbox" style="width:auto" />
-                            <span id="veo-ai-video-title">🎬 AI Video — generate select scenes</span>
+                            <span id="veo-ai-video-title">AI Video — generate select scenes</span>
                             <span id="veo-ai-video-mode-badge" class="mode-badge hidden">Required</span>
                         </label>
                         <small id="veo-ai-video-description" style="display:block; margin-top:4px; color:#c99">Generates B-roll with an AI video model instead of downloading it. OFF = normal stock/YouTube footage.</small>
@@ -430,10 +417,11 @@
                     <div id="repeat-settings-group">
                     <label style="margin-top:8px">Repeat From Step:</label>
                     <select id="repeat-from-step">
-                        <option value="visual-planner">Visual Planner (keep scene split)</option>
+                        <option value="motion-graphics">Motion Graphics + QA (keep plan &amp; media)</option>
+                        <option value="visual-planner" selected>Visual Planner (keep scene split)</option>
                         <option value="media">Media Download (keep VP plan)</option>
                     </select>
-                    <small class="ai-instructions-hint">Use the Repeat Step button to skip everything above the selected step during testing.</small>
+                    <small class="ai-instructions-hint" id="repeat-from-step-hint">Motion Graphics + QA rebuilds only the existing graphics, proof-renders them, and preserves planning, footage, narration, transitions, and SFX.</small>
                     </div>
                     <div id="force-fresh-group">
                     <label class="toggle-row" style="margin-top:8px">
@@ -450,12 +438,11 @@
                     </label>
                     <small class="ai-instructions-hint" id="fast-media-hint">OFF for production. One-shot mode uses unique random footage and skips semantic asset searches, footage relevance vision, icon/subject acquisition, and bespoke overlay authoring. Stage authoring and Motion QA remain active. It automatically returns to OFF after launch.</small>
                     </details>
-                    <div id="script-build-note" class="mode-note hidden">Script-driven AI Video builds regenerate directly from the current story source and generator settings.</div>
                     </div><!-- /build panel -->
                 </div><!-- /settings-tabbed -->
 
                 <button id="btn-generate" class="btn btn-large btn-primary" disabled>
-                    🚀 Generate Video
+                    Generate first cut
                 </button>
                 <button id="btn-repeat-step" class="btn btn-large" disabled style="margin-top:8px">
                     Repeat Selected Step
@@ -467,10 +454,22 @@
 
             <!-- Center - Preview -->
             <main class="preview-area" id="preview-area">
+                <div class="preview-stage-bar">
+                    <div class="preview-stage-title">
+                        <span>Program monitor</span>
+                        <strong>Master preview</strong>
+                    </div>
+                    <div class="preview-stage-readouts" aria-label="Preview status">
+                        <span class="monitor-status"><i></i>Ready</span>
+                        <span>16:9</span>
+                        <span>1920 × 1080</span>
+                    </div>
+                </div>
                 <div class="preview-container" id="preview-container">
                     <div id="preview-placeholder" class="preview-placeholder">
-                        <p>Preview will appear here</p>
-                        <p class="small">Import audio to get started</p>
+                        <span class="placeholder-mark">00:00:00:00</span>
+                        <p>No cut loaded</p>
+                        <p class="small">Import narration to create your first sequence</p>
                     </div>
                     <!-- Multi-track video container (16:9 composition frame) -->
                     <div id="video-transition-container" class="video-transition-container hidden">
@@ -522,6 +521,7 @@
                 </div>
                 <!-- Preview zoom toolbar -->
                 <div class="preview-zoom-bar">
+                    <span class="preview-toolbar-label">Monitor scale</span>
                     <select id="preview-zoom-select" class="preview-zoom-select">
                         <option value="fit" selected>Fit</option>
                         <option value="25">25%</option>
@@ -550,7 +550,7 @@
                     <!-- Build Log panel — clean, phase-grouped, per-scene status -->
                     <div id="build-log" class="build-log hidden">
                         <div class="build-log-head">
-                            <span class="build-log-title">📋 Build Log</span>
+                            <span class="build-log-title">Build log</span>
                             <button id="build-log-toggle" class="build-log-toggle" title="Collapse / expand">▾</button>
                         </div>
                         <div id="build-log-body" class="build-log-body"></div>
@@ -829,6 +829,12 @@
                                     <option value="neon">Neon</option>
                                     <option value="cinematic">Cinematic</option>
                                     <option value="elegant">Elegant</option>
+                                </select>
+                            </div>
+                            <div class="property-row" id="mg-shell-row">
+                                <label>Structure</label>
+                                <select id="mg-shell" class="property-select">
+                                    <!-- Populated dynamically from the graphic-shell capability registry -->
                                 </select>
                             </div>
                             <div class="property-row" id="mg-subtype-row" style="display:none">
@@ -1256,35 +1262,35 @@
                 <div class="timeline-tracks">
                     <!-- Video Track 1 (Main) -->
                     <div class="timeline-row">
-                        <div class="track-label">🎬 Video 1</div>
+                        <div class="track-label">Video 1</div>
                         <div class="track-content video-track" id="video-track">
                             <div class="timeline-empty">Import audio to see timeline</div>
                         </div>
                     </div>
                     <!-- Video Track 2 (B-Roll) -->
                     <div class="timeline-row">
-                        <div class="track-label">🎥 Video 2</div>
+                        <div class="track-label">Video 2</div>
                         <div class="track-content video-track" id="timeline-video-track-2">
                             <div class="track-empty">B-roll footage</div>
                         </div>
                     </div>
                     <!-- Video Track 3 (Overlays) -->
                     <div class="timeline-row">
-                        <div class="track-label">🖼️ Video 3</div>
+                        <div class="track-label">Video 3</div>
                         <div class="track-content video-track" id="timeline-video-track-3">
                             <div class="track-empty">Overlays & graphics</div>
                         </div>
                     </div>
                     <!-- Audio Track (Voiceover) -->
                     <div class="timeline-row">
-                        <div class="track-label">🎙️ Voice</div>
+                        <div class="track-label">Voice</div>
                         <div class="track-content audio-track" id="audio-track">
                             <div class="track-empty">Voiceover will appear here</div>
                         </div>
                     </div>
                     <!-- SFX Track -->
                     <div class="timeline-row">
-                        <div class="track-label">🔊 SFX</div>
+                        <div class="track-label">SFX</div>
                         <div class="track-content sfx-track" id="sfx-track">
                             <div class="track-empty">Sound effects</div>
                         </div>
@@ -1310,6 +1316,7 @@
     <script src="../src/data/languages.js"></script>
     <script src="../src/data/language-helper.js"></script>
     <script src="../src/data/themes.js"></script>
+    <script src="../src/render/graphic-shells.js"></script>
     <script src="../src/render/mg-registry.js"></script>
     <script src="../src/render/effect-presets.js"></script>
     <script src="js/renderer-data.js"></script>
@@ -1329,7 +1336,8 @@
         </div>
         <div style="padding:14px 18px;">
           <div style="font-size:11px;color:#999;margin-bottom:10px;line-height:1.5;">
-            Each Lightning account gives ~$15/month free GPU credit (~18 usable hours). Builds rotate through these accounts; when one runs low it switches to the next, and falls back to Bedrock if all are spent. When an account's credit refreshes (monthly), click <b>Reset</b> to put it back in play.
+            Builds rotate through the configured Lightning GPU accounts; when one reaches its local hour budget or Lightning rejects it for insufficient credit, the app switches to the next and falls back to Bedrock if none are usable. When an account's credit refreshes, click <b>Reset</b> to put it back in play.
+            <div style="margin-top:6px;color:#fbbf24;">New accounts default to <b>T4</b>. Lightning may still enforce account-specific billing, credit, or payment checks before GPU compute can start. Confirm each teamspace's spending limit before enabling builds.</div>
           </div>
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;padding:8px 10px;background:#1a1726;border:1px solid #2e2640;border-radius:6px;">
             <label style="font-size:12px;color:#ddd;font-weight:600;white-space:nowrap;">⚡ Build uses:</label>
@@ -1351,7 +1359,7 @@
               <label style="font-size:11px;color:#bbb;">Studio name<input id="la-studioName" type="text" placeholder="my-first-one" style="width:100%"></label>
               <label style="font-size:11px;color:#bbb;">Teamspace<input id="la-teamspace" type="text" placeholder="vision-model" style="width:100%"></label>
               <label style="font-size:11px;color:#bbb;">Username<input id="la-user" type="text" placeholder="your-username" style="width:100%"></label>
-              <label style="font-size:11px;color:#bbb;">Machine<input id="la-machine" type="text" value="L4" style="width:100%"></label>
+              <label style="font-size:11px;color:#bbb;">Machine<input id="la-machine" type="text" value="T4" style="width:100%"></label>
               <label style="font-size:11px;color:#bbb;">Budget (GPU hours)<input id="la-budget" type="number" value="18" min="1" step="1" style="width:100%"></label>
             </div>
             <div id="lightning-add-error" style="display:none;color:#f87171;font-size:11px;margin-top:8px;"></div>
@@ -1365,6 +1373,7 @@
     <script src="../src/settings/schema.js"></script>
     <script src="js/settings-io.js"></script>
     <script src="js/app.js"></script>
+    <script src="js/editor-agent-request-retry.js"></script>
     <script src="js/editor-agent-panel.js"></script>
 </body>
 

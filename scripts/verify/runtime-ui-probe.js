@@ -9,34 +9,58 @@ const puppeteer = require('puppeteer-core');
 
 const BROWSER_WS = process.argv[2];
 if (!BROWSER_WS) { console.error('usage: node runtime-ui-probe.js <browserWsEndpoint>'); process.exit(2); }
+// Remember the last step announced, so a watchdog kill names where it died.
+// Without it the only output is "exceeded N seconds" — no failing check, no
+// step, nothing to act on, which is the least useful thing a gate can say.
+let lastStep = 'startup';
+const baseLog = console.log.bind(console);
+console.log = (...args) => {
+  const first = typeof args[0] === 'string' ? args[0] : '';
+  if (first.startsWith('[ui-probe] ')) lastStep = first.slice('[ui-probe] '.length);
+  baseLog(...args);
+};
+// A hang guard, not a performance budget. Every individual step already carries
+// its own timeout, so this only has to stop a wedged run from hanging the suite
+// forever. It sat at 140s while this probe grew to drive ~10 live Editor Agent
+// round-trips, so a slow model reply killed the whole report — every check lost
+// to something that was not a defect. It stays under the harness's own 240s cap
+// so the probe is still the one that gets to explain itself.
 const watchdog = setTimeout(() => {
-  console.error('PROBE ERROR runtime UI probe exceeded 140 seconds');
+  console.error(`PROBE ERROR runtime UI probe exceeded 210 seconds (last step: ${lastStep})`);
   process.exit(4);
-}, 140_000);
+}, 210_000);
 const withTimeout = (promise, label, ms = 15_000) => Promise.race([
   promise,
   new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out`)), ms)),
 ]);
 const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function readHyperframesPreviewTime(page, timeoutMs = 5_000) {
+// `accept` lets a caller keep reading until the preview clock has actually been
+// driven. The first successful read is not automatically an answer: a preview
+// frame that has just been attached reports 0 because nothing has driven it yet,
+// which is indistinguishable from a preview that is stuck — and taking that
+// first sample failed a playback that was working. Whatever the deadline
+// produces is still returned, so a genuinely stuck preview keeps failing.
+async function readHyperframesPreviewTime(page, timeoutMs = 5_000, accept = null) {
   const deadline = Date.now() + timeoutMs;
   let lastError = null;
+  let last = 0;
   while (Date.now() < deadline) {
     const frame = page.frames().filter(candidate => candidate.url().startsWith('hf-preview://project/')).at(-1);
     if (frame) {
       try {
-        return await frame.evaluate(() => Number(
+        last = await frame.evaluate(() => Number(
           document.getElementById('yta-hyperframes')?.dataset.previewTime || 0
         ));
+        if (!accept || accept(last)) return last;
       } catch (error) {
         lastError = error;
       }
     }
     await wait(100);
   }
-  if (lastError) throw lastError;
-  return 0;
+  if (lastError && !last) throw lastError;
+  return last;
 }
 
 async function readHyperframesSceneVisual(page, timeoutMs = 10_000) {
@@ -58,6 +82,9 @@ async function readHyperframesSceneVisual(page, timeoutMs = 10_000) {
           const headlineTitle = headline?.querySelector('.hf-agentic-title, .hf-title');
           const headlineCard = headline?.querySelector('.hf-agentic-copy, .hf-copy-shell');
           const headlineAccentRule = headline?.querySelector('.hf-agentic-rule');
+          const headlineWordCascadeWords = [
+            ...(headline?.querySelectorAll('.hf-agentic-word-cascade .hf-agentic-word') || []),
+          ];
           const sceneIcon = scene?.querySelector('.hf-scene-icon');
           return {
             sceneCount: document.querySelectorAll('.hf-scene').length,
@@ -80,6 +107,13 @@ async function readHyperframesSceneVisual(page, timeoutMs = 10_000) {
             headlineClass: headline?.className || '',
             headlineVariant: headline?.dataset?.hfVariant || '',
             headlineAnimation: headline?.dataset?.hfAnimation || '',
+            headlineWordCascadeCount: headlineWordCascadeWords.length,
+            headlineWordCascadeOpacities: headlineWordCascadeWords.map((word) => (
+              Number.parseFloat(getComputedStyle(word).opacity)
+            )),
+            headlineWordCascadeTransforms: headlineWordCascadeWords.map((word) => (
+              getComputedStyle(word).transform
+            )),
             headlineAccentRuleDisplay: headlineAccentRule
               ? getComputedStyle(headlineAccentRule).display
               : '',
@@ -230,6 +264,18 @@ async function waitForPageState(page, evaluator, {
   const readyMatches = readyPages.filter(p => !p.isClosed() && /ui\/index\.html/i.test(p.url()));
   page = readyMatches[readyMatches.length - 1] || page;
   page.setDefaultTimeout(10_000);
+  // Ready means "app.js finished and the project is loaded", not "the markup
+  // parsed". The tab buttons waited for above live in index.html, so they exist
+  // before app.js has built anything — the fixed sleep after them covered the
+  // gap on a warm machine and intermittently did not on a cold one. The first
+  // check to touch the app's state then died with a bare "state is not defined"
+  // that named no step and looked like a product fault.
+  await waitForPageState(page, () => (
+    typeof state === 'object'
+      && state !== null
+      && Array.isArray(state.videoPlan?.scenes)
+      && state.videoPlan.scenes.length > 0
+  ), { label: 'renderer app state', timeoutMs: 25_000 });
 
   const results = [];
   const check = (name, pass, detail) => { results.push({ name, pass, detail }); };
@@ -247,6 +293,25 @@ async function waitForPageState(page, evaluator, {
   check('SETTINGS_SCHEMA loaded', globals.schema, `${globals.schemaCount} settings`);
   check('SettingsIO loaded (collect+apply)', globals.settingsIO);
   check('app.js executed (window fns present)', globals.appLoaded);
+  const liveCapabilities = await withTimeout(
+    page.evaluate(() => window.electronAPI.agentCapabilities()),
+    'live capability catalog'
+  );
+  check('Editor Agent publishes live versioned worker contracts',
+    liveCapabilities?.success === true
+      && liveCapabilities.contractVersion === 2
+      && liveCapabilities.capabilityCount === 10
+      && liveCapabilities.toolCount >= 60
+      && liveCapabilities.capabilities.every((capability) => (
+        capability.contractVersion === 2
+          && capability.tools?.length === capability.actions?.length
+          && /^[a-f0-9]{64}$/.test(capability.contractHash || '')
+      )),
+    JSON.stringify({
+      contractVersion: liveCapabilities?.contractVersion,
+      capabilityCount: liveCapabilities?.capabilityCount,
+      toolCount: liveCapabilities?.toolCount,
+    }));
 
   // 2. Tab bar + panels structure
   console.log('[ui-probe] tabs');
@@ -281,11 +346,21 @@ async function waitForPageState(page, evaluator, {
     for (const sec of panel.querySelectorAll(':scope > .panel-section')) {
       // The tab container itself is a .panel-section — it's SUPPOSED to be a direct child.
       if (sec.classList.contains('settings-tabbed')) continue;
-      // A section is "settings" if it holds form controls; the Import Audio dropzone has none.
-      const hasControls = sec.querySelector('input,select,textarea');
+      // A section is "settings" if it holds a control the user can actually see
+      // and touch. The narration dropzone owns a hidden <input type="file"> that
+      // the whole card acts as the click target for — machinery, not a setting.
+      //
+      // This used to be an allowlist on the heading text ("Import Audio"), so
+      // renaming that heading to "Import narration" reported the importer as a
+      // stray settings section and failed a layout that had not moved a pixel.
+      // A gate pinned to a human-facing label breaks on copy edits and says
+      // nothing about the thing it exists to protect. Visibility is the real
+      // question, and it keeps the gate honest the other way too: drop a live
+      // dropdown into that card tomorrow and it is flagged, heading or no.
+      const hasControls = Array.from(sec.querySelectorAll('input,select,textarea'))
+        .some((el) => el.getClientRects().length > 0);
       const h3 = (sec.querySelector('h3')?.textContent || '').trim();
-      const isImport = /import audio/i.test(h3);
-      if (hasControls && !isImport) out.push(h3 || sec.className);
+      if (hasControls) out.push(h3 || sec.className);
     }
     return { stray: out };
   }), 'layout');
@@ -370,7 +445,6 @@ async function waitForPageState(page, evaluator, {
     const faceless = {
       format: visible('format-group'),
       presenter: visible('presenter-image-row'),
-      script: visible('ai-videos-script-group'),
       audioImporter: visible('audio-import-card'),
       generatorToggle: visible('veo-ai-video-enabled'),
       fallback: visible('fallback-media-settings'),
@@ -379,79 +453,18 @@ async function waitForPageState(page, evaluator, {
     setMode('talkingHead');
     const talkingHead = {
       presenter: visible('presenter-image-row'),
-      script: visible('ai-videos-script-group'),
       format: visible('format-group'),
-    };
-
-    setMode('aiVideos');
-    const inputMode = document.getElementById('ai-videos-input-mode');
-    inputMode.value = 'script';
-    inputMode.dispatchEvent(new Event('change', { bubbles: true }));
-    const textarea = document.getElementById('ai-videos-script');
-    textarea.value = 'A city wakes before dawn. A hidden signal changes everything.';
-    textarea.dispatchEvent(new Event('input', { bubbles: true }));
-    const aiScript = {
-      script: visible('ai-videos-script-group'),
-      audioImporter: visible('audio-import-card'),
-      format: visible('format-group'),
-      language: visible('language-group'),
-      smartAI: visible('smart-ai-group'),
-      mapStyle: visible('map-style-group'),
-      referenceStyle: visible('reference-style-group'),
-      generatorOptions: visible('veo-ai-video-opts'),
-      generatorToggle: visible('veo-ai-video-enabled'),
-      scope: visible('veo-scope-group'),
-      fallback: visible('fallback-media-settings'),
-      buildTab: visible(document.querySelector('.stab-btn[data-stab="build"]')?.id || '__none__'),
-      buildTabHidden: document.querySelector('.stab-btn[data-stab="build"]')?.classList.contains('mode-hidden') === true,
-      buttonText: document.getElementById('btn-generate')?.textContent.trim(),
-    };
-
-    inputMode.value = 'audio';
-    inputMode.dispatchEvent(new Event('change', { bubbles: true }));
-    const aiAudio = {
-      language: visible('language-group'),
-      smartAI: visible('smart-ai-group'),
-      mapStyle: visible('map-style-group'),
-      referenceStyle: visible('reference-style-group'),
-      fallback: visible('fallback-media-settings'),
-      fallbackProfile: document.getElementById('fallback-media-settings')?.classList.contains('fallback-media-settings') === true,
-      buildTabHidden: document.querySelector('.stab-btn[data-stab="build"]')?.classList.contains('mode-hidden') === true,
-      buttonText: document.getElementById('btn-generate')?.textContent.trim(),
     };
 
     setMode('faceless');
-    return { faceless, talkingHead, aiScript, aiAudio };
+    return { faceless, talkingHead };
   }), 'production mode matrix');
   check('faceless shows B-roll controls only', modeMatrix.faceless.format
     && !modeMatrix.faceless.presenter
-    && !modeMatrix.faceless.script
     && modeMatrix.faceless.generatorToggle
     && modeMatrix.faceless.fallback, JSON.stringify(modeMatrix.faceless));
   check('talking-head exposes presenter controls', modeMatrix.talkingHead.presenter
-    && !modeMatrix.talkingHead.script
     && modeMatrix.talkingHead.format, JSON.stringify(modeMatrix.talkingHead));
-  check('AI script route removes audio-only/dead controls', modeMatrix.aiScript.script
-    && !modeMatrix.aiScript.format
-    && !modeMatrix.aiScript.audioImporter
-    && !modeMatrix.aiScript.language
-    && !modeMatrix.aiScript.smartAI
-    && !modeMatrix.aiScript.mapStyle
-    && !modeMatrix.aiScript.referenceStyle
-    && modeMatrix.aiScript.generatorOptions
-    && !modeMatrix.aiScript.generatorToggle
-    && !modeMatrix.aiScript.scope
-    && !modeMatrix.aiScript.fallback
-    && modeMatrix.aiScript.buildTabHidden
-    && /from Script/i.test(modeMatrix.aiScript.buttonText), JSON.stringify(modeMatrix.aiScript));
-  check('AI audio route restores full Director/fallback controls', modeMatrix.aiAudio.language
-    && modeMatrix.aiAudio.smartAI
-    && modeMatrix.aiAudio.mapStyle
-    && modeMatrix.aiAudio.referenceStyle
-    && modeMatrix.aiAudio.fallback
-    && modeMatrix.aiAudio.fallbackProfile
-    && !modeMatrix.aiAudio.buildTabHidden
-    && /from Audio/i.test(modeMatrix.aiAudio.buttonText), JSON.stringify(modeMatrix.aiAudio));
 
   const sourceImporter = await withTimeout(page.evaluate(() => ({
     hasAudio: !!state.audioFile,
@@ -509,6 +522,14 @@ async function waitForPageState(page, evaluator, {
   }, playbackTarget), 'nonzero seek');
   await page.keyboard.press('Space');
   await new Promise((resolve) => setTimeout(resolve, 1200));
+  // Read the preview clock while it is still playing. Stopping is allowed to
+  // park the preview back at its idle position, so reading afterwards measured
+  // the stop rather than the play, and reported 0 for a playback whose every
+  // other signal was correct.
+  const previewTime = await withTimeout(
+    readHyperframesPreviewTime(page, 5_000, (value) => value > playbackTarget),
+    'HyperFrames playback time'
+  );
   const playbackAfter = await withTimeout(page.evaluate(() => {
     const result = {
       stateTime: state.currentTime,
@@ -521,10 +542,6 @@ async function waitForPageState(page, evaluator, {
     stopPlayback();
     return result;
   }), 'nonzero playback state');
-  const previewTime = await withTimeout(
-    readHyperframesPreviewTime(page),
-    'HyperFrames playback time'
-  );
   check('HyperFrames Play preserves a selected nonzero timeline position',
     Math.abs(playbackBefore.stateTime - playbackTarget) < 0.08
       && playbackBefore.audioTime > playbackTarget - 0.2
@@ -538,21 +555,11 @@ async function waitForPageState(page, evaluator, {
   const screenshotDir = String(process.env.YTA_UI_SCREENSHOT_DIR || '').trim();
   if (screenshotDir) {
     fs.mkdirSync(screenshotDir, { recursive: true });
-    const captureMode = async (name, mode, sourceMode, scrollTarget, tabName = 'setup') => {
-      await page.evaluate(({ mode, sourceMode, scrollTarget, tabName }) => {
+    const captureMode = async (name, mode, scrollTarget, tabName = 'setup') => {
+      await page.evaluate(({ mode, scrollTarget, tabName }) => {
         const modeSelect = document.getElementById('build-production-mode');
         modeSelect.value = mode;
         modeSelect.dispatchEvent(new Event('change', { bubbles: true }));
-        if (mode === 'aiVideos' && sourceMode) {
-          const inputMode = document.getElementById('ai-videos-input-mode');
-          inputMode.value = sourceMode;
-          inputMode.dispatchEvent(new Event('change', { bubbles: true }));
-          if (sourceMode === 'script') {
-            const textarea = document.getElementById('ai-videos-script');
-            textarea.value = 'At dawn, a silent city receives a signal from deep space. Every screen turns on at once.';
-            textarea.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-        }
         document.querySelector(`.stab-btn[data-stab="${tabName}"]`)?.click();
         const left = document.getElementById('left-panel');
         if (left) left.scrollTop = 0;
@@ -560,17 +567,12 @@ async function waitForPageState(page, evaluator, {
           const target = document.getElementById(scrollTarget);
           if (target) left.scrollTop = Math.max(0, target.offsetTop - 12);
         }
-      }, { mode, sourceMode, scrollTarget, tabName });
+      }, { mode, scrollTarget, tabName });
       await new Promise((resolve) => setTimeout(resolve, 200));
       await page.screenshot({ path: path.join(screenshotDir, `${name}.png`), fullPage: false });
     };
     await captureMode('faceless', 'faceless');
     await captureMode('talking-head', 'talkingHead');
-    await captureMode('ai-videos-script', 'aiVideos', 'script');
-    await captureMode('ai-videos-script-source', 'aiVideos', 'script', 'ai-videos-script-group');
-    await captureMode('ai-videos-generator-script', 'aiVideos', 'script', null, 'media');
-    await captureMode('ai-videos-audio', 'aiVideos', 'audio');
-    await captureMode('ai-videos-generator-audio', 'aiVideos', 'audio', null, 'media');
     await page.evaluate(() => {
       const modeSelect = document.getElementById('build-production-mode');
       modeSelect.value = 'faceless';
@@ -1248,14 +1250,22 @@ async function waitForPageState(page, evaluator, {
   });
 
   console.log('[ui-probe] selective in-place graphic text color');
-  await withTimeout(page.evaluate(() => {
+  // Find the clip and click it in the same breath, and keep doing it until the
+  // app confirms the selection.
+  //
+  // The timeline is rebuilt with innerHTML, so the element a query returns can be
+  // detached before the click lands — the click then goes to a node that is no
+  // longer on the page and nothing happens, silently. The previous edit in this
+  // suite rewrites the lower-third's text, which triggers exactly that rebuild,
+  // so a single click here was a coin flip and the timeout that followed blamed
+  // the selection instead of the race.
+  await waitForPageState(page, () => {
+    if (state.selectedMgIndex === 0) return true;
     const graphicClip = document.querySelector('.mg-clip[data-mg-index="0"]');
-    if (!graphicClip) throw new Error('Runtime lower-third timeline clip is unavailable');
+    if (!graphicClip) return false;
     graphicClip.click();
-  }), 'select runtime lower third');
-  await withTimeout(page.waitForFunction(() => (
-    state.selectedMgIndex === 0
-  ), { timeout: 10_000 }), 'selected lower-third Agent scope', 15_000);
+    return state.selectedMgIndex === 0;
+  }, { label: 'selected lower-third Agent scope', timeoutMs: 15_000 });
 
   await planAndApplyAgent(
     page,
@@ -1587,6 +1597,136 @@ async function waitForPageState(page, evaluator, {
       && compoundBefore.scope?.iconRefs?.length === 1,
     JSON.stringify(compoundBefore.scope));
 
+  console.log('[ui-probe] dynamically discovered word-cascade animation');
+  const wordCascadePlanText = await planAndApplyAgent(
+    page,
+    'Give the headline a word cascade animation',
+    'word cascade animation'
+  );
+  await waitForPageState(page, () => (
+    state.videoPlan?.motionGraphics?.find((item) => item.id === 'runtime-headline')?.animation
+      === 'wordCascade'
+  ), {
+    label: 'word cascade animation state',
+    timeoutMs: 30_000,
+  });
+  // The claim under test is "the words do not arrive together". That is a claim
+  // about the entrance WINDOW, not about one instant, so scan the window instead
+  // of betting the whole check on a single seek.
+  //
+  // A seek pauses the timeline, so polling at one time cannot help: the frame is
+  // frozen and the two words read the same opacity forever. Landing a few
+  // milliseconds before the stagger opens therefore failed a green product — the
+  // canvas-renderer half of this very check kept passing while the page half
+  // flipped run to run. Scanning is also the stricter reading: a headline whose
+  // words truly pop in together now fails at every point in the window, not just
+  // at 0.36s.
+  let wordCascadeMid = null;
+  for (const at of [0.36, 0.30, 0.42, 0.33, 0.39, 0.45, 0.48]) {
+    await page.evaluate(async (time) => {
+      await seekToTime(time);
+    }, at);
+    const visual = await waitForHyperframesVisual(page, (candidate) => (
+      candidate.headlineAnimation === 'wordCascade'
+        && candidate.headlineWordCascadeCount === 2
+    ));
+    if (visual) wordCascadeMid = visual;
+    if (new Set(visual?.headlineWordCascadeOpacities || []).size > 1) break;
+  }
+  await page.evaluate(async () => {
+    await seekToTime(0.9);
+  });
+  const wordCascadeLate = await waitForHyperframesVisual(page, (visual) => (
+    visual.headlineAnimation === 'wordCascade'
+      && visual.headlineWordCascadeOpacities.every((opacity) => opacity > 0.98)
+  ));
+  const wordCascadeRuntime = await page.evaluate(() => {
+    const renderer = new window.MGRenderer({
+      createOrUpdate: (id, canvas) => ({ id, width: canvas.width, height: canvas.height }),
+    }, 30);
+    renderer.setPreviewScale(0.25);
+    const graphic = {
+      type: 'headline',
+      text: 'Runtime headline',
+      subtext: '',
+      position: 'center',
+      style: 'clean',
+      subType: 'standard',
+      animation: 'wordCascade',
+      duration: 2,
+      _totalFrames: 60,
+      _animationSpeed: 1,
+    };
+    const countAlphaPixels = () => {
+      const data = renderer._ctx.getImageData(
+        0,
+        0,
+        renderer._canvas.width,
+        renderer._canvas.height
+      ).data;
+      let count = 0;
+      for (let index = 3; index < data.length; index += 4) {
+        if (data[index] > 4) count++;
+      }
+      return count;
+    };
+    const earlyState = renderer._computeAnimation(
+      'wordCascade',
+      4,
+      30,
+      window.AnimationUtils.computeAnimationState(4, 30, graphic),
+      graphic
+    );
+    renderer.renderMG(graphic, 4, { themeId: 'standard' });
+    const earlyPixels = countAlphaPixels();
+    renderer.renderMG(graphic, 28, { themeId: 'standard' });
+    const latePixels = countAlphaPixels();
+    const registered = typeof renderer._animComputers.wordCascade === 'function';
+    renderer.destroy();
+    return {
+      animation: state.videoPlan?.motionGraphics?.find(
+        (item) => item.id === 'runtime-headline'
+      )?.animation || '',
+      registryAnimations: window._mgRegistry?.getAnimationsForCategory?.('headline') || [],
+      canvasRenderer: {
+        registered,
+        earlyPixels,
+        latePixels,
+        hasCascadeState: Boolean(earlyState.wordCascade),
+      },
+    };
+  });
+  check('A new registry animation is discovered, executed, and rendered without a router command edit',
+    /Motion Graphics Editor/i.test(wordCascadePlanText)
+      && !/needs a stronger editing tool/i.test(wordCascadePlanText)
+      && wordCascadeRuntime.animation === 'wordCascade'
+      && wordCascadeRuntime.registryAnimations.includes('wordCascade')
+      && wordCascadeRuntime.canvasRenderer.registered
+      && wordCascadeRuntime.canvasRenderer.hasCascadeState
+      && wordCascadeRuntime.canvasRenderer.earlyPixels > 0
+      && wordCascadeRuntime.canvasRenderer.latePixels > wordCascadeRuntime.canvasRenderer.earlyPixels
+      && wordCascadeMid?.headlineWordCascadeCount === 2
+      && new Set(wordCascadeMid?.headlineWordCascadeOpacities || []).size > 1
+      && wordCascadeLate?.headlineWordCascadeOpacities?.every((opacity) => opacity > 0.98),
+    JSON.stringify({
+      plan: wordCascadePlanText,
+      runtime: wordCascadeRuntime,
+      mid: wordCascadeMid,
+      late: wordCascadeLate,
+    }));
+  await withTimeout(
+    page.evaluate(() => document.getElementById('agent-undo')?.click()),
+    'word cascade animation undo'
+  );
+  await waitForPageState(page, (before) => {
+    const headline = state.videoPlan?.motionGraphics?.find((item) => item.id === 'runtime-headline');
+    return headline?.animation === before.headline.animation;
+  }, {
+    label: 'word cascade animation undo state',
+    timeoutMs: 30_000,
+    argument: compoundBefore,
+  });
+
   console.log('[ui-probe] isolated headline duration agent');
   const durationMediaBefore = await page.evaluate(() => (
     state.videoPlan?.scenes?.[0]?.mediaFile || ''
@@ -1811,41 +1951,6 @@ async function waitForPageState(page, evaluator, {
       && /creates a new folder/i.test(newProjectDialog.subfolderState.hint)
       && newProjectDialog.dialogClosed,
     JSON.stringify(newProjectDialog.subfolderState));
-
-  console.log('[ui-probe] AI Videos IPC dry run');
-  const aiVideosDryRun = await withTimeout(page.evaluate(async () => {
-    const result = await window.electronAPI.runAiVideos({
-      script: 'A storm gathers over the city. The power grid fails. One building remains lit.',
-      generate: false,
-      backend: 'kling',
-      resolution: '720p',
-      qualityTier: 'standard',
-      themeId: 'modern',
-      nicheId: 'tech',
-      videoTitle: 'The Last Light',
-      aiInstructions: 'cinematic aerial movement',
-    });
-    const saved = await window.electronAPI.loadProjectFile();
-    return {
-      result,
-      savedMode: saved?.videoPlan?.productionMode,
-      savedSource: saved?.videoPlan?._generatedFrom,
-      savedTitle: saved?.videoPlan?.scriptContext?.title,
-      sceneCount: saved?.videoPlan?.scenes?.length || 0,
-      savedInputMode: saved?.settings?.aiVideosInputMode,
-      savedScriptWords: String(saved?.settings?.aiVideosScript || '').trim().split(/\s+/).filter(Boolean).length,
-    };
-  }), 'AI Videos dry-run IPC', 30_000);
-  check('script pipeline IPC persists a renderer-ready project plan',
-    aiVideosDryRun.result?.success === true
-      && aiVideosDryRun.result?.dryRun === true
-      && aiVideosDryRun.savedMode === 'aiVideos'
-      && aiVideosDryRun.savedSource === 'ai-videos-script'
-      && aiVideosDryRun.savedTitle === 'The Last Light'
-      && aiVideosDryRun.sceneCount > 0
-      && aiVideosDryRun.savedInputMode === 'script'
-      && aiVideosDryRun.savedScriptWords > 0,
-    JSON.stringify(aiVideosDryRun));
 
   // Report
   console.log('\n=== RUNTIME UI PROBE ===');

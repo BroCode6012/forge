@@ -96,14 +96,26 @@ function _resolveRange(scenes, scope, plan) {
 function visualMatchesRefs(visual, refs, collection = '', fallbackIndex = -1) {
     const visualRefs = Array.isArray(refs) ? refs : [];
     if (!visual || !visualRefs.length) return false;
-    const id = String(visual.id || visual.clipId || '');
-    const replacedId = String(visual._agentReplacesVisualId || '');
+    const identityIds = new Set([
+        visual.id,
+        visual.clipId,
+        visual?.mgData?.id,
+        visual?.mgData?.clipId,
+        visual._agentReplacesVisualId,
+        visual?.mgData?._agentReplacesVisualId,
+        ...(Array.isArray(visual._agentReplacesVisualIds)
+            ? visual._agentReplacesVisualIds
+            : []),
+        ...(Array.isArray(visual?.mgData?._agentReplacesVisualIds)
+            ? visual.mgData._agentReplacesVisualIds
+            : []),
+    ].map((value) => String(value || '')).filter(Boolean));
     const timing = windowOf(visual, collection === 'templateScenes' ? 4 : 3);
     const type = String(visual.type || visual.templateType || '');
     return visualRefs.some((ref) => {
         const refId = String(ref?.id || '');
-        if (refId && (refId === id || refId === replacedId)) return true;
-        if (refId && (id || replacedId)) return false;
+        if (refId && identityIds.has(refId)) return true;
+        if (refId && identityIds.size) return false;
         if (
             ref?.collection
             && String(ref.collection) === String(collection)
@@ -134,6 +146,151 @@ function resolveVisualTargets(plan, scope) {
     return all.filter(({ visual }) => overlaps(visual, fromSec, toSec));
 }
 
+function _iconMomentId(scene, sceneIndex, momentIndex) {
+    const sourceSceneIndex = Number(scene?.sourceSceneIndex ?? scene?.index ?? sceneIndex);
+    const clipId = String(
+        scene?.clipId
+        || `scene-${Number.isFinite(sourceSceneIndex) ? Math.trunc(sourceSceneIndex) : sceneIndex}`
+    );
+    return `${clipId}:icon:${momentIndex}`;
+}
+
+function _iconRefMatches(scene, sceneIndex, moment, momentIndex, ref) {
+    if (!scene || !moment || !ref) return false;
+    const id = _iconMomentId(scene, sceneIndex, momentIndex);
+    if (ref.id && String(ref.id) === id) return true;
+
+    const clipId = String(scene.clipId || '');
+    if (ref.clipId && String(ref.clipId) !== clipId) return false;
+    const sourceSceneIndex = Number(scene.sourceSceneIndex ?? scene.index ?? sceneIndex);
+    if (
+        ref.sourceSceneIndex != null
+        && Number(ref.sourceSceneIndex) !== sourceSceneIndex
+    ) return false;
+    if (
+        ref.sceneIndex != null
+        && Number(ref.sceneIndex) !== Number(sceneIndex)
+    ) return false;
+    if (
+        ref.momentIndex != null
+        && Number(ref.momentIndex) !== Number(momentIndex)
+    ) return false;
+
+    return Boolean(
+        ref.clipId
+        || ref.sourceSceneIndex != null
+        || ref.sceneIndex != null
+        || ref.momentIndex != null
+    );
+}
+
+function verifyStableScopeTargets(plan, scope, options = {}) {
+    const kind = String(scope?.kind || 'project');
+    if (kind === 'project' || kind === 'range') {
+        return {
+            safe: false,
+            reason: `${kind} scope has no stable target identity`,
+            targetCount: 0,
+            missing: [],
+            ambiguous: [],
+        };
+    }
+
+    const operations = Array.isArray(options.operations) ? options.operations : [];
+    const capabilityIds = new Set(
+        operations.map((operation) => String(operation?.capabilityId || '')).filter(Boolean)
+    );
+    const clipRefs = Array.isArray(scope?.clipRefs) ? scope.clipRefs : [];
+    const visualRefs = Array.isArray(scope?.visualRefs) ? scope.visualRefs : [];
+    const iconRefs = Array.isArray(scope?.iconRefs) ? scope.iconRefs : [];
+    const checkClips = kind !== 'visual' && clipRefs.length > 0;
+    const checkVisuals = (
+        kind === 'visual'
+        || capabilityIds.has('graphics')
+    ) && visualRefs.length > 0;
+    const checkIcons = capabilityIds.has('icons') && iconRefs.length > 0;
+
+    const missing = [];
+    const ambiguous = [];
+    let targetCount = 0;
+    const record = (type, ref, count) => {
+        targetCount++;
+        if (count === 0) missing.push({ type, id: String(ref?.id || ref?.clipId || '') });
+        else if (count > 1) ambiguous.push({ type, id: String(ref?.id || ref?.clipId || ''), count });
+    };
+
+    if (checkClips) {
+        const scenes = (plan?.scenes || [])
+            .map((scene, index) => ({ scene, index }))
+            .filter(({ scene }) => scene && !scene.isMGScene);
+        clipRefs.forEach((ref) => {
+            const count = scenes.filter(({ scene, index }) => (
+                sceneMatchesClipRefs(scene, [ref], index)
+            )).length;
+            record('clip', ref, count);
+        });
+    }
+
+    if (checkVisuals) {
+        const entries = ['mgScenes', 'templateScenes', 'motionGraphics'].flatMap((collection) => (
+            Array.isArray(plan?.[collection])
+                ? plan[collection].map((visual, index) => ({ collection, index, visual }))
+                : []
+        ));
+        visualRefs.forEach((ref) => {
+            const count = entries.filter(({ collection, index, visual }) => (
+                visualMatchesRefs(visual, [ref], collection, index)
+            )).length;
+            record('visual', ref, count);
+        });
+    }
+
+    if (checkIcons) {
+        const entries = [];
+        (plan?.scenes || []).forEach((scene, sceneIndex) => {
+            if (!scene || scene.isMGScene) return;
+            (Array.isArray(scene._iconMoments) ? scene._iconMoments : [])
+                .forEach((moment, momentIndex) => {
+                    if (moment) entries.push({ scene, sceneIndex, moment, momentIndex });
+                });
+        });
+        iconRefs.forEach((ref) => {
+            const count = entries.filter(({ scene, sceneIndex, moment, momentIndex }) => (
+                _iconRefMatches(scene, sceneIndex, moment, momentIndex, ref)
+            )).length;
+            record('icon', ref, count);
+        });
+    }
+
+    if (targetCount === 0) {
+        return {
+            safe: false,
+            reason: 'scope has no stable referenced targets',
+            targetCount,
+            missing,
+            ambiguous,
+        };
+    }
+    if (missing.length || ambiguous.length) {
+        return {
+            safe: false,
+            reason: missing.length
+                ? 'one or more scoped targets no longer exist'
+                : 'one or more scoped targets are ambiguous',
+            targetCount,
+            missing,
+            ambiguous,
+        };
+    }
+    return {
+        safe: true,
+        reason: 'all scoped targets still resolve exactly once',
+        targetCount,
+        missing,
+        ambiguous,
+    };
+}
+
 function containingSceneIndex(plan, time) {
     const scenes = plan?.scenes || [];
     let closest = -1;
@@ -160,6 +317,7 @@ module.exports = {
     resolveVisualTargets,
     sceneMatchesClipRefs,
     scopeRange,
+    verifyStableScopeTargets,
     visualMatchesRefs,
     windowOf,
 };

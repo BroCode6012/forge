@@ -52,6 +52,24 @@ function _signature(operation) {
     });
 }
 
+function _routerManifests() {
+    return registry.listManifests().map((manifest) => ({
+        id: manifest.id,
+        specialist: manifest.specialist,
+        description: manifest.description,
+        scopes: manifest.scopes,
+        contractVersion: manifest.contractVersion,
+        contractHash: manifest.contractHash,
+        tools: (manifest.tools || []).filter((toolSpec) => (
+            toolSpec.action === toolSpec.canonicalAction
+        )),
+        vocabulary: manifest.vocabulary || {},
+        examples: manifest.examples || [],
+        limitations: manifest.limitations || [],
+        risk: manifest.risk,
+    }));
+}
+
 function coerceSmartPlan(raw, context = {}) {
     const source = raw && typeof raw === 'object' ? raw : {};
     const operations = [];
@@ -95,20 +113,12 @@ function coerceSmartPlan(raw, context = {}) {
 }
 
 function _buildPrompt(context) {
-    const manifests = registry.listManifests().map((manifest) => ({
-        id: manifest.id,
-        specialist: manifest.specialist,
-        description: manifest.description,
-        scopes: manifest.scopes,
-        actions: manifest.actions,
-        vocabulary: manifest.vocabulary || {},
-        examples: manifest.examples || [],
-    }));
+    const manifests = _routerManifests().map(({ risk: _risk, ...manifest }) => manifest);
     return `You are the Editor Supervisor inside a professional video editor.
 Your job is to understand the user's editing intent and delegate it to the LIVE specialist capabilities below.
-You never invent actions, effect names, presets, fields, or capability ids.
+You never invent actions, effect names, presets, fields, argument names, or capability ids.
 You never directly edit project JSON.
-Use zero or more invocations. Each invocation must use one declared capability id and one declared action.
+Use zero or more invocations. Each invocation must use one declared capability id, one declared tool action, and only arguments allowed by that tool schema.
 Do not repeat an edit already listed under existingOperations.
 If an existing operation has exclusiveCapability=true, it fully owns that capability for this request.
 When one or more existing or new operations are present, the summary must describe a FUTURE proposed edit.
@@ -118,6 +128,7 @@ Prefer semantic combinations when the user describes a mood instead of naming co
 Whole-scene visualRefs and iconRefs are composition context, not permission to edit every layer.
 When the user names a target such as an icon, lower third, caption, transition, effect, audio cue, or footage clip, only capabilities that own that named target may act unless the user explicitly requests multiple targets.
 For copy-only or text-style-only requests, use the matching in-place graphics action. Never regenerate a graphic just to change its wording or text color.
+For "another style", "different look", or "redesign this graphic", use an in-place graphics property edit with a concrete different style and/or supported variant. Preserve the graphic id, content, timing, and collection; do not regenerate it.
 Keep arguments minimal and concrete.
 When exact-playhead visual grounding is present, treat its target id, target type,
 visible description, and semantic part as stronger evidence than a vague noun in
@@ -161,20 +172,11 @@ Return:
 }
 
 function _buildRecoveryPrompt(context) {
-    const manifests = registry.listManifests().map((manifest) => ({
-        id: manifest.id,
-        specialist: manifest.specialist,
-        description: manifest.description,
-        scopes: manifest.scopes,
-        actions: manifest.actions,
-        vocabulary: manifest.vocabulary || {},
-        examples: manifest.examples || [],
-        risk: manifest.risk,
-    }));
+    const manifests = _routerManifests();
     return `You are the recovery planner for an autonomous video-editing supervisor.
 The user already approved the editing intent and exact scope. One specialist attempt failed verification.
 Choose at most ONE live capability invocation that can still satisfy the same intent.
-Never broaden or change the scope. Never increase risk. Never invent capability ids, actions, fields, effects, presets, or assets.
+Never broaden or change the scope. Never increase risk. Never invent capability ids, actions, fields, arguments, effects, presets, or assets.
 Prefer a more precise action or safer arguments. If no declared capability can recover safely, return null.
 Do not claim the edit succeeded.
 

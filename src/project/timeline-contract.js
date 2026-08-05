@@ -5,9 +5,10 @@
     if (typeof module !== 'undefined' && module.exports) module.exports = api;
     if (root) root.YtaTimelineContract = api;
 }(typeof window !== 'undefined' ? window : null, function createTimelineContract() {
-    const VERSION = 2;
+    const VERSION = 3;
     const DEFAULT_FPS = 30;
     const MIN_DURATION_SEC = 0.05;
+    const DEFAULT_CONTINUITY_TRACK = 'video-track-1';
 
     function finiteNumber(value, fallback = NaN) {
         const parsed = Number(value);
@@ -189,6 +190,167 @@
         });
     }
 
+    function _mediaOffsetSeconds(scene) {
+        const candidates = [
+            scene?.mediaOffset,
+            scene?.templateMediaOffset,
+            scene?.clipOffset,
+            scene?.sourceOffset,
+            scene?.sourceStart,
+            scene?.trimStart,
+            scene?.mediaStart,
+            scene?.videoStart,
+            scene?.startOffset,
+        ];
+        for (const candidate of candidates) {
+            const numeric = finiteNumber(candidate);
+            if (numeric >= 0) return numeric;
+        }
+        return 0;
+    }
+
+    function buildContinuityHolds(scenes, options = {}) {
+        if (!Array.isArray(scenes) || !scenes.length) return [];
+        const fps = Math.max(1, finiteNumber(options.fps, DEFAULT_FPS));
+        const totalDuration = Math.max(0, finiteNumber(options.totalDuration, 0));
+        const trackId = String(options.trackId || DEFAULT_CONTINUITY_TRACK);
+        const gapThreshold = Math.max(
+            MIN_DURATION_SEC,
+            finiteNumber(options.gapThreshold, Math.max(MIN_DURATION_SEC, 2 / fps))
+        );
+        const sourceScenes = scenes
+            .filter((scene) => (
+                scene
+                && scene.disabled !== true
+                && scene.isMGScene !== true
+                && String(scene.trackId || DEFAULT_CONTINUITY_TRACK) === trackId
+                && finiteNumber(scene.endTime) > finiteNumber(scene.startTime, 0)
+            ))
+            .map((scene, index) => ({
+                scene,
+                index,
+                start: Math.max(0, finiteNumber(scene.startTime, 0)),
+                end: Math.max(0, finiteNumber(scene.endTime, 0)),
+            }))
+            .sort((left, right) => left.start - right.start || left.end - right.end);
+        if (!sourceScenes.length) return [];
+
+        const resolvedDuration = totalDuration > 0
+            ? totalDuration
+            : Math.max(...sourceScenes.map((entry) => entry.end));
+        const coverage = [];
+        for (const entry of sourceScenes) {
+            const last = coverage[coverage.length - 1];
+            if (!last || entry.start > last.end + gapThreshold) {
+                coverage.push({
+                    start: entry.start,
+                    end: entry.end,
+                    first: entry,
+                    last: entry,
+                });
+            } else {
+                last.end = Math.max(last.end, entry.end);
+                if (entry.end >= last.last.end) last.last = entry;
+            }
+        }
+
+        const gaps = [];
+        if (coverage[0].start > gapThreshold) {
+            gaps.push({
+                start: 0,
+                end: coverage[0].start,
+                source: coverage[0].first,
+                holdMode: 'head',
+            });
+        }
+        for (let index = 0; index < coverage.length - 1; index++) {
+            const current = coverage[index];
+            const next = coverage[index + 1];
+            if (next.start - current.end <= gapThreshold) continue;
+            gaps.push({
+                start: current.end,
+                end: next.start,
+                source: current.last,
+                holdMode: 'tail',
+            });
+        }
+        const finalCoverage = coverage[coverage.length - 1];
+        if (resolvedDuration - finalCoverage.end > gapThreshold) {
+            gaps.push({
+                start: finalCoverage.end,
+                end: resolvedDuration,
+                source: finalCoverage.last,
+                holdMode: 'tail',
+            });
+        }
+
+        return gaps.map((gap) => {
+            const source = gap.source.scene;
+            const duration = Math.max(MIN_DURATION_SEC, gap.end - gap.start);
+            const sourceDuration = Math.max(
+                MIN_DURATION_SEC,
+                finiteNumber(source.endTime, 0) - finiteNumber(source.startTime, 0)
+            );
+            const mediaOffset = _mediaOffsetSeconds(source);
+            const freezeTime = gap.holdMode === 'head'
+                ? mediaOffset
+                : mediaOffset + Math.max(0, sourceDuration - 1 / fps);
+            const sourceClipId = String(
+                source.clipId
+                || buildClipId(source, gap.source.index, {
+                    startTime: gap.source.start,
+                    endTime: gap.source.end,
+                })
+            );
+            const startMs = Math.round(gap.start * 1000);
+            const endMs = Math.round(gap.end * 1000);
+            return {
+                clipId: `continuity-${safeToken(sourceClipId, 'source')}-${startMs}-${endMs}`,
+                isContinuityHold: true,
+                reason: 'timeline-continuity',
+                trackId,
+                sourceClipId,
+                sourceSceneIndex: resolveSourceSceneIndex(source, gap.source.index),
+                holdMode: gap.holdMode,
+                freezeTime,
+                startTime: gap.start,
+                endTime: gap.end,
+                duration,
+                durationFrames: Math.max(1, Math.round(duration * fps)),
+                durationUnit: 'seconds',
+            };
+        });
+    }
+
+    function withContinuityHolds(plan, options = {}) {
+        if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return plan;
+        const fps = Math.max(1, finiteNumber(plan.fps, DEFAULT_FPS));
+        const explicitDuration = finiteNumber(plan.totalDuration);
+        const normalizedScenes = normalizeScenes(plan.scenes || [], {
+            fps,
+            totalDuration: explicitDuration,
+            fallbackDuration: options.fallbackDuration,
+        });
+        const sceneDuration = normalizedScenes.length
+            ? Math.max(...normalizedScenes.map((scene) => finiteNumber(scene.endTime, 0)))
+            : 0;
+        const totalDuration = explicitDuration > 0 ? explicitDuration : sceneDuration;
+        const continuityHolds = buildContinuityHolds(normalizedScenes, {
+            fps,
+            totalDuration,
+            trackId: options.continuityTrackId || DEFAULT_CONTINUITY_TRACK,
+            gapThreshold: options.continuityGapThreshold,
+        });
+        const alreadyContracted = Object.prototype.hasOwnProperty.call(plan, 'continuityHolds')
+            || Object.prototype.hasOwnProperty.call(plan, 'timelineContractVersion');
+        if (!continuityHolds.length && !alreadyContracted) return { ...plan };
+        return {
+            ...plan,
+            timelineContractVersion: VERSION,
+            continuityHolds,
+        };
+    }
+
     function normalizePlan(plan, options = {}) {
         if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return plan;
         const fps = Math.max(1, finiteNumber(plan.fps, DEFAULT_FPS));
@@ -222,6 +384,12 @@
         ].map((scene) => finiteNumber(scene.endTime, 0));
         const computedDuration = ends.length ? Math.max(0, ...ends) : 0;
         normalized.totalDuration = totalDuration > 0 ? totalDuration : computedDuration;
+        normalized.continuityHolds = buildContinuityHolds(normalized.scenes, {
+            fps,
+            totalDuration: normalized.totalDuration,
+            trackId: options.continuityTrackId || DEFAULT_CONTINUITY_TRACK,
+            gapThreshold: options.continuityGapThreshold,
+        });
         return normalized;
     }
 
@@ -278,6 +446,7 @@
     return {
         VERSION,
         buildClipId,
+        buildContinuityHolds,
         finiteNumber,
         normalizePlan,
         normalizeScenes,
@@ -287,5 +456,6 @@
         safeToken,
         serializeScenes,
         serializeVisualScenes,
+        withContinuityHolds,
     };
 }));

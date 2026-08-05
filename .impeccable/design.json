@@ -1,0 +1,350 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-02T12:08:32.2910025+01:00",
+  "title": "Design System: YTA Empire WebGL",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "Selection Lime",
+        "canonical": "#c6f36a"
+      },
+      "primary-hover": {
+        "role": "primary",
+        "displayName": "Action Lime",
+        "canonical": "#d3ff7a"
+      },
+      "primary-light": {
+        "role": "primary",
+        "displayName": "Lime Wash",
+        "canonical": "rgba(198, 243, 106, 0.11)"
+      },
+      "warning": {
+        "role": "secondary",
+        "displayName": "Processing Amber",
+        "canonical": "#ffb454"
+      },
+      "success": {
+        "role": "tertiary",
+        "displayName": "Signal Green",
+        "canonical": "#7ed69a"
+      },
+      "danger": {
+        "role": "tertiary",
+        "displayName": "Fault Coral",
+        "canonical": "#ff756d"
+      },
+      "bg-dark": {
+        "role": "neutral",
+        "displayName": "Matte Carbon",
+        "canonical": "#080a08"
+      },
+      "panel-surface": {
+        "role": "neutral",
+        "displayName": "Console Carbon",
+        "canonical": "#101310"
+      },
+      "recessed-surface": {
+        "role": "neutral",
+        "displayName": "Recessed Carbon",
+        "canonical": "#0c0f0d"
+      },
+      "monitor-surface": {
+        "role": "neutral",
+        "displayName": "Program Black",
+        "canonical": "#030403"
+      },
+      "track-surface": {
+        "role": "neutral",
+        "displayName": "Track Black",
+        "canonical": "#090b09"
+      },
+      "text-primary": {
+        "role": "neutral",
+        "displayName": "Warm Paper",
+        "canonical": "#e6eadf"
+      },
+      "text-secondary": {
+        "role": "neutral",
+        "displayName": "Secondary Paper",
+        "canonical": "#aeb5a9"
+      },
+      "text-muted": {
+        "role": "neutral",
+        "displayName": "Muted Ledger",
+        "canonical": "#777f75"
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Ruled Divider",
+        "canonical": "#293029"
+      },
+      "border-light": {
+        "role": "neutral",
+        "displayName": "Raised Rule",
+        "canonical": "#384238"
+      }
+    },
+    "typographyMeta": {
+      "brand": {
+        "displayName": "Brand",
+        "purpose": "Uppercase studio identity in the top bar."
+      },
+      "section": {
+        "displayName": "Section",
+        "purpose": "Uppercase panel and bay headings."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Default application copy."
+      },
+      "control": {
+        "displayName": "Control",
+        "purpose": "Compact buttons and high-emphasis control labels."
+      },
+      "field": {
+        "displayName": "Field",
+        "purpose": "Inputs, scene copy, and agent composition."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Track names, toolbar labels, and technical metadata."
+      },
+      "tab": {
+        "displayName": "Tab",
+        "purpose": "Settings and inspector navigation."
+      },
+      "badge": {
+        "displayName": "Badge",
+        "purpose": "Compact uppercase production-mode status."
+      },
+      "timecode": {
+        "displayName": "Timecode",
+        "purpose": "Duration, monitor readouts, and timeline values."
+      }
+    },
+    "shadows": [
+      {
+        "name": "root-elevation",
+        "value": "0 18px 42px rgba(0, 0, 0, 0.38)",
+        "purpose": "Shared elevated media-frame shadow."
+      },
+      {
+        "name": "studio-bar",
+        "value": "0 7px 24px rgba(0, 0, 0, 0.24)",
+        "purpose": "Separates global controls from the workspace."
+      },
+      {
+        "name": "program-monitor",
+        "value": "0 20px 48px rgba(0, 0, 0, 0.32)",
+        "purpose": "Gives the central viewing surface physical priority."
+      },
+      {
+        "name": "timeline-lift",
+        "value": "0 -12px 28px rgba(0, 0, 0, 0.24)",
+        "purpose": "Separates the ledger from the bays above."
+      },
+      {
+        "name": "agent-composer",
+        "value": "0 12px 28px rgba(0, 0, 0, 0.24)",
+        "purpose": "Lifts the active command surface."
+      },
+      {
+        "name": "floating-menu",
+        "value": "0 18px 48px rgba(0, 0, 0, 0.52)",
+        "purpose": "Highest ambient shadow for transient overlays."
+      },
+      {
+        "name": "focus-halo",
+        "value": "0 0 0 2px rgba(198, 243, 106, 0.08)",
+        "purpose": "Restrained lime confirmation around the active composer."
+      }
+    ],
+    "motion": [
+      {
+        "name": "state-standard",
+        "value": "170ms cubic-bezier(0.22, 1, 0.36, 1)",
+        "purpose": "Default control border, surface, and state transitions."
+      },
+      {
+        "name": "tab-fast",
+        "value": "120ms",
+        "purpose": "Settings-tab background, color, and border changes."
+      },
+      {
+        "name": "clip-state",
+        "value": "150ms ease",
+        "purpose": "Timeline clip shadow and brightness feedback."
+      },
+      {
+        "name": "progress-width",
+        "value": "300ms ease",
+        "purpose": "Build progress width updates."
+      },
+      {
+        "name": "agent-progress-width",
+        "value": "200ms ease",
+        "purpose": "Agent progress width updates."
+      },
+      {
+        "name": "status-pulse",
+        "value": "1s ease-in-out infinite",
+        "purpose": "Working-state status-dot pulse."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "compact-desktop",
+        "value": "1260px"
+      },
+      {
+        "name": "tight-desktop",
+        "value": "1020px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Render Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Primary top-bar action for rendering the current edit.",
+      "html": "<button class=\"ds-btn-primary\">Render Video</button>",
+      "css": ".ds-btn-primary { min-width: 108px; min-height: 32px; display: inline-flex; align-items: center; justify-content: center; padding: 6px 10px; border: 1px solid var(--primary, #c6f36a); border-radius: 5px; color: #10150d; background: var(--primary, #c6f36a); font-family: \"YTA Source\", \"Segoe UI\", sans-serif; font-size: 11px; font-weight: 700; cursor: pointer; transition: all 170ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-btn-primary:hover { border-color: var(--primary-hover, #d3ff7a); background: var(--primary-hover, #d3ff7a); } .ds-btn-primary:focus-visible { outline: 2px solid var(--primary, #c6f36a); outline-offset: 2px; }"
+    },
+    {
+      "name": "Secondary Studio Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Compact toolbar action for project and editor utilities.",
+      "html": "<button class=\"ds-btn-secondary\">Open Project</button>",
+      "css": ".ds-btn-secondary { min-height: 32px; display: inline-flex; align-items: center; justify-content: center; padding: 6px 10px; border: 1px solid #323a32; border-radius: 5px; color: #b9c0b5; background: #171b18; font-family: \"YTA Source\", \"Segoe UI\", sans-serif; font-size: 11px; font-weight: 700; cursor: pointer; transition: all 170ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-btn-secondary:hover { color: #f0f3eb; border-color: #4b574a; background: #20251f; } .ds-btn-secondary:focus-visible { outline: 2px solid var(--primary, #c6f36a); outline-offset: 2px; }"
+    },
+    {
+      "name": "Control Field",
+      "kind": "input",
+      "refersTo": "field",
+      "description": "Dense text field used throughout build settings and properties.",
+      "html": "<label class=\"ds-field-label\" for=\"ds-field\">Video format</label><input class=\"ds-field\" id=\"ds-field\" type=\"text\" value=\"Documentary\">",
+      "css": ".ds-field-label { display: block; margin: 0 0 5px; color: #aeb6aa; font-family: \"YTA Source\", \"Segoe UI\", sans-serif; font-size: 11px; font-weight: 700; } .ds-field { width: 100%; min-height: 32px; padding: 6px 9px; border: 1px solid #384138; border-radius: 5px; color: #e3e7df; background: #171b18; font-family: \"YTA Source\", \"Segoe UI\", sans-serif; font-size: 11px; transition: border-color 170ms cubic-bezier(0.22, 1, 0.36, 1), background 170ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-field:hover { border-color: #4c584b; } .ds-field:focus { outline: 0; border-color: #8aac53; background: #1b201b; } .ds-field:focus-visible { outline: 2px solid var(--primary, #c6f36a); outline-offset: 2px; }"
+    },
+    {
+      "name": "Settings Tab Rail",
+      "kind": "nav",
+      "refersTo": "settings-tab-active",
+      "description": "Five-part rail for switching dense settings without a long panel scroll.",
+      "html": "<nav class=\"ds-settings-tabs\" aria-label=\"Build settings\"><button class=\"ds-stab ds-active\">Setup</button><button class=\"ds-stab\">Style</button><button class=\"ds-stab\">AI</button><button class=\"ds-stab\">Media</button><button class=\"ds-stab\">Build</button></nav>",
+      "css": ".ds-settings-tabs { display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; padding: 7px 8px 0; border-bottom: 1px solid #2c332c; background: #0c0f0d; } .ds-stab { min-width: 0; min-height: 33px; padding: 6px 4px; border: 0; border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0; color: #7f887d; background: transparent; font-family: \"YTA Source\", \"Segoe UI\", sans-serif; font-size: 10px; font-weight: 700; cursor: pointer; transition: background 120ms, color 120ms, border-color 120ms; } .ds-stab:hover { color: #cbd1c7; background: #151915; } .ds-stab.ds-active { color: #eaf7d8; border-color: var(--primary, #c6f36a); background: #182015; } .ds-stab:focus-visible { outline: 2px solid var(--primary, #c6f36a); outline-offset: 2px; }"
+    },
+    {
+      "name": "Production Mode Badge",
+      "kind": "chip",
+      "refersTo": "mode-badge",
+      "description": "Compact status chip identifying the active production mode.",
+      "html": "<span class=\"ds-mode-badge\">B-roll</span>",
+      "css": ".ds-mode-badge { min-height: 19px; display: inline-flex; align-items: center; padding: 2px 7px; border: 1px solid #617444; border-radius: 999px; color: #dff5b6; background: #202a19; font-family: \"YTA Source\", \"Segoe UI\", sans-serif; font-size: 9px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; white-space: nowrap; }"
+    },
+    {
+      "name": "Narration Drop Zone",
+      "kind": "card",
+      "refersTo": "drop-zone",
+      "description": "Recessed import well for the narration that starts the workflow.",
+      "html": "<div class=\"ds-drop-zone\" tabindex=\"0\"><svg class=\"ds-drop-icon\" width=\"28\" height=\"28\" viewBox=\"0 0 28 28\" fill=\"none\" aria-hidden=\"true\"><path d=\"M14 18V5M14 5L9.5 9.5M14 5L18.5 9.5\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M6 16.5V21.5C6 22.6046 6.89543 23.5 8 23.5H20C21.1046 23.5 22 22.6046 22 21.5V16.5\" stroke=\"currentColor\" stroke-width=\"1.6\" stroke-linecap=\"round\"/></svg><p class=\"ds-drop-title\">Drop your voiceover here</p><p class=\"ds-drop-hint\">MP3 or WAV · click to browse</p></div>",
+      "css": ".ds-drop-zone { min-height: 100px; padding: 16px 12px; border: 1px dashed #465044; border-radius: 7px; color: #8f9a89; background: #0c0f0d; text-align: center; cursor: pointer; transition: all 170ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-drop-zone:hover { border-color: var(--primary, #c6f36a); background: #131a10; } .ds-drop-zone:focus-visible { outline: 2px solid var(--primary, #c6f36a); outline-offset: 2px; } .ds-drop-icon { display: block; margin: 0 auto 7px; color: #a7b69a; } .ds-drop-title { margin: 2px 0; color: #c8cec3; font-family: \"YTA Source\", \"Segoe UI\", sans-serif; font-size: 12px; font-weight: 700; } .ds-drop-hint { margin: 2px 0; color: #788176; font-family: \"YTA Source\", \"Segoe UI\", sans-serif; font-size: 10px; }"
+    },
+    {
+      "name": "Active Scene Card",
+      "kind": "card",
+      "refersTo": "scene-card-active",
+      "description": "Inspector list item for the currently selected scene.",
+      "html": "<article class=\"ds-scene-card\" tabindex=\"0\"><div class=\"ds-scene-number\">Scene 04</div><div class=\"ds-scene-text\">The selected narration beat remains readable while its edit state is emphasized.</div><span class=\"ds-scene-keyword\">archive footage</span></article>",
+      "css": ".ds-scene-card { padding: 9px 10px; border: 1px solid var(--primary, #c6f36a); border-radius: 6px; color: #b6beb2; background: #202a19; box-shadow: inset 0 0 0 1px rgba(198, 243, 106, 0.08); font-family: \"YTA Source\", \"Segoe UI\", sans-serif; cursor: pointer; transition: all 170ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-scene-card:hover { border-color: #d3ff7a; background: #25311d; } .ds-scene-card:focus-visible { outline: 2px solid var(--primary, #c6f36a); outline-offset: 2px; } .ds-scene-number { margin-bottom: 5px; color: #cced8c; font-family: \"YTA Condensed\", sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; } .ds-scene-text { font-size: 11px; line-height: 1.45; } .ds-scene-keyword { display: inline-block; margin-top: 7px; padding: 3px 6px; border: 1px solid #354234; border-radius: 4px; color: #95bd7e; background: #111a12; font-size: 9px; }"
+    },
+    {
+      "name": "Selected Timeline Clip",
+      "kind": "custom",
+      "refersTo": "timeline-clip-selected",
+      "description": "Signature ledger clip showing ruled time and lime selection.",
+      "html": "<div class=\"ds-track\"><span class=\"ds-track-label\">Video 1</span><div class=\"ds-track-content\"><div class=\"ds-timeline-clip\" tabindex=\"0\">Scene 04 · Archive</div><span class=\"ds-playhead\" aria-hidden=\"true\"></span></div></div>",
+      "css": ".ds-track { height: 40px; display: flex; border-bottom: 1px solid #242a24; background: #0c0f0d; font-family: \"YTA Source\", \"Segoe UI\", sans-serif; } .ds-track-label { width: 112px; min-width: 112px; display: grid; place-items: center; border-right: 1px solid #343d34; color: #8f988c; background: #111511; font-family: \"YTA Condensed\", sans-serif; font-size: 10px; font-weight: 700; letter-spacing: 0.045em; text-transform: uppercase; } .ds-track-content { position: relative; flex: 1; overflow: hidden; background-color: #090b09; background-image: linear-gradient(90deg, transparent calc(100% - 1px), rgba(105, 117, 103, 0.1)); background-size: 80px 100%; } .ds-timeline-clip { position: absolute; inset: 3px auto 3px 12px; width: 190px; display: flex; align-items: center; padding: 0 8px; border: 1px solid var(--primary, #c6f36a); border-radius: 4px; color: #dfe8d6; background: #334326; box-shadow: 0 0 0 1px rgba(198, 243, 106, 0.18); font-size: 10px; font-weight: 700; cursor: grab; transition: box-shadow 150ms ease, filter 150ms ease; } .ds-timeline-clip:hover { filter: brightness(1.15); } .ds-timeline-clip:focus-visible { outline: 2px solid var(--primary, #c6f36a); outline-offset: 2px; } .ds-playhead { position: absolute; top: 0; bottom: 0; left: 238px; width: 1px; background: var(--warning, #ffb454); } .ds-playhead::before { position: absolute; top: 0; left: -4px; border: 4px solid transparent; border-top-color: var(--warning, #ffb454); content: \"\"; }"
+    },
+    {
+      "name": "Agent Composer",
+      "kind": "custom",
+      "refersTo": "agent-composer",
+      "description": "Signature command surface for directing edits against the current timeline scope.",
+      "html": "<div class=\"ds-agent-composer\"><textarea class=\"ds-agent-input\" rows=\"3\" placeholder=\"Ask Agent to edit your video…\"></textarea><div class=\"ds-agent-row\"><label class=\"ds-agent-effort-label\" for=\"ds-agent-effort\">Effort</label><select class=\"ds-agent-effort\" id=\"ds-agent-effort\"><option>Fast</option><option>Smart + Visual QA</option></select><button class=\"ds-agent-send\" type=\"button\" aria-label=\"Send to Agent\">↑</button></div></div>",
+      "css": ".ds-agent-composer { border: 1px solid #384138; border-radius: 7px; background: #151915; box-shadow: 0 12px 28px rgba(0, 0, 0, 0.24); font-family: \"YTA Source\", \"Segoe UI\", sans-serif; } .ds-agent-composer:focus-within { border-color: #8aac53; box-shadow: 0 0 0 2px rgba(198, 243, 106, 0.08); } .ds-agent-input { width: 100%; min-height: 66px; max-height: 180px; display: block; padding: 10px 11px 5px; resize: vertical; border: 0; outline: 0; color: #e4e5ea; background: transparent; font: inherit; font-size: 11px; line-height: 1.45; } .ds-agent-input::placeholder { color: #666b77; } .ds-agent-row { display: flex; align-items: center; gap: 7px; padding: 6px 7px 7px 10px; } .ds-agent-effort-label { color: #6f7480; font-size: 9px; } .ds-agent-effort { min-width: 66px; padding: 3px 18px 3px 5px; border: 0; outline: 0; color: #c9e39c; background: transparent; font: inherit; font-size: 10px; font-weight: 700; cursor: pointer; } .ds-agent-send { width: 30px; height: 30px; margin-left: auto; border: 0; border-radius: 5px; color: #11160e; background: var(--primary, #c6f36a); box-shadow: 0 5px 13px rgba(0, 0, 0, 0.28); font-size: 17px; font-weight: 750; cursor: pointer; transition: transform 170ms cubic-bezier(0.22, 1, 0.36, 1); } .ds-agent-send:hover { transform: translateY(-1px); } .ds-agent-send:focus-visible { outline: 2px solid var(--primary, #c6f36a); outline-offset: 2px; }"
+    },
+    {
+      "name": "Processing Progress",
+      "kind": "custom",
+      "refersTo": "progress",
+      "description": "Amber build-state indicator that keeps processing distinct from selection.",
+      "html": "<div class=\"ds-progress\"><div class=\"ds-progress-track\"><span class=\"ds-progress-fill\"></span></div><div class=\"ds-progress-info\"><span>Processing scenes…</span><strong>01:42</strong></div></div>",
+      "css": ".ds-progress { padding: 16px; border: 1px solid #313a31; border-radius: 7px; color: #aeb5a9; background: #111511; font-family: \"YTA Source\", \"Segoe UI\", sans-serif; font-size: 11px; } .ds-progress-track { width: 100%; height: 3px; overflow: hidden; background: #232923; } .ds-progress-fill { display: block; width: 68%; height: 100%; background: var(--warning, #ffb454); transition: width 300ms ease; } .ds-progress-info { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; } .ds-progress-info strong { color: var(--warning, #ffb454); font-family: Consolas, monospace; font-size: 10px; font-variant-numeric: tabular-nums; letter-spacing: 0; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Cut Ledger",
+    "overview": "Cut Ledger treats YTA Empire as an edit decision ledger rather than a generic dashboard. Matte carbon bays frame a dominant program monitor; warm paper text, ruled timecode, and sharply divided tracks make automation legible as an editing process.\n\nThe interface is dense, restrained, and operational. Lime is reserved for selection and primary action, amber marks processing and the current time, and quiet carbon layers preserve context across import, build, inspection, refinement, and render.\n\nThe independent finish review disposition is PASS across THESIS, OWN-WORLD, STORY, FIRST VIEWPORT, and FORM.",
+    "keyCharacteristics": [
+      "Matte carbon editing-console surfaces with warm paper text.",
+      "Condensed uppercase bay labels paired with compact humanist body copy.",
+      "Ruled timecode, fixed track labels, and 80px timeline divisions.",
+      "Lime selection and primary actions; amber processing and playhead states.",
+      "Tight desktop density with shallow radii, hairline borders, and selective structural shadow."
+    ],
+    "rules": [
+      {
+        "name": "The Signal Hierarchy Rule",
+        "body": "Lime means selection and primary action; amber means processing or current time; green means healthy status; coral means fault or destructive state.",
+        "section": "colors"
+      },
+      {
+        "name": "The Matte Majority Rule",
+        "body": "Carbon surfaces dominate every viewport; accent colors stay local to state, selection, and action.",
+        "section": "colors"
+      },
+      {
+        "name": "The Three-Voice Rule",
+        "body": "Condensed names the workspace, Source explains and controls it, and Consolas reports time or machine state.",
+        "section": "typography"
+      },
+      {
+        "name": "The Context-Preservation Rule",
+        "body": "Responsive changes remove secondary header information before hiding editing state, the monitor, inspector, or timeline.",
+        "section": "layout"
+      },
+      {
+        "name": "The Flat-Until-Needed Rule",
+        "body": "Panels, cards, and clips are flat at rest; shadow appears only when a surface must separate spatially or capture active input.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Shallow-Corner Rule",
+        "body": "Keep operational surfaces between 4px and 10px; reserve pills and circles for badges, status, and icon-only controls.",
+        "section": "shapes"
+      },
+      {
+        "name": "The State-Before-Decoration Rule",
+        "body": "Every accent, border shift, and shadow must communicate selection, progress, health, error, hierarchy, or input focus.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "Do keep Matte Carbon, Console Carbon, and Track Black as the visual majority.",
+      "Do use Selection Lime for the active edit target, primary action, checked control, and keyboard focus.",
+      "Do use Processing Amber for build progress, agent progress, and the current-time playhead.",
+      "Do preserve the dominant program monitor, visible side bays, and ruled timeline in desktop layouts.",
+      "Do use condensed uppercase labels for bays, tracks, and technical toolbar metadata."
+    ],
+    "donts": [
+      "Don't reintroduce purple gradients, neon dashboard glows, or generic SaaS-card styling into the editor shell.",
+      "Don't use lime and amber interchangeably; they encode different operational states.",
+      "Don't float every section as a rounded card; panel structure comes from edge-to-edge stacking and hairline rules.",
+      "Don't hide essential editing context merely to simplify a narrower desktop viewport.",
+      "Don't add marketing claims, decorative data, or interface states that are not supported by the product."
+    ]
+  }
+}

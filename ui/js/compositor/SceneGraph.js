@@ -33,26 +33,49 @@ class SceneGraph {
         const allScenes = [];
 
         // Regular scenes
-        const regularScenes = _timelineContract?.normalizeScenes
-            ? _timelineContract.normalizeScenes(plan.scenes || [], {
-                fps,
-                totalDuration: plan.totalDuration,
-            })
-            : (plan.scenes || []);
+        const normalizedPlan = _timelineContract?.normalizePlan
+            ? _timelineContract.normalizePlan(plan)
+            : plan;
+        const regularScenes = normalizedPlan.scenes || [];
         if (regularScenes.length) {
             for (const scene of regularScenes) {
                 allScenes.push(this._parseScene(scene, fps));
             }
         }
+        const regularByClipId = new Map(
+            regularScenes
+                .filter((scene) => scene?.clipId)
+                .map((scene) => [String(scene.clipId), scene])
+        );
+        for (const hold of normalizedPlan.continuityHolds || []) {
+            const source = regularByClipId.get(String(hold.sourceClipId || ''));
+            if (!source) continue;
+            allScenes.push(this._parseScene({
+                ...source,
+                clipId: hold.clipId,
+                index: hold.clipId,
+                sourceSceneIndex: hold.clipId,
+                startTime: hold.startTime,
+                endTime: hold.endTime,
+                duration: hold.duration,
+                durationFrames: hold.durationFrames,
+                mediaOffset: hold.freezeTime,
+                isContinuityHold: true,
+                continuitySourceClipId: hold.sourceClipId,
+                continuitySourceSceneIndex: hold.sourceSceneIndex,
+                transition: null,
+                transitionType: 'cut',
+            }, fps));
+        }
 
         // Full-screen MG scenes (from mgScenes array)
         const fullscreenMGs = _timelineContract?.normalizeVisualScenes
-            ? _timelineContract.normalizeVisualScenes(plan.mgScenes || [], {
+            ? _timelineContract.normalizeVisualScenes(normalizedPlan.mgScenes || [], {
                 fps,
-                totalDuration: plan.totalDuration,
+                totalDuration: normalizedPlan.totalDuration,
                 prefix: 'mg',
             })
-            : (plan.mgScenes || []);
+            : (normalizedPlan.mgScenes || []);
         if (fullscreenMGs.length) {
             for (const mg of fullscreenMGs) {
                 const s = this._parseScene({
@@ -68,8 +91,8 @@ class SceneGraph {
         this._scenes = allScenes;
 
         // --- Parse overlay motion graphics ---
-        if (plan.motionGraphics && plan.motionGraphics.length) {
-            for (const mg of plan.motionGraphics) {
+        if (normalizedPlan.motionGraphics && normalizedPlan.motionGraphics.length) {
+            for (const mg of normalizedPlan.motionGraphics) {
                 const startFrame = Math.round((mg.startTime || 0) * fps);
                 const dur = mg.duration || 3;
                 const endFrame = Math.round((mg.startTime + dur) * fps);
@@ -78,14 +101,14 @@ class SceneGraph {
                     _startFrame: startFrame,
                     _endFrame: endFrame,
                     _totalFrames: endFrame - startFrame,
-                    _animationSpeed: mg.animationSpeed || plan.scriptContext?.mgAnimationSpeed || 1.0,
+                    _animationSpeed: mg.animationSpeed || normalizedPlan.scriptContext?.mgAnimationSpeed || 1.0,
                 });
             }
         }
 
         // --- Parse transitions ---
-        if (plan.transitions && plan.transitions.length) {
-            for (const t of plan.transitions) {
+        if (normalizedPlan.transitions && normalizedPlan.transitions.length) {
+            for (const t of normalizedPlan.transitions) {
                 if (!t.type || t.type === 'cut' || t.type === 'none') continue; // Skip hard cuts
                 const dur = t.duration || 0.5; // seconds
                 const durationFrames = Math.round(dur * fps);
@@ -121,8 +144,8 @@ class SceneGraph {
             if (m._endFrame > maxEnd) maxEnd = m._endFrame;
         }
         // Also consider audio duration from plan
-        if (plan.totalDuration) {
-            const audiEnd = Math.ceil(plan.totalDuration * fps);
+        if (normalizedPlan.totalDuration) {
+            const audiEnd = Math.ceil(normalizedPlan.totalDuration * fps);
             if (audiEnd > maxEnd) maxEnd = audiEnd;
         }
         this._totalFrames = maxEnd;

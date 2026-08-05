@@ -7,6 +7,7 @@
  *   1. frame overflow  — visible text extending past the 1920×1080 canvas
  *   2. text collisions — text elements overlapping each other
  *   3. invisible text  — elements still at ~0 opacity at the hero frame
+ *   4. title-safe area — text sitting where YouTube's own chrome will cover it
  * Violations come back as lint errors with the offending text + numbers, so
  * the author's repair round gets concrete, fixable feedback.
  *
@@ -24,6 +25,40 @@ const CHROME_CANDIDATES = [
     'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
     'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
 ].filter(Boolean);
+
+/**
+ * Title-safe area — YouTube's, not television's.
+ *
+ * The old broadcast rule (a flat 5% margin on every edge) is about CRT
+ * overscan, which does not exist here: YouTube shows every pixel of the frame.
+ * What it DOES do is paint its own interface over the top of that frame, and
+ * that is a different shape entirely — heavy at the bottom, light at the top,
+ * barely anything at the sides. Copying the TV numbers would push graphics
+ * inward on all four edges for a reason that no longer applies, and still
+ * leave them under the controls.
+ *
+ * Measured against the player as it actually behaves at 1920x1080:
+ *
+ *   bottom  the progress bar plus the control row plus the gradient behind
+ *           them. It is hidden while playing on desktop and reappears on any
+ *           mouse move — and on mobile it is showing every time the viewer
+ *           touches the screen, which is constantly. 80px is the control row
+ *           and its gradient; anything inside it will be sat on.
+ *   top     mobile fullscreen paints the video title, the channel and the
+ *           overflow menu across the top on tap. Lighter than the bottom.
+ *   sides   YouTube never crops horizontally. The margin here is only for
+ *           rounded player corners and phone safe-area cut-ins, so it is small
+ *           — and deliberately not the 5% a broadcast rule would demand.
+ *
+ * These bound where TEXT may sit. Panels, plates and imagery may run to the
+ * edge; a bleed is a design choice, an unreadable word is not.
+ */
+const TITLE_SAFE = {
+    bottomPx: 80,
+    bottomLine: 1080 - 80,
+    topPx: 56,
+    edgePx: 40,
+};
 
 let _browserPromise = null;
 
@@ -128,7 +163,7 @@ async function visualLint(comp, ns, duration, opts = {}) {
 
         await page.evaluate((t) => { if (window.__tl) window.__tl.time(t); }, Math.max(0.1, duration * 0.45));
         await new Promise(r => setTimeout(r, 250));
-        const errors = await page.evaluate(() => {
+        const errors = await page.evaluate((SAFE) => {
             const out = [];
             const stage = document.getElementById('stage');
             const els = [...stage.querySelectorAll('*')].filter(el => {
@@ -149,10 +184,28 @@ async function visualLint(comp, ns, duration, opts = {}) {
                 if (op < 0.12) { out.push(`text "${label}" is nearly invisible at the hero frame (opacity ${op.toFixed(2)}) — entrance finishes too late or design too dim`); continue; }
                 visible.push({ el, r, label });
                 // 1. frame overflow (8px tolerance)
-                if (r.left < -8 || r.top < -8 || r.right > 1928 || r.bottom > 1088) {
+                const overflows = r.left < -8 || r.top < -8 || r.right > 1928 || r.bottom > 1088;
+                if (overflows) {
                     const ox = Math.max(0, Math.ceil(Math.max(-r.left, r.right - 1920)));
                     const oy = Math.max(0, Math.ceil(Math.max(-r.top, r.bottom - 1080)));
                     out.push(`text "${label}" overflows the 1920x1080 frame by ${ox}px horizontally / ${oy}px vertically — reduce font-size or break the line`);
+                }
+                // 4. title-safe area. The frame is not the whole story: YouTube
+                // paints its own chrome ON TOP of the video. Text that clears
+                // 1920x1080 can still be unreadable in the player, and this is
+                // the one failure the author can never see in a preview.
+                //
+                // Already-overflowing text is skipped — it gets the sharper
+                // message above, and two errors for one mistake just crowds the
+                // repair round.
+                if (!overflows) {
+                    if (r.bottom > SAFE.bottomLine) {
+                        out.push(`text "${label}" reaches ${Math.round(r.bottom)}px, inside the bottom ${SAFE.bottomPx}px where YouTube's progress bar and controls sit — lift it above ${SAFE.bottomLine}px`);
+                    } else if (r.top < SAFE.topPx) {
+                        out.push(`text "${label}" starts at ${Math.round(r.top)}px, inside the top ${SAFE.topPx}px where the mobile player paints the title bar — drop it below ${SAFE.topPx}px`);
+                    } else if (r.left < SAFE.edgePx || r.right > 1920 - SAFE.edgePx) {
+                        out.push(`text "${label}" runs to within ${Math.round(Math.min(r.left, 1920 - r.right))}px of the frame edge — keep a ${SAFE.edgePx}px margin so it survives rounded corners and safe-area cut-ins`);
+                    }
                 }
             }
             // 2. text-on-text collisions (skip ancestor/descendant pairs)
@@ -169,7 +222,7 @@ async function visualLint(comp, ns, duration, opts = {}) {
             }
             if (window.__tlErr) out.push(`timeline threw at runtime: ${window.__tlErr}`);
             return out.slice(0, 6);
-        });
+        }, TITLE_SAFE);
 
         // ── Overlay coverage (OVERLAY MODE): the comp floats on live footage.
         // Measured at the hero frame: union of painted/text element rects on
@@ -257,4 +310,4 @@ async function captureHeroFrame(comp, ns, duration) {
     }
 }
 
-module.exports = { visualLint, captureHeroFrame, closeVisualLint };
+module.exports = { visualLint, captureHeroFrame, closeVisualLint, TITLE_SAFE };

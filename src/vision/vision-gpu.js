@@ -76,6 +76,14 @@ async function ensureReady(opts = {}) {
         // A boot can report failure (timeout/parse) while the endpoint actually
         // came up moments later — verify before giving up on this attempt.
         if (await ready()) { r = { ok: true, recovered: true }; break; }
+        // Account/configuration policy failures (for example Lightning requiring
+        // a verified payment method) cannot heal through retries. Preserve the
+        // exact reason and fall back immediately instead of waiting through six
+        // identical wake-up attempts.
+        if (r && r.retryable === false) {
+            log(`❌ ${backendLabel()} cannot start: ${r.reason || 'non-retryable configuration failure'} — vision falls back to Bedrock for this build.`);
+            break;
+        }
         if (attempt < maxAttempts) {
             const delay = Math.min(baseDelayMs * attempt, 90000); // linear backoff, cap 90s
             log(`⚠️ ${backendLabel()} wake-up attempt ${attempt}/${maxAttempts} failed (${(r && r.reason) || 'unknown'}) — retrying in ${Math.round(delay / 1000)}s…`);

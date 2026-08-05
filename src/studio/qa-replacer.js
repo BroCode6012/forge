@@ -3,8 +3,8 @@
  *
  * Given a flagged scene with qaReplacementKeyword + qaReplacementSource,
  * downloads new footage using the existing footage-manager pipeline,
- * then replaces the scene's mediaFile in-place (same filename).
- * No plan update needed — compositor keeps loading the same path.
+ * then replaces the scene's media asset. Same-type replacements keep the path;
+ * manual fallback retries may switch extensions and update the scene metadata.
  */
 
 'use strict';
@@ -49,6 +49,76 @@ function _resolveAllowedMediaDestination(mediaFile) {
     return null;
 }
 
+function _normalizeMediaExtension(ext, mediaType = 'video') {
+    const clean = String(ext || '').trim().toLowerCase();
+    const allowed = new Set(['.mp4', '.mov', '.mkv', '.webm', '.jpg', '.jpeg', '.png', '.webp']);
+    if (allowed.has(clean)) return clean;
+    return mediaType === 'image' ? '.jpg' : '.mp4';
+}
+
+function _resolveReplacementTarget(existingMediaFile, downloadedExt, mediaType, allowExtensionChange) {
+    const existingExt = path.extname(existingMediaFile).toLowerCase();
+    const nextExt = _normalizeMediaExtension(downloadedExt, mediaType);
+    if (!allowExtensionChange || existingExt === nextExt) return existingMediaFile;
+    return path.join(
+        path.dirname(existingMediaFile),
+        `${path.basename(existingMediaFile, existingExt)}${nextExt}`
+    );
+}
+
+function _updateSceneReplacementMetadata(scene, result, targetPath, keyword, sourceHint, requestedMediaType) {
+    if (!scene) return;
+    const ext = _normalizeMediaExtension(result?.ext || path.extname(targetPath), requestedMediaType);
+    const actualMediaType = result?.mediaType
+        || (['.jpg', '.jpeg', '.png', '.webp'].includes(ext) ? 'image' : 'video');
+    const provider = result?.provider || 'QA Media Replacement';
+    const visionScore = Number(result?.visionScore);
+    const width = Number(result?.mediaWidth ?? result?.width);
+    const height = Number(result?.mediaHeight ?? result?.height);
+
+    scene.mediaFile = targetPath;
+    if (Object.prototype.hasOwnProperty.call(scene, 'mediaPath')) scene.mediaPath = targetPath;
+    if (Object.prototype.hasOwnProperty.call(scene, 'assetFile')) scene.assetFile = targetPath;
+    if (Object.prototype.hasOwnProperty.call(scene, 'assetPath')) scene.assetPath = targetPath;
+    scene.mediaExtension = ext;
+    scene.mediaType = actualMediaType;
+    scene.sourceProvider = provider;
+    scene.mediaDownloadStatus = 'accepted';
+    scene.keyword = keyword;
+    scene.searchKeyword = keyword;
+    if (sourceHint) scene.sourceHint = sourceHint;
+    if (Number.isFinite(visionScore)) scene.visionScore = visionScore;
+    else delete scene.visionScore;
+
+    if (width > 0 && height > 0) {
+        scene.mediaWidth = width;
+        scene.mediaHeight = height;
+        scene.aspectRatio = width / height;
+        scene.isVertical = height > width;
+    }
+
+    if (scene.mediaDiagnostics) {
+        scene.mediaDiagnostics.final = {
+            ...(scene.mediaDiagnostics.final || {}),
+            status: 'accepted',
+            provider,
+            path: targetPath,
+            mediaType: actualMediaType,
+            visionScore: Number.isFinite(visionScore) ? visionScore : undefined,
+            reason: Number.isFinite(visionScore)
+                ? `manual retry accepted at ${visionScore}/10`
+                : 'manual retry accepted',
+        };
+        scene.mediaDiagnostics.completedAt = new Date().toISOString();
+    }
+    scene._retryReplacement = {
+        at: new Date().toISOString(),
+        keyword,
+        provider,
+        mediaType: actualMediaType,
+    };
+}
+
 // Lazy-require to avoid loading heavy provider modules until needed
 let _footageManagerLoaded = false;
 let _downloadMedia, _initProviders;
@@ -74,7 +144,17 @@ function _ensureLoaded() {
  * @param {Function} [params.onProgress]    - (message: string) => void
  * @returns {Promise<{success: boolean, newFile?: string, error?: string}>}
  */
-async function replaceSceneMedia({ mediaFile, keyword, sourceHint, mediaType = 'video', sceneDuration = 8, scriptContext = {}, scene = null, onProgress }) {
+async function replaceSceneMedia({
+    mediaFile,
+    keyword,
+    sourceHint,
+    mediaType = 'video',
+    sceneDuration = 8,
+    scriptContext = {},
+    scene = null,
+    onProgress,
+    allowExtensionChange = false,
+}) {
     const log = onProgress || (() => {});
     const allowedMediaFile = _resolveAllowedMediaDestination(mediaFile);
     if (!allowedMediaFile) {
@@ -84,7 +164,7 @@ async function replaceSceneMedia({ mediaFile, keyword, sourceHint, mediaType = '
     _ensureLoaded();
     const ext = mediaType === 'video' ? '.mp4' : '.jpg';
     const tmpBase = 'qa-replacement-' + Date.now();
-    const safeSourceHint = sanitizeSourceHint(sourceHint || '', 'youtube') || '';
+    const safeSourceHint = sanitizeSourceHint(sourceHint || '', mediaType === 'image' ? 'web-image' : 'youtube') || '';
 
     try {
         // Init providers with script context (sets API keys, niche, etc.)
@@ -94,32 +174,34 @@ async function replaceSceneMedia({ mediaFile, keyword, sourceHint, mediaType = '
         // Temporarily lower clip reject threshold for QA replacements —
         // the QA agent already verified what we need, so be more permissive than the build pipeline
         const origThreshold = process.env.CLIP_ANALYZER_REJECT_THRESHOLD;
-        process.env.CLIP_ANALYZER_REJECT_THRESHOLD = '2';
+        let downloaded = null;
+        try {
+            process.env.CLIP_ANALYZER_REJECT_THRESHOLD = '2';
 
-        if (scene) {
-            delete scene._aborted;
-            delete scene._abortSignal;
-            delete scene._timeoutFired;
-            delete scene._inFlightCandidate;
-            delete scene._inFlightCandidateReason;
-            delete scene._inFlightCandidateReasons;
-            delete scene._inFlightCandidateCount;
-            delete scene._inFlightCandidateSince;
+            if (scene) {
+                delete scene._aborted;
+                delete scene._abortSignal;
+                delete scene._timeoutFired;
+                delete scene._inFlightCandidate;
+                delete scene._inFlightCandidateReason;
+                delete scene._inFlightCandidateReasons;
+                delete scene._inFlightCandidateCount;
+                delete scene._inFlightCandidateSince;
+            }
+
+            downloaded = await _downloadMedia(
+                keyword,
+                mediaType,
+                tmpBase,
+                sceneDuration,
+                safeSourceHint,
+                scriptContext.nicheId || '',
+                scene || null
+            );
+        } finally {
+            if (origThreshold !== undefined) process.env.CLIP_ANALYZER_REJECT_THRESHOLD = origThreshold;
+            else delete process.env.CLIP_ANALYZER_REJECT_THRESHOLD;
         }
-
-        const downloaded = await _downloadMedia(
-            keyword,
-            mediaType,
-            tmpBase,
-            sceneDuration,
-            safeSourceHint,
-            scriptContext.nicheId || '',
-            scene || null
-        );
-
-        // Restore threshold
-        if (origThreshold !== undefined) process.env.CLIP_ANALYZER_REJECT_THRESHOLD = origThreshold;
-        else delete process.env.CLIP_ANALYZER_REJECT_THRESHOLD;
 
         // downloadMedia returns { path, ext, provider, visionScore, ... } — extract the file path
         const downloadedPath = downloaded?.path || downloaded;
@@ -135,11 +217,18 @@ async function replaceSceneMedia({ mediaFile, keyword, sourceHint, mediaType = '
             return { success: false, error: err };
         }
 
+        const downloadedExt = downloaded?.ext || path.extname(downloadedPath) || ext;
+        const targetPath = _resolveReplacementTarget(
+            mediaFile,
+            downloadedExt,
+            downloaded?.mediaType || mediaType,
+            allowExtensionChange
+        );
         log(`Downloaded → ${path.basename(downloadedPath)} (score: ${downloaded?.visionScore ?? '?'}), replacing ${path.basename(mediaFile)}…`);
-        console.log('[QA Replacer] Copying:', downloadedPath, '→', mediaFile);
+        console.log('[QA Replacer] Copying:', downloadedPath, '→', targetPath);
 
         // Ensure destination directory exists
-        const destDir = path.dirname(mediaFile);
+        const destDir = path.dirname(targetPath);
         if (!fs.existsSync(destDir)) {
             const err = `Destination folder does not exist: ${destDir}`;
             console.error('[QA Replacer]', err);
@@ -147,12 +236,46 @@ async function replaceSceneMedia({ mediaFile, keyword, sourceHint, mediaType = '
         }
 
         // Use copy+delete instead of rename to handle cross-drive moves (D:\temp → C:\public)
-        fs.copyFileSync(downloadedPath, mediaFile);
+        //
+        // Unlink the target FIRST rather than copying over it. Generated HyperFrames
+        // project dirs hardlink this file instead of duplicating it (see
+        // render/hyperframes-bridge.js:linkOrCopy), and a copy onto an existing path
+        // writes through the shared inode — so replacing a scene's footage would silently
+        // rewrite the media inside every preview/render folder that still references the
+        // old clip, including one mid-capture. Unlinking drops just this directory entry
+        // and leaves those builds intact; the copy then creates a fresh, unshared file.
+        try { fs.unlinkSync(targetPath); } catch (_) { /* absent or busy — copy still lands */ }
+        fs.copyFileSync(downloadedPath, targetPath);
+        const copied = fs.statSync(targetPath);
+        if (!copied.isFile() || copied.size <= 0) {
+            throw new Error(`Replacement copy is empty: ${targetPath}`);
+        }
         try { fs.unlinkSync(downloadedPath); } catch (_) { /* temp cleanup — non-fatal */ }
+        if (targetPath !== mediaFile) {
+            try { fs.unlinkSync(mediaFile); } catch (_) { /* old fallback cleanup — non-fatal */ }
+        }
 
-        log(`Replaced ${path.basename(mediaFile)} ✓`);
-        console.log('[QA Replacer] ✅ Success:', mediaFile);
-        return { success: true, newFile: mediaFile };
+        _updateSceneReplacementMetadata(
+            scene,
+            downloaded,
+            targetPath,
+            keyword,
+            safeSourceHint,
+            mediaType
+        );
+
+        log(`Replaced ${path.basename(targetPath)} ✓`);
+        console.log('[QA Replacer] ✅ Success:', targetPath);
+        return {
+            success: true,
+            newFile: targetPath,
+            ext: _normalizeMediaExtension(downloadedExt, mediaType),
+            mediaType: scene?.mediaType || downloaded?.mediaType || mediaType,
+            provider: downloaded?.provider || scene?.sourceProvider || 'QA Media Replacement',
+            visionScore: Number.isFinite(Number(downloaded?.visionScore)) ? Number(downloaded.visionScore) : undefined,
+            mediaWidth: Number(downloaded?.mediaWidth ?? downloaded?.width) || 0,
+            mediaHeight: Number(downloaded?.mediaHeight ?? downloaded?.height) || 0,
+        };
 
     } catch (err) {
         console.error('[QA Replacer] Error:', err);
@@ -272,4 +395,9 @@ async function _searchMultipleArticles(articleImage, keyword, subtext) {
     return { items: url ? [url] : [] };
 }
 
-module.exports = { replaceSceneMedia, rescreenhotArticle };
+module.exports = {
+    replaceSceneMedia,
+    rescreenhotArticle,
+    _resolveReplacementTarget,
+    _updateSceneReplacementMetadata,
+};
