@@ -15,6 +15,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const https = require('https');
+const { isCanvasSafeImage } = require('../util/image-bytes');
 const config = require('../settings/config');
 
 // ── Cache ──
@@ -289,6 +290,10 @@ async function _fetchAndRasterize(iconId, keyword, tag) {
         // Download SVG with white fill for dark map backgrounds
         const svgUrl = `https://api.iconify.design/${prefix}/${name}.svg?height=128&color=white`;
         const svgBuf = await httpGet(svgUrl);
+        // Guard the RAW BYTES, not the data: URI built from them — @napi-rs/canvas
+        // SEGFAULTS (exit 139, no exception) on anything it cannot decode, and a
+        // data: URI string sniffs as an unreadable path, which fails open.
+        if (!isCanvasSafeImage(svgBuf)) return null;
         const svgStr = svgBuf.toString();
         if (!svgStr.includes('<svg')) return null;
 

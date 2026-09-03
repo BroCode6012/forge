@@ -17,6 +17,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const config = require('../settings/config');
+const { isCanvasSafeImage } = require('../util/image-bytes');
 const { getPack: getMapStylePack } = require('./map-style-packs');
 
 // ── Geocoding cache (avoids repeat API calls within same build) ──
@@ -731,6 +732,10 @@ async function stitchMapTilerTiles(view, mapStyle, apiKey, outW, outH) {
             batch.map(async (t) => {
                 const key = `${t.z}/${t.x}/${t.y}`;
                 const buf = await downloadTile(style, t.z, t.x, t.y, apiKey);
+                // @napi-rs/canvas SEGFAULTS on formats it cannot decode (exit 139, no
+                // exception) — a tile server erroring into non-image bytes must not take
+                // the build down. The allSettled below logs this as a normal tile failure.
+                if (!isCanvasSafeImage(buf)) throw new Error('tile bytes are not safe to decode');
                 const img = await loadImage(buf);
                 tileImages.set(key, { img, tile: t });
             })

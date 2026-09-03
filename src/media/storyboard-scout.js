@@ -41,6 +41,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
+const { isCanvasSafeImage } = require('../util/image-bytes');
 
 let _canvasMod = null;
 function canvasLib() {
@@ -293,6 +294,9 @@ async function _packSheet(board, indices, cols, scale = 1) {
         const within = g % geom.perSheet;
         if (sheetIdx >= sheets.length) continue;
         if (sheetIdx !== cachedIdx) {
+            // @napi-rs/canvas SEGFAULTS on formats it cannot decode (exit 139, no
+            // exception) — one odd sheet would kill the whole build silently.
+            if (!isCanvasSafeImage(sheets[sheetIdx])) continue;
             try { cachedImg = await C.loadImage(sheets[sheetIdx]); cachedIdx = sheetIdx; }
             catch (_) { continue; }
         }
@@ -457,6 +461,53 @@ function _bestHit(hits) {
     return bestI < 0 ? null : { index: bestI, ...hits[bestI] };
 }
 
+// ── Self-measured cost ──────────────────────────────────────────────────────
+//
+// A caller working inside a per-candidate budget has to know what a scout run
+// costs BEFORE paying for one, or it spends its whole budget picking a perfect
+// window and has nothing left to download with. That is exactly what happened on
+// the Aug-5 build: 47s of a 56s YouTube budget went here, the download started
+// with 9s left, and all four candidates were aborted mid-transfer.
+//
+// The answer is not a hard-coded number — that would be wrong on a different
+// machine, network or GPU queue, and it would go stale silently. The scout
+// remembers what its OWN completed runs took during THIS build and answers from
+// that. Before it has evidence it answers with its configured ceiling: the honest
+// "I don't know yet, assume the worst", which stops a tight scene from gambling.
+// One roomy scene is enough to bootstrap a real number for every scene after it.
+const _runMs = [];
+const _RUN_SAMPLE_MAX = 12;
+
+function _recordRunMs(ms) {
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    _runMs.push(ms);
+    if (_runMs.length > _RUN_SAMPLE_MAX) _runMs.shift();
+}
+
+/**
+ * What one full deep-scout run costs, from this build's own evidence.
+ *
+ * p75 of completed runs, not the mean: the question a caller is asking is "will
+ * this fit", and being wrong is asymmetric — an overrun costs the download, a
+ * conservative skip costs only a blind window the post-download judge still
+ * checks. Two samples is the minimum that makes a p75 mean anything.
+ *
+ * @returns {number} milliseconds
+ */
+function estimatedRunMs() {
+    const ceiling = Math.max(1, envInt('YOUTUBE_STORYBOARD_TIMEOUT_MS', 90000));
+    if (_runMs.length < 2) return ceiling;
+    const sorted = [..._runMs].sort((a, b) => a - b);
+    const p75 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.75))];
+    return Math.max(1, Math.min(ceiling, p75));
+}
+
+/** Test hook — drop the measured samples. */
+function _resetRunMs() { _runMs.length = 0; }
+
+/** Test hook — feed a completed-run sample without doing a real scout run. */
+function _seedRunMs(ms) { _recordRunMs(ms); }
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /**
@@ -610,7 +661,14 @@ async function locateWindow(visualQuery, videoId, opts = {}) {
         console.log(`  🗺️ [Storyboard Scout] no window — ${e.message}${probesUsed.length ? ` (looked for ${JSON.stringify(probesUsed)})` : ''}`);
     }
 
-    if (result) result.elapsedMs = Date.now() - t0;
+    if (result) {
+        result.elapsedMs = Date.now() - t0;
+        // Only COMPLETED runs are sampled. A run we cut short says nothing about
+        // what a real one costs, and feeding the short ones back would make the
+        // estimate shrink every time we were in a hurry — the same self-serving
+        // feedback loop that killed YouTube on the Aug-5 build.
+        _recordRunMs(result.elapsedMs);
+    }
     // "We ran out of time" is a fact about this moment, not about the video, so it
     // must not be remembered as "there is no window here" — same reasoning as the
     // board cache above. Also give the video its budget slot back.
@@ -927,4 +985,4 @@ async function _tiebreak(results, opts, deadline) {
     }));
 }
 
-module.exports = { locateWindow, screenVideo, screenVideos };
+module.exports = { locateWindow, screenVideo, screenVideos, estimatedRunMs, _resetRunMs, _seedRunMs };
