@@ -52,6 +52,30 @@ function assignFinalSceneIndices(scenes = []) {
     return scenes;
 }
 
+// Track membership is by scene NUMBER, not object identity. The MG carve and the
+// template carve both rebuild the base track out of `{ ...scene }` copies, so past
+// that point nothing on the track is reference-equal to its entry in
+// scenesWithKeywords — an identity test answers "off track" for every scene, and a
+// merge that trusts it appends the whole track back onto itself (147 scenes in,
+// 270 out, every beat drawn twice, the copy on top missing its effect recipe).
+// Same key `scene-coverage.js:_uniqueScenes` uses, for the same reason.
+function partitionTrackMembership(scenesOnTrack = [], candidateScenes = []) {
+    const onTrackObjects = new Set(scenesOnTrack);
+    const onTrackNumbers = new Set(
+        scenesOnTrack.map(s => Number(s?.index)).filter(Number.isFinite)
+    );
+    const isOnTrack = (s) => {
+        if (!s) return false;
+        if (onTrackObjects.has(s)) return true;
+        const no = Number(s.index);
+        return Number.isFinite(no) && onTrackNumbers.has(no);
+    };
+    const offTrack = (candidateScenes || []).filter(s =>
+        s && !isOnTrack(s) && !s._presenterAnchor && !s.presenterInsert
+    );
+    return { isOnTrack, offTrack };
+}
+
 // Clean a folder of old build artifacts — removes ALL media and plan files
 function cleanFolder(folderPath, label) {
     if (!fs.existsSync(folderPath)) return;
@@ -1987,6 +2011,13 @@ async function preflightVisionHealth() {
     const _vb = String(process.env.VISION_BACKEND || 'aws').toLowerCase();
     if (_vb === 'aws' || _vb === 'lightning') {
         log.info(`🔬 Pre-build vision check skipped — ${_vb} GPU vision starts just-in-time at media download (Step 5)`);
+        return;
+    }
+    // Azure Managed Compute is a single always-on deployment reached with one key, not a
+    // rotating pool — the same reason the GPU backends skip this. Probing it here would
+    // only add a cold call and could poison the health map for a pool it isn't part of.
+    if (_vb === 'azure-managed') {
+        log.info('🔬 Pre-build vision check skipped — Azure Managed Compute is always on (no key pool to probe)');
         return;
     }
     await preflightQwenModelRegistrySync();
@@ -4221,13 +4252,30 @@ async function buildVideo() {
         // of a blank scene stay invisible. Presenter holds are excluded: their
         // visual is owned by the presenter system, not the footage system, and
         // handing one a stock clip would be a worse bug than the blank.
-        const offTrack = (scenesWithKeywords || []).filter(s =>
-            s && !scenesWithMedia.includes(s) && !s._presenterAnchor && !s.presenterInsert
-        );
+        const { isOnTrack, offTrack } = partitionTrackMembership(scenesWithMedia, scenesWithKeywords);
         const sweepUniverse = [
             ...scenesWithMedia.filter(s => s && !s._presenterAnchor && !s.presenterInsert),
             ...offTrack,
         ];
+
+        // Which off-track scenes were ALREADY covered before the sweep touched
+        // them. The merge below may only re-attach a scene the sweep actually
+        // fixed. Most off-track scenes are off-track on purpose — a fullscreen
+        // graphic owns their whole span, so the carve dropped them from V1 — and
+        // they still carry the mediaFile they were downloaded with. Joining those
+        // on "has a mediaFile" puts footage back underneath the graphic that
+        // replaced it. ANY coverage counts here, not just footage: a scene drawn
+        // by its own graphic is already on screen, so it has nothing to join for.
+        // Judged with the sweep's own classifier, so there is no second
+        // definition of success anywhere.
+        const _coveredBeforeSweep = new Set();
+        try {
+            const { classifyScene } = require('../media/scene-coverage');
+            for (const s of offTrack) {
+                const v = classifyScene(s, coverageCtx);
+                if (v && v.covered) _coveredBeforeSweep.add(s);
+            }
+        } catch (_) { /* classifier unavailable — merge falls back to mediaFile only */ }
 
         let rescueResult = null;
         try {
@@ -4272,7 +4320,9 @@ async function buildVideo() {
         // found it or the borrow handed it over — has to join the base track or
         // nothing will draw it. Same merge the presenter holds use.
         if ((rescueResult && rescueResult.rescued > 0) || (borrowResult && borrowResult.borrowed > 0)) {
-            const joined = offTrack.filter(s => s.mediaFile && !scenesWithMedia.includes(s));
+            const joined = offTrack.filter(s =>
+                s.mediaFile && !isOnTrack(s) && !_coveredBeforeSweep.has(s)
+            );
             if (joined.length > 0) {
                 scenesWithMedia = [...scenesWithMedia, ...joined]
                     .sort((a, b) => (Number(a.startTime) || 0) - (Number(b.startTime) || 0));
@@ -4350,6 +4400,28 @@ async function buildVideo() {
     const allScenes = [...scenesWithMedia, ...v2ScenesForPlan];
     if (v2ScenesForPlan.length > 0) {
         log.ok(`Merged ${v2ScenesForPlan.length} V2 overlay scenes into plan`);
+    }
+
+    // Tripwire: two main-track scenes on the same (start, end, media) are the same
+    // beat drawn twice. The renderer stacks them, the second copy wins, and it is
+    // the copy that missed every late per-index enrichment (FX recipe, transitions).
+    // This is silent by construction — the timeline contract renames the colliding
+    // clipId and everything downstream looks healthy — so it has to be shouted
+    // here, at the one place the main track is finalised.
+    {
+        const seen = new Map();
+        for (const s of scenesWithMedia) {
+            if (!s) continue;
+            const key = `${Number(s.startTime) || 0}|${Number(s.endTime) || 0}|${s.mediaFile || ''}`;
+            seen.set(key, (seen.get(key) || 0) + 1);
+        }
+        const dupes = [...seen.values()].filter(n => n > 1).length;
+        if (dupes > 0) {
+            const extra = [...seen.values()].reduce((a, n) => a + (n - 1), 0);
+            log.warn(`⚠️  DUPLICATE MAIN-TRACK SCENES: ${dupes} timeline slot(s) carry more than one scene (${extra} redundant scene(s), ${scenesWithMedia.length} total).`);
+            log.warn('   Every duplicated beat renders twice and the copy on top loses its per-index enrichment (effect recipe, transition).');
+            log.warn('   This means a merge upstream appended scenes that were already on the track — check the coverage-sweep merge.');
+        }
     }
 
     // Theme effectParams were resolved before HyperFrames Motion Director so
@@ -4886,6 +4958,38 @@ async function buildVideo() {
     log.ok('Updated video-plan.json with public paths');
     log.br();
 
+    // Fold this video's media memory into the niche's shared footage library, so the
+    // next video in this niche starts from what this one learned instead of paying to
+    // rediscover it. Deliberately here, on finished state, rather than inside the
+    // download path: that path is the most crash-sensitive code in the pipeline and
+    // must not carry library work. Entirely best-effort — a build never fails here.
+    try {
+        const { getMediaMemoryPath } = require('../media/media-memory-bank');
+        const studioCtx = require('../project/studio-link')
+            .resolveContext({ projectDir: PROJECT_DIR }) || {};
+        // The creator's own niche on the channel wins when he has set one; otherwise
+        // fall back to what the Director detected, because a fresh channel's
+        // _channel.json still has an empty niche and would key the library on nothing.
+        const libraryNiche = studioCtx.niche || scriptContext.nicheId || '';
+        let bankPath = '';
+        try { bankPath = getMediaMemoryPath(); } catch (_) {}
+        if (!bankPath || !fs.existsSync(bankPath)) {
+            bankPath = path.join(config.paths.temp, 'media-source-memory-bank.json');
+        }
+        if (libraryNiche && fs.existsSync(bankPath)) {
+            require('../media/footage-library').mergeVideoBank({
+                bankPath,
+                assetDir: path.join(path.dirname(bankPath), 'media-memory-assets'),
+                niche: libraryNiche,
+                channelSlug: studioCtx.channelSlug || '',
+                vaultId: studioCtx.vaultId ?? null,
+                videoId: studioCtx.videoId || path.basename(PROJECT_DIR),
+            });
+        }
+    } catch (e) {
+        console.warn(`[Footage Library] merge skipped: ${e.message}`);
+    }
+
     // Done!
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
@@ -4965,7 +5069,7 @@ async function _stopVisionGpuIfStarted() {
 // Testable helpers (safe to require without running the pipeline).
 module.exports = { getFfmpegPath, getFfprobePath, probeNarration, cleanNarration };
 // Test-only surface (verify-directives.js; require with BUILD_VIDEO_NO_RUN=1).
-module.exports.__test = { applySceneDirectives, _applyVeoScope, assignFinalSceneIndices };
+module.exports.__test = { applySceneDirectives, _applyVeoScope, assignFinalSceneIndices, partitionTrackMembership };
 
 // Run when this file is the ENTRY POINT — true both for `node src/build-video.js`
 // AND for `electron.exe src/build-video.js` (how main.js spawns it). Under

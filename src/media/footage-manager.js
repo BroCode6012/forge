@@ -7158,6 +7158,26 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             score: postScore,
                             postScore,
                         });
+                        // Negative memory. This candidate was downloaded AND paid for with a vision
+                        // call before losing, which makes it the one kind of failure worth keeping:
+                        // the cross-video footage library reads these so a later video in the same
+                        // niche does not spend the same download and the same judgement to reach the
+                        // same verdict. Rejects never copy their bytes, so this costs no disk.
+                        try {
+                            rememberMediaSource(selected, scene, scriptContextRef || {}, {
+                                providerKey,
+                                providerName: provider.name,
+                                mediaType,
+                                query: searchQuery,
+                                mediaAgent: mediaAgentPlan,
+                                mediaHunter: hunterProfile,
+                                visualContract,
+                                status: 'rejected',
+                                score: postScore,
+                                postScore,
+                                reason: `vision ${postScore}/10 below ${raceMinScore}: ${postDesc}`,
+                            });
+                        } catch (_) { /* remembering a loss must never cost the build */ }
                         return { accepted: false, path: finalPath, reason: `vision ${postScore}/10` };
                     }
 

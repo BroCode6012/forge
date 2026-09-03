@@ -24,6 +24,15 @@ scene video footage image clip shot shots close up close-up full frame fullscree
 agentic setting environment standard generic context theme lane mode role domain authority provider need mission brief target accepted rejected usable result candidate scout hunter memory
 `).split(/\s+/).map(s => s.trim().toLowerCase()).filter(Boolean));
 
+// Path segments that are how a provider organises its site, not what a clip shows.
+// These come free with every URL from that host, so they carry zero signal and
+// would otherwise match every source from the same provider.
+const PROVIDER_PATH_WORDS = new Set(String(process.env.MEDIA_MEMORY_URL_STOP_WORDS || `
+video videos photo photos image images clip clips stock footage watch embed media file files
+download preview thumb thumbs large medium small orig original content upload uploads assets
+www com net org html htm jpg jpeg png webp mp4 mov webm search result results page
+`).split(/\s+/).map(s => s.trim().toLowerCase()).filter(Boolean));
+
 let _bank = null;
 let _filePath = '';
 let _dirty = false;
@@ -261,15 +270,43 @@ function _contextText(scene = {}, scriptContext = {}, opts = {}) {
     ].filter(Boolean).join(' ');
 }
 
+/**
+ * Turn a URL into the words a human would use for it.
+ *
+ * Several providers hand back no title at all, so _candidateTitle falls through
+ * to the raw URL — which used to tokenise into {https, www, pexels, com} and
+ * swamp a source's tags with noise that matches every other source from the same
+ * host. The slug is usually the only real description a stock clip has
+ * ("a-woman-shopping-for-fresh-vegetables-8027660"), so keep that and drop the
+ * scheme, the host, the provider's structural path segments and the numeric id.
+ */
+function _deUrl(value) {
+    const text = _clean(value);
+    if (!/^https?:\/\//i.test(text)) return text;
+    let rest;
+    try {
+        const u = new URL(text);
+        rest = `${u.pathname} ${u.searchParams.get('q') || ''}`;
+    } catch (_) {
+        rest = text.replace(/^https?:\/\/[^/]+/i, '');
+    }
+    return rest
+        .replace(/\.[a-z0-9]{2,4}$/i, '')
+        .split(/[/_\-.+%\s]+/)
+        .filter((part) => part && !/^\d+$/.test(part) && !PROVIDER_PATH_WORDS.has(part.toLowerCase()))
+        .join(' ');
+}
+
 function _sourceTags(result = {}, scene = {}, scriptContext = {}, opts = {}) {
     const agent = opts.mediaAgent || {};
     const hunter = opts.mediaHunter || {};
     const text = [
-        _candidateTitle(result),
+        _deUrl(_candidateTitle(result)),
         result.description,
         result.alt,
         result._sourceSearchQuery,
         opts.query,
+        _deUrl(result.description),
         scene.keyword,
         scene.searchKeyword,
         scene.templateBgQuery,
@@ -550,6 +587,10 @@ function summarizeMediaMemoryBank() {
 }
 
 module.exports = {
+    // Exported so the cross-video footage library tags sources with exactly the
+    // same words this bank does — one tokenizer, no drift between the two.
+    tokenizeMediaText: _tokens,
+    deUrlMediaText: _deUrl,
     initMediaMemoryBank,
     saveMediaMemoryBank,
     getMediaMemoryPath,
