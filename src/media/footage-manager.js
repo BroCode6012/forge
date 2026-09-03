@@ -23,6 +23,17 @@ const {
     isTopicAccurateMapFromPremiumStock,
 } = require('./relevant-person-rules');
 const {
+    personSubjectMinScore,
+    personSubjectCoversMandatory,
+    aliasesFor,
+    mentionsAny,
+} = require('./person-subject');
+const {
+    footageAcceptFloor,
+    nicheFootageStrictness,
+    nicheWantsRealFootageFirst,
+} = require('./niche-strictness');
+const {
     buildVisualContract,
     summarizeVisualContract,
     scoutMediaResults,
@@ -177,10 +188,25 @@ function _readSceneConcurrencySetting() {
     const picked = entries.find(([, value]) => String(value || '').trim() !== '');
     const raw = picked ? picked[1] : String(fallback);
     const parsed = parseInt(raw, 10);
+    // Ceiling, not policy. Scene concurrency is the single biggest speed lever in the
+    // build because it parallelises EVERYTHING per scene at once — provider search,
+    // download, ffmpeg, the two Media Agent calls and every vision call — not just the
+    // GPU. Measured 2026-08-31 on 345 scenes: ~212 s of work per scene, so wall time is
+    // roughly (scenes x 212 / concurrency). The model is only ~40% of wall time, which is
+    // why adding GPU alone plateaus and concurrency does not.
+    //
+    // The old ceiling was 8, which at 345 scenes meant ~2.5 h of media. Raised so the
+    // ceiling stops being the binding constraint; MEDIA_SCENE_CONCURRENCY still controls
+    // the actual value and the default is unchanged. Going high is not free — 32 means 32
+    // concurrent video downloads plus ffmpeg, and provider rate limits are untested above
+    // 8 (only 3 throttle events in 2 h at 8). Raise it deliberately, watch the throttle
+    // and unjudged counters, and see SPEED-PLAN.md for the staged results.
+    const CEILING = Math.max(1, parseInt(process.env.MEDIA_SCENE_CONCURRENCY_CEILING, 10) || 32);
     return {
-        value: Math.max(1, Math.min(8, Number.isFinite(parsed) ? parsed : fallback)),
+        value: Math.max(1, Math.min(CEILING, Number.isFinite(parsed) ? parsed : fallback)),
         source: picked ? picked[0] : 'default',
         raw,
+        ceiling: CEILING,
     };
 }
 const DOWNLOAD_CONCURRENCY_SETTING = _readSceneConcurrencySetting();
@@ -323,6 +349,45 @@ function cleanupSceneTempMedia(filenameBase) {
         }
     }
     return removed;
+}
+
+// Rename an accepted race winner from its scratch name to the ONE name resume knows.
+//
+// A race downloads candidates as `scene-7.race-3-abc123.mp4` and the winner simply kept
+// that name — nothing ever renamed it. But BOTH halves of resume look for the bare
+// `scene-7.mp4`: build-video.js keeps only /^scene-\d+\.(mp4|jpg|...)$/ when cleaning
+// temp, and the per-scene skip in this file stats `scene-${si}${ext}`. The two agreed
+// with each other and neither matched what the race actually wrote, so resume could
+// never reuse downloaded footage — it re-raced every scene from zero.
+//
+// Measured 2026-08-29 on a build killed at scene 148/356: 129 winners recorded, 128 race
+// files on disk, and a resume preserved 2. The only bare files present came from
+// media-cache hits and placeholder graphics, never from a race.
+//
+// Promoting here — at the moment of acceptance — makes both existing mechanisms start
+// working without changing either of them. Best effort by design: if the rename fails
+// the caller keeps the scratch path and the build proceeds exactly as before.
+function promoteWinnerToSceneFile(filenameBase, winnerPath, ext) {
+    if (!filenameBase || !winnerPath) return winnerPath;
+    try {
+        const extension = ext || path.extname(winnerPath) || '';
+        if (!extension) return winnerPath;
+        const target = path.join(config.paths.temp, `${filenameBase}${extension}`);
+        if (path.resolve(target) === path.resolve(winnerPath)) return winnerPath; // already bare
+        if (!fs.existsSync(winnerPath)) return winnerPath;
+        try { if (fs.existsSync(target)) fs.unlinkSync(target); } catch (_) {}
+        try {
+            fs.renameSync(winnerPath, target);
+        } catch (err) {
+            if (err.code !== 'EXDEV' && err.code !== 'EPERM') throw err;
+            fs.copyFileSync(winnerPath, target);
+            try { fs.unlinkSync(winnerPath); } catch (_) {}
+        }
+        return target;
+    } catch (e) {
+        console.log(`  [Temp Cleanup] could not promote winner for ${filenameBase} (${e.message}); keeping scratch name`);
+        return winnerPath;
+    }
 }
 
 function cleanupSceneRaceTempMedia(filenameBase, keepPath = '') {
@@ -2751,19 +2816,41 @@ function _applyMismatchPenalty(score, description, keyword, sceneText, clipAnaly
         && /\b(on|printed on|attached to|visible on|sticker on|label on|branded)\b.*\b(product|appliance|device|screen|display|control panel|panel|package|packaging|label|sticker|storefront|vehicle|machine)\b/i.test(desc)
         && !/\b(watermark|agency stamp|channel logo|press logo|overlay|overlaid|thumbnail)\b/i.test(desc);
 
+    // "The main character is not identifiable in frame" is the defect this scene
+    // cannot avoid: free stock has no footage of a named person, so cap-4 puts
+    // every candidate under the accept floor and the scene finishes empty. Demote
+    // instead. A clip that DOES prove the identity is not penalized at all, so it
+    // still outranks the generic one — accuracy stays the tie-breaker. Only fires
+    // when the main character is the ONLY mandatory entity; a scene that also
+    // demands a product or place keeps the strict cap.
+    const personSubjectMandatory = personSubjectCoversMandatory(hunter?.personSubject, mandatoryEntities);
+
     if (mandatoryEntities.length > 0 && !mandatoryEntityVisible) {
-        penalty += 4;
         const missingMandatory = (mandatoryCoverage.missing || [])
             .map(item => item.term)
             .slice(0, 3);
-        reasons.push(`mandatory visible entity missing: ${(missingMandatory.length ? missingMandatory : mandatoryEntities).slice(0, 3).join(', ')}`);
-        capScore = Math.min(capScore ?? 10, 4);
+        const missingLabel = (missingMandatory.length ? missingMandatory : mandatoryEntities).slice(0, 3).join(', ');
+        if (personSubjectMandatory) {
+            penalty += 1;
+            reasons.push(`main character not identifiable: ${missingLabel} (person-subject scene — demoted, not rejected)`);
+            capScore = Math.min(capScore ?? 10, 6);
+        } else {
+            penalty += 4;
+            reasons.push(`mandatory visible entity missing: ${missingLabel}`);
+            capScore = Math.min(capScore ?? 10, 4);
+        }
     }
 
     if (negatedMandatoryVisual) {
-        penalty += 4;
-        reasons.push(`mandatory visual negated: ${negatedMandatoryVisual}`);
-        capScore = Math.min(capScore ?? 10, 4);
+        if (personSubjectMandatory) {
+            penalty += 1;
+            reasons.push(`main character not identifiable: ${negatedMandatoryVisual} (person-subject scene — demoted, not rejected)`);
+            capScore = Math.min(capScore ?? 10, 6);
+        } else {
+            penalty += 4;
+            reasons.push(`mandatory visual negated: ${negatedMandatoryVisual}`);
+            capScore = Math.min(capScore ?? 10, 4);
+        }
     }
 
     if ((mustShowCoverage.missing || []).length > 0
@@ -3639,6 +3726,12 @@ const IMAGE_SOURCE_MAP = {
 const VIDEO_PRIORITY = ['pexels', 'pixabay', 'youtube', 'reddit'];
 const IMAGE_PRIORITY = ['bing', 'brave', 'pexels', 'pixabay'];
 
+// The lanes the Visual Planner can choose between, and therefore the only lanes the
+// live scoreboard is allowed to move a scene to. Same list the planner is offered
+// (`VP_SOURCE_HINTS` in ai-visual-planner.js) — the correction stays inside the set of
+// answers the planner itself could have given.
+const VP_LANE_CANDIDATES = ['stock', 'youtube', 'web-image', 'reddit'];
+
 // ============ SMART SOURCE PRIORITY ============
 
 const POLITICS_MILITARY_EVENT_ACTOR_RE = /\b(houthi|houthis|yemen|iran|iranian|israel|israeli|gaza|hamas|hezbollah|idf|russia|russian|ukraine|ukrainian|nato|pentagon|navy|naval|military|army|troops?|soldiers?|forces?|warship|destroyer|missile|drone|uav)\b/i;
@@ -3685,6 +3778,135 @@ function _shouldPromoteYouTubeForMaritimeBroll(scene = {}, keyword = '', hunterP
     ].filter(Boolean).join(' ');
     if (/\b(map|route map|locator|satellite|chart|infographic|diagram)\b/i.test(text)) return false;
     return /\b(container ship|cargo ship|oil tanker|tanker|vessel|freighter|canal|suez|panama canal|strait|red sea|bab[-\s]?el[-\s]?mandeb|shipping lane|port)\b/i.test(text);
+}
+
+// ============ REAL-SUBJECT SOURCE PREFERENCE ============
+//
+// Free stock libraries index generic subjects — "tennis court", "office desk",
+// "city skyline". They do not index named people, organisations or specific
+// events, and no keyword rewrite will make them. So on a scene whose visual is
+// ABOUT one of those, opening Pexels/Pixabay first cannot succeed; it only
+// spends the scene's deadline before the sources that could have delivered.
+//
+// Aug-15 build, "Victoria Mboko beats Naomi Osaka": 12 of the 27 real-subject
+// video scenes shipped generic Pexels/Pixabay clips, several of them AFTER the
+// planner had explicitly hinted youtube or reddit. The order was authored by
+// the Media Agent (85 video scenes drafted `pexels > pixabay > ...`), which
+// overrides the niche's own real-first `reddit > youtube > pexels > pixabay`.
+//
+// This is deliberately NOT a niche rule and NOT a keyword list. The question is
+// answered per scene from data the pipeline already produced: the Director's
+// typed entities and the Visual Planner's declared mediaNeed.
+
+const STOCK_PROVIDER_KEYS = new Set(['pexels', 'pixabay', 'storyblocks']);
+
+// Director entity types (ai-director.js tags 'person' | 'place' | 'org' | 'event').
+// `place` is deliberately absent — stock libraries genuinely do carry cities,
+// coastlines and landscapes, so a "Montreal skyline" scene loses nothing there.
+const REAL_SUBJECT_ENTITY_TYPES = new Set(['person', 'org', 'event']);
+
+// mediaNeed values (ai-visual-planner.js VP_MEDIA_NEEDS) where the planner has
+// already said it needs footage of a real thing rather than a mood.
+const REAL_SUBJECT_MEDIA_NEEDS = new Set(['real-demo-video', 'exact-still']);
+// ...and where the clip is wallpaper behind a card or a chart, so a generic
+// stock plate is the correct answer and must keep its current behaviour.
+const DECORATIVE_MEDIA_NEEDS = new Set(['template-only', 'data-graphic']);
+
+// Memoized per scriptContext object: the entity list cannot change within a
+// build, and this is asked once per scene per retry.
+const _realSubjectEntityCache = new WeakMap();
+
+/**
+ * The video's Director-typed entities that free stock cannot supply.
+ * Person names also match on a distinctive surname (`aliasesFor`), because
+ * scripts say "Mboko" far more often than "Victoria Mboko". Orgs and events
+ * must match in full — "National Bank Open" shortened to "Open" would flag
+ * every scene in the video.
+ */
+function _realSubjectEntities(scriptContext) {
+    if (!scriptContext || typeof scriptContext !== 'object') return [];
+    const cached = _realSubjectEntityCache.get(scriptContext);
+    if (cached) return cached;
+    const types = scriptContext.entityTypes || {};
+    const out = [];
+    for (const raw of (Array.isArray(scriptContext.entities) ? scriptContext.entities : [])) {
+        const name = String(raw || '').replace(/\s+/g, ' ').trim();
+        if (!name) continue;
+        const type = String(types[name.toLowerCase()] || '').toLowerCase();
+        if (!REAL_SUBJECT_ENTITY_TYPES.has(type)) continue;
+        out.push({ name, type, aliases: type === 'person' ? aliasesFor(name) : [name] });
+    }
+    _realSubjectEntityCache.set(scriptContext, out);
+    return out;
+}
+
+/**
+ * Is THIS scene's visual about a real person / organisation / event?
+ *
+ * Only the scene's OWN visual intent is read — keyword, queries, visualIntent,
+ * protectedTerms and the Media Agent's must-show list. `scene.entityContext` is
+ * pointedly excluded: it carries the whole video's entity list into every
+ * scene, so reading it would flag 256 of 270 scenes here, including "empty
+ * tennis court baseline". `scene.text` is excluded for the same reason — the
+ * narration names the athlete over shots that are not of her.
+ *
+ * @returns {{active: boolean, reason: string}}
+ */
+function _isRealSubjectScene(scene, keyword, hunterProfile, scriptContext) {
+    const inactive = { active: false, reason: '' };
+    if (!scene) return inactive;
+    // A map / template / chart lane never downloads subject footage.
+    if (hunterProfile?.allowGraphics) return inactive;
+    const need = String(scene.mediaNeed || '').toLowerCase();
+    if (DECORATIVE_MEDIA_NEEDS.has(need)) return inactive;
+
+    const agentPlan = scene._mediaAgentPlan || null;
+    const intent = [
+        keyword,
+        scene._forcedSearchKeyword, scene.searchKeyword, scene.researchKeyword, scene.keyword,
+        scene.stockQuery, scene.webQuery, scene.visualIntent, scene.visualDescription,
+        ...(Array.isArray(scene.protectedTerms) ? scene.protectedTerms : []),
+        ...(Array.isArray(agentPlan?.mandatoryIdentity) ? agentPlan.mandatoryIdentity : []),
+        ...(Array.isArray(agentPlan?.mandatoryVisible) ? agentPlan.mandatoryVisible : []),
+        ...(Array.isArray(agentPlan?.mustShow) ? agentPlan.mustShow : []),
+    ].filter(Boolean).join(' • ');
+
+    for (const entity of _realSubjectEntities(scriptContext)) {
+        if (mentionsAny(intent, entity.aliases)) {
+            return { active: true, reason: `scene visual names ${entity.name} (${entity.type})` };
+        }
+    }
+    if (REAL_SUBJECT_MEDIA_NEEDS.has(need)) {
+        return { active: true, reason: `planner declared mediaNeed=${need}` };
+    }
+    // The existing politics/military real-event detector, reused rather than
+    // re-derived, so both paths agree on what "a real event" means.
+    if (_isPoliticsMilitaryRealEventScene(scene, keyword, scriptContext || {})) {
+        return { active: true, reason: 'politics/military real-event scene' };
+    }
+    return inactive;
+}
+
+/**
+ * Stable partition: real-footage sources keep their relative order and lead,
+ * stock keeps its relative order and follows.
+ *
+ * Nothing is removed. Stock is still reachable — it is the last resort instead
+ * of the first attempt, which is the whole change.
+ */
+function _preferRealSourcesOverStock(order) {
+    const real = order.filter(k => !STOCK_PROVIDER_KEYS.has(k));
+    const stock = order.filter(k => STOCK_PROVIDER_KEYS.has(k));
+    return [...real, ...stock];
+}
+
+/** Real-footage video providers this build could still open for the scene. */
+function _untriedRealVideoProviders(scene) {
+    const opened = scene?._realSourcesOpened;
+    return videoProviders
+        .map(p => getProviderKey(p))
+        .filter(key => key && !STOCK_PROVIDER_KEYS.has(key))
+        .filter(key => !opened || !opened.has(key));
 }
 
 // AI source hint → provider order (reorders, never adds unchecked sources).
@@ -4486,11 +4708,46 @@ function _filterResultsByHunterTitle(results, hunterProfile, providerName, scene
     return Array.isArray(results) ? results : [];
 }
 
+/**
+ * Why the controlled stock-video fallback must wait.
+ *
+ * On a real-subject scene, dropping to stock while YouTube or Reddit have never
+ * been opened is not a fallback, it is a shortcut past the only sources that
+ * could have the footage. Worse, `shouldReserveForControlledStock()` *bails out
+ * of the provider ladder* to reserve deadline for that stock pass — so the
+ * scene stops trying real sources in order to guarantee a generic clip.
+ *
+ * Stock is still the last resort, not a ban: once the scene no longer has time
+ * to open the untried real sources, this releases and stock may rescue it. An
+ * empty scene is worse than a generic one; a generic one chosen first is the bug.
+ *
+ * @returns {string} reason to hold, or '' to allow
+ */
+function _realSubjectStockHoldReason(scene) {
+    const realSubject = _isRealSubjectScene(scene, '', scene?._mediaHunterProfile, scriptContextRef);
+    if (!realSubject.active) return '';
+    const untried = _untriedRealVideoProviders(scene);
+    if (untried.length === 0) return '';
+    const left = scene?._deadlineAt ? Math.max(0, scene._deadlineAt - Date.now()) : Infinity;
+    if (left < STRICT_RAW_STOCK_MIN_ATTEMPT_MS) return '';
+    return `${realSubject.reason}; ${untried.join(', ')} not opened yet`;
+}
+
 function _shouldTryControlledStockVideoFallback(scene, mediaType) {
     const profile = scene?._mediaHunterProfile;
     if (mediaType !== 'video') return false;
     if (!profile?.strictRaw || profile.allowGraphics) return false;
     if (profile.domain === 'event' || profile.domain === 'history') return false;
+
+    // This predicate is polled many times per scene, so the hold is logged once.
+    const hold = _realSubjectStockHoldReason(scene);
+    if (hold) {
+        if (scene && scene._realSubjectStockHoldLogged !== hold) {
+            scene._realSubjectStockHoldLogged = hold;
+            console.log(`  [Real Subject] holding controlled stock-video fallback — ${hold}`);
+        }
+        return false;
+    }
 
     return videoProviders.some(provider => {
         const key = getProviderKey(provider);
@@ -4501,7 +4758,8 @@ function _shouldTryControlledStockVideoFallback(scene, mediaType) {
 function _providerSearchTimeoutMs(providerKey) {
     const scale = LOW_BANDWIDTH_MODE ? 1.5 : 1;
     if (providerKey === 'youtube') return Math.round(45_000 * scale);
-    // Reddit runs UI scrape (hard-capped 25s) then search.json fallback (~30s).
+    // Reddit uses paced old.reddit HTML searches; keep room for one structural
+    // retry plus the relaxed-query ladder when the first query has no videos.
     if (providerKey === 'reddit') return Math.round(60_000 * scale);
     if (STOCK_VIDEO_PROVIDER_KEYS.has(providerKey)) return Math.round(35_000 * scale);
     // Storyblocks subscribed mode opens up to 6 clip pages sequentially
@@ -5180,6 +5438,12 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
 
     // Media Agent is the provider authority. VP/sourceHint and Topic Scout are
     // context/evidence only; the base priority is just a fallback tail.
+    // NOTE 2026-09-02: a live lane-swap sat here (provider-scoreboard.betterLane) and was
+    // removed. It never fired once in a full build — the mechanism is still exported and
+    // unit-tested, but it was shipped unverified alongside a prompt change, so the run it
+    // was meant to protect had no safety net. Re-introduce only with a test that proves it
+    // fires. The lane was also the wrong lever: see SPEED-PLAN.md Stage 5 — the failures
+    // were on-topic clips being rejected by the judge, not scenes sent to the wrong library.
     const mediaAgentProviderLock = getMediaAgentProviderLock(mediaAgentPlan, mediaType);
     let priorityOrder = getSmartPriority('', mediaType, scriptContextRef);
     const mediaAgentSourceMap = mediaType === 'video' ? VIDEO_SOURCE_MAP : IMAGE_SOURCE_MAP;
@@ -5257,6 +5521,52 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                 .map(m => `${m.provider} ${m.from + 1}->${m.to + 1} (${m.winRate} win rate over ${m.opens})`)
                 .join(', ');
             console.log(`  [Provider Scoreboard] this build's record re-ranked the mission: ${detail}`);
+        }
+    }
+    // Real-subject scenes: stock cannot hold this footage, so it goes last.
+    //
+    // Applied AFTER the Media Agent draft and the scoreboard on purpose — both
+    // of those are what put Pexels first on scenes about a named athlete, and
+    // the scoreboard structurally favours stock because stock always returns
+    // *something*. Everything above still decides the order WITHIN each family;
+    // this only decides that the family that could actually have the footage
+    // gets opened first.
+    //
+    // SOURCE_PRIORITY_MAP is untouched — it still authors the base order, and an
+    // explicit hint is NOT exempted from the overlay. `sourceHint` is a provider
+    // *guess*; mediaNeed and the Director's entities are the editorial
+    // *requirement*, and where they disagree the requirement wins. The reference
+    // build has two scenes tagged `mediaNeed=real-demo-video` AND
+    // `sourceHint=stock` — a self-contradiction — and both shipped a generic
+    // aerial of a soccer stadium having opened no real source at all.
+    //
+    // The niche arm of the same overlay. `_isRealSubjectScene` only fires when
+    // THIS scene's own visual names a Director-typed entity, so on a sport or
+    // celebrity video the connective scenes — "the pressure was unbearable", "the
+    // crowd sensed it" — name nobody and fall straight to Pexels even though the
+    // whole video is about people free stock has never filmed. On the niches where
+    // stock structurally cannot hold the footage, the family goes first for every
+    // scene, not just the ones that happen to say a name. Deliberately narrower
+    // than "relaxed": nature and food are relaxed too, and stock genuinely IS the
+    // better waterfall. See media/niche-strictness.js.
+    const realSubject = _isRealSubjectScene(scene, keyword, hunterProfile, scriptContextRef);
+    const nicheRealFirst = !realSubject.active
+        && mediaType === 'video'
+        && !hunterProfile?.allowGraphics
+        && nicheWantsRealFootageFirst(nicheId);
+    if ((realSubject.active || nicheRealFirst) && !options.stockOnly && priorityOrder.length > 1) {
+        const why = realSubject.active
+            ? realSubject.reason
+            : `${nicheId} is a real-people niche`;
+        const preferred = _preferRealSourcesOverStock(priorityOrder);
+        if (preferred.join('>') !== priorityOrder.join('>')) {
+            console.log(`  [Real Subject] ${why} — real sources before stock: ${priorityOrder.join(' > ')} -> ${preferred.join(' > ')}`);
+            _recordMediaProvider(scene, {
+                mediaType,
+                status: 'info',
+                reason: `real-subject source preference (${why}): ${preferred.join(' > ')}`,
+            });
+            priorityOrder = preferred;
         }
     }
     if (priorityOrder.length > 0) {
@@ -5406,6 +5716,9 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
             }
             providersStarted++;
             providerScoreboard.recordOpen(mediaType, providerKey);
+            if (scene && !STOCK_PROVIDER_KEYS.has(providerKey)) {
+                (scene._realSourcesOpened || (scene._realSourcesOpened = new Set())).add(providerKey);
+            }
             const isStock = STOCK_PROVIDERS.has(providerKey);
             const isWeb = WEB_PROVIDERS.has(providerKey);
             const isYouTube = YOUTUBE_PROVIDERS.has(providerKey);
@@ -6318,9 +6631,40 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     : raceProviderIsSoftLocked ? softLockDefaultBatches
                     : raceDefaultBatches
                 ));
-                const raceMinScore = mediaType === 'image'
+                const raceStrictMinScore = mediaType === 'image'
                     ? Math.max(4, Math.min(9, parseInt(process.env.IMAGE_RACE_MIN_SCORE || process.env.FOOTAGE_RACE_MIN_SCORE || '6', 10)))
                     : Math.max(4, Math.min(9, parseInt(process.env.FOOTAGE_RACE_MIN_SCORE || '6', 10)));
+                // Two independent relaxations, stacked by taking the lower floor:
+                //
+                //  - A scene about the video's main character is judged on "is this
+                //    the right person doing the right thing", not "is this the exact
+                //    moment" — free stock has no footage of a named athlete, so the
+                //    strict floor rejects every candidate and the scene ships empty.
+                //    See media/person-subject.js.
+                //  - A relaxed niche (sport, celebrity, DIY, …) accepts rougher REAL
+                //    footage, because on those videos "really them, badly shot" beats
+                //    "beautifully shot, nobody". STOCK providers keep the strict floor
+                //    in every niche, so this can only ever admit a real clip that used
+                //    to be rejected — it never admits a generic one. See
+                //    media/niche-strictness.js.
+                //
+                // Strict niches (news, crime, politics, military) move nothing:
+                // accuracy still decides there.
+                const raceMinScore = footageAcceptFloor({
+                    niche: nicheId,
+                    strictFloor: raceStrictMinScore,
+                    sourceProvider: providerKey,
+                    personSubjectActive: hunterProfile?.personSubject?.active,
+                });
+                if (raceMinScore !== raceStrictMinScore) {
+                    const why = [
+                        hunterProfile?.personSubject?.active
+                            ? `person-subject (${hunterProfile.personSubject.people.join(', ')})`
+                            : '',
+                        `${nicheFootageStrictness(nicheId)} niche${nicheId ? ` ${nicheId}` : ''}`,
+                    ].filter(Boolean).join(', ');
+                    console.log(`  [Race] ${why} — real-source accept floor ${raceStrictMinScore} -> ${raceMinScore} for ${provider.name}`);
+                }
                 // Race pool should NOT be capped at maxTries (which is 3 for
                 // strict-raw video). The army consumes full batches only.
                 // Cap to the exact number this race can actually test.
@@ -6357,6 +6701,32 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     minKeep: Math.max(1, preliminaryRacePlan.finalistMinKeep),
                 });
                 const racePool = finalistTrim.results;
+                // How many soldiers actually got a footage verdict out of this
+                // provider — a real judged score, pass or fail. Zero means the
+                // scene never learned anything about this provider's footage,
+                // which is a fact about our clock, not about the provider. Used
+                // at the end of the race to decide whether this counts against
+                // its record at all. See provider-scoreboard.recordNoContest.
+                let raceVerdicts = 0;
+                const raceStats = { soldiersRun: 0, soldiersTimedOut: 0, soldiersErrored: 0, soldiersReturned: 0 };
+                // The scene's promise to an in-flight candidate. The moment a
+                // soldier starts, `_beginInFlight` pushes the scene deadline out
+                // to at least this, raising the hard cap to fit — so this much
+                // time is genuinely available to it.
+                //
+                // These two numbers used to be set in two places and disagree.
+                // A log line would read "[Deadline Grace] protected 120s" and the
+                // very next one "soldier timeout 56s": the scene held the door
+                // open for two minutes while the candidate's own budget shut it
+                // in under one. The protection could never protect anything.
+                // Defined once here, and read by BOTH the grace call and the
+                // patience call below, so they cannot drift apart again.
+                const raceInFlightGraceMs = mediaType === 'video'
+                    ? RACE_INFLIGHT_GRACE_MS
+                    : Math.min(45_000, RACE_INFLIGHT_GRACE_MS);
+                const raceInFlightCapMs = mediaType === 'video'
+                    ? RACE_INFLIGHT_MAX_EXTENSION_MS
+                    : Math.min(90_000, RACE_INFLIGHT_MAX_EXTENSION_MS);
                 if (finalistTrim.skipped.length > 0) {
                     const sample = finalistTrim.skipped
                         .slice(0, 3)
@@ -6442,9 +6812,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                         } catch (_) { /* helper not exported in older build — skip */ }
                     }
                     const raceInFlightReason = `${provider.name} race soldier ${raceAttempt + 1} (${mediaType} download+scoring)`;
-                    const raceInFlightOpts = mediaType === 'video'
-                        ? { minRemainingMs: RACE_INFLIGHT_GRACE_MS, extraCapMs: RACE_INFLIGHT_MAX_EXTENSION_MS }
-                        : { minRemainingMs: Math.min(45_000, RACE_INFLIGHT_GRACE_MS), extraCapMs: Math.min(90_000, RACE_INFLIGHT_MAX_EXTENSION_MS) };
+                    const raceInFlightOpts = { minRemainingMs: raceInFlightGraceMs, extraCapMs: raceInFlightCapMs };
                     // The WHOLE candidate stopwatch: download AND judging. The
                     // per-candidate budget is spent on both, so both have to be
                     // measured, or the budget shrinks to the size of half the job
@@ -6452,6 +6820,33 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     const _soldierStartedAt = Date.now();
                     let _reachedVerdict = false;
                     _beginInFlight(scene, raceInFlightReason, raceInFlightOpts);
+                    // THE PREP CLOCK. Some providers look inside a source before
+                    // downloading it (YouTube's storyboard scout reads the free
+                    // sprite sheet to find the right 4s window in a 13-minute
+                    // video). That work used to be bounded by the SCENE deadline —
+                    // which `_beginInFlight` had just pushed 120s out — while this
+                    // soldier's own budget was 56s. On the Aug-5 build the scout
+                    // spent 47 of those 56 seconds, the download began with 9s
+                    // left, and all four soldiers were aborted mid-transfer: four
+                    // opens, zero verdicts, and (before `recordNoContest`) four
+                    // recorded losses that shrank the next budget further.
+                    //
+                    // Prep therefore gets its own, tighter clock: this soldier's
+                    // deadline minus what a download plus judging measurably needs.
+                    // That reserve is `patience.minViableMs`, which download-patience
+                    // measures per provider from this run — no constant to go stale
+                    // on a different machine or network. When the reserve eats the
+                    // whole budget the prep clock lands in the past, the provider
+                    // takes its blind window, and every second goes to the bytes.
+                    // That is the right trade: a blind window that gets judged beats
+                    // a perfect window that never finishes downloading.
+                    const _sceneDeadlineAt = Number(scene?._deadlineAt || 0);
+                    const _prepDeadlineAt = downloadPatience.resolvePrepDeadlineAt({
+                        startedAt: _soldierStartedAt,
+                        candidateTimeoutMs: racePerCandidateTimeoutMs,
+                        minViableMs: patience?.minViableMs,
+                        sceneDeadlineAt: _sceneDeadlineAt,
+                    });
                     try {
                     const memoryAssetExt = reusableMemoryAssetPath ? path.extname(reusableMemoryAssetPath) : '';
                     const providerExt = memoryAssetExt || ((provider.mediaType === 'image') ? '.jpg' : (provider.mediaType === 'video') ? '.mp4' : ext);
@@ -6485,9 +6880,13 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             // whichever gives up first actually stops the bytes.
                             abortSignal: soldierSignals,
                             // The scene's wall-clock, so in-download look-inside work
-                            // (the storyboard deep scout) stops when the scene's time
-                            // does instead of running on and starving later providers.
-                            deadlineAt: scene?._deadlineAt || 0,
+                            // stops when the scene's time does instead of running on
+                            // and starving later providers.
+                            deadlineAt: _sceneDeadlineAt,
+                            // The tighter of the two: how long PRE-download work may
+                            // take before it starts stealing from the download itself.
+                            // See the prep-clock note above the try block.
+                            prepDeadlineAt: _prepDeadlineAt,
                         };
                         if (reusableMemoryAssetPath) {
                             finalPath = _copyReusableMediaMemoryAsset(selected, outputPath, provider.mediaType || mediaType);
@@ -6918,6 +7317,8 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                             ms: Date.now() - _soldierStartedAt,
                             reachedVerdict: _reachedVerdict,
                         });
+                        // Same signal, different consumer: the provider's record.
+                        if (_reachedVerdict) raceVerdicts++;
                     }
                 };
 
@@ -6926,11 +7327,18 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                 // downloads actually cost in this run — see download-patience.js.
                 // The scene-share clamp inside it is what keeps the retry and
                 // fallback steps behind this race reachable instead of decorative.
+                //
+                // The time we hand it is the larger of what the scene clock shows
+                // and what the scene has already promised to protect for an
+                // in-flight candidate. Budgeting against the smaller of two
+                // numbers the system itself has reconciled is how a race gets a
+                // budget it cannot finish in while the scene sits there holding
+                // the door open.
                 const patience = downloadPatience.resolveCandidatePatienceMs({
                     mediaType,
                     providerKey,
                     nicheId: scriptContextRef?.nicheId,
-                    remainingSceneMs: remainingMs(),
+                    remainingSceneMs: Math.max(remainingMs(), raceInFlightGraceMs),
                     log: (msg) => console.log(msg),
                 });
                 const racePerCandidateTimeoutMs = patience.ms;
@@ -6948,6 +7356,12 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                 // provider (a still instead of a clip) may well fit in what's left.
                 if (patience.viable === false) {
                     console.log(`  ⏭️  [Race] skipping ${provider.name}: ${patience.explain.split(', ').pop()}`);
+                    // We never opened a single download here, so this provider
+                    // has told us nothing about its footage. Filing it as a loss
+                    // would shrink its next budget for a decision it took no part
+                    // in — the spiral. Remember it as a no-contest instead.
+                    providerScoreboard.recordNoContest(mediaType, providerKey,
+                        `scene had ${Math.round(Math.max(remainingMs(), raceInFlightGraceMs) / 1000)}s left, one candidate needs ~${Math.round(patience.minViableMs / 1000)}s`);
                     _recordMediaProvider(scene, {
                         provider: provider.name,
                         key: providerKey,
@@ -6966,7 +7380,14 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     concurrency: raceConcurrency,
                     maxBatches: raceMaxBatches,
                     minAcceptScore: raceMinScore,
+                    // Relaxed niches rank a real-source candidate above a stock one
+                    // unless stock beats it by more than the tolerance. A race pool
+                    // is normally single-provider, where the bonus is uniform and
+                    // changes nothing; it bites on the merged topic-bank/memory
+                    // pools, which are the only mixed-origin pools we build.
+                    niche: nicheId,
                     perCandidateTimeoutMs: racePerCandidateTimeoutMs,
+                    stats: raceStats,
                     refereeCollectBatches: preliminaryRacePlan.refereeCollectBatches,
                     collectMoreOnBorderline: true,
                     skipRefereeOnObvious: true,
@@ -7043,6 +7464,10 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                     if (raceWinner._referee?.reason) {
                         console.log(`  [AI Referee] final pick reason: ${raceWinner._referee.reason}`);
                     }
+                    // Give the winner the name resume looks for, before anything records
+                    // the path — mediaFile, the media trace, the memory bank and the
+                    // return value all read raceWinner.path below.
+                    raceWinner.path = promoteWinnerToSceneFile(filenameBase, raceWinner.path, raceWinner.ext);
                     const rememberedAcceptedSource = rememberMediaSource(selected, scene, scriptContextRef || {}, {
                         providerKey,
                         providerName: provider.name,
@@ -7091,7 +7516,34 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                 const lockedProviders = new Set((mediaAgentProviderLock?.providers || []).map(k => String(k || '').toLowerCase()));
                 const providerIsLocked = (lockStrength === 'hard' || lockStrength === 'reference')
                     && (lockedProviders.size === 0 || lockedProviders.has(providerKey));
-                providerScoreboard.recordLoss(mediaType, providerKey, 'race exhausted, no winner');
+                // Did this provider LOSE, or did we simply never let it finish?
+                //
+                // THE AUG-5 DEATH SPIRAL. Both used to be filed as a loss. The
+                // record fell, the record multiplier in download-patience cut the
+                // NEXT budget for the same provider, the shorter budget aborted
+                // sooner, and the record fell further — a loop with no way back
+                // up. On that build YouTube won 0 of 47 scenes in a topic whose
+                // own ranking put YouTube first, while its win rate slid
+                // 0.17 → 0.14, and it was never once allowed to finish a download.
+                //
+                // The test is evidence, not blame: if not one soldier reached a
+                // footage verdict, nothing here is a statement about this
+                // provider's footage. `raceVerdicts` is the authoritative count —
+                // it is stamped by the soldier itself, after real judging. The
+                // clock has to be the dominant cause too, so a provider whose
+                // downloads all fail outright (dead links, dead auth) still takes
+                // the loss it has earned.
+                const raceRan = raceStats.soldiersRun > 0;
+                const clockKilled = raceStats.soldiersTimedOut;
+                const otherFailures = Math.max(0, raceStats.soldiersRun - clockKilled);
+                const noContest = raceRan && raceVerdicts === 0 && clockKilled > 0 && clockKilled >= otherFailures;
+                if (noContest) {
+                    providerScoreboard.recordNoContest(mediaType, providerKey,
+                        `${clockKilled}/${raceStats.soldiersRun} soldier(s) cut off by the ${Math.round(racePerCandidateTimeoutMs / 1000)}s budget, none judged`);
+                    console.log(`  [Race] ${provider.name} produced no verdict — ${clockKilled} of ${raceStats.soldiersRun} candidate(s) were cut off at ${Math.round(racePerCandidateTimeoutMs / 1000)}s. Recording as no-contest, not a loss (nothing was judged, so nothing was learned about its footage).`);
+                } else {
+                    providerScoreboard.recordLoss(mediaType, providerKey, 'race exhausted, no winner');
+                }
                 if (providerIsLocked) {
                     console.log(`  [Race] no winner - ${provider.name} exhausted in army mode; staying inside locked provider family only`);
                 } else {
@@ -8041,7 +8493,14 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                                 try { fs.unlinkSync(finalPath); } catch {}
                                 continue;
                             }
-                            if (!mapRescued && score <= 4) {
+                            // Twin of the race floor above, for the serial lane: a
+                            // person-subject scene rejects at <4 instead of <=4, so
+                            // an on-subject clip from a different day survives here
+                            // too. Non-person scenes are unchanged.
+                            const serialRejectAtOrBelow = hunterProfile?.personSubject?.active
+                                ? personSubjectMinScore(5) - 1
+                                : 4;
+                            if (!mapRescued && score <= serialRejectAtOrBelow) {
                                 const verifiedSegmentLock = candidateWasSegmentHunted
                                     && _canVerifiedSegmentLockLowVision(
                                         finalVisionProblemText || description,
@@ -9415,7 +9874,13 @@ async function downloadAllMedia(scenes, scriptContext, options = {}) {
     const hasOptionConcurrency = String(optionConcurrencyRaw || '').trim() !== ''
         && Number.isFinite(optionConcurrency)
         && optionConcurrency > 0;
-    const CONCURRENCY = Math.max(1, Math.min(8, hasOptionConcurrency ? optionConcurrency : DOWNLOAD_CONCURRENCY));
+    // Second ceiling, independent of the one in _readSceneConcurrencySetting. Both were 8,
+    // so raising only the first silently did nothing: MEDIA_SCENE_CONCURRENCY=16 still ran
+    // 8 scenes (2026-08-31). Share the ceiling so there is ONE number to change.
+    const CONCURRENCY = Math.max(1, Math.min(
+        DOWNLOAD_CONCURRENCY_SETTING.ceiling,
+        hasOptionConcurrency ? optionConcurrency : DOWNLOAD_CONCURRENCY,
+    ));
 
     // ─── Log buffering for clean scene-by-scene output ─────────────
     // Scenes download in parallel (3 at a time) but their logs interleave,
@@ -10074,10 +10539,38 @@ async function downloadAllMedia(scenes, scriptContext, options = {}) {
                     } else {
                         fallbackSourceHint = sourceHint;
                     }
-                    console.log(`  🔄 Trying fallback type: ${fallbackType}...`);
-                    if (!_shouldSkipDuplicateQuery(keyword, fallbackType)) {
+                    // Ask the new lane in the new lane's own language.
+                    //
+                    // The Visual Planner writes TWO queries per scene — `stockQuery` for the
+                    // libraries and `webQuery` for web image search — because the same idea
+                    // has to be asked for differently in each. This call used to hand the
+                    // image lane `keyword`, the stock-shaped one, and then `forceKeywordQuery`
+                    // switched OFF the planner-query selection downstream
+                    // (`forceExactWebImageQuery`), so `scene.webQuery` could not be recovered
+                    // later either. The best-performing lane in the build was being asked the
+                    // wrong question on purpose.
+                    //
+                    // Measured 2026-09-01: this fallback ran 131 times and produced 15 wins,
+                    // while web-image as a PRIMARY lane found footage 89% of the time (93% on
+                    // hard scenes). Same providers, same scenes — the difference was the
+                    // query. Scene S1 searched Bing for "calendar showing 7 days" when its own
+                    // webQuery said "1 week calendar countdown".
+                    //
+                    // `forceKeywordQuery` still means what it says: the caller supplies the
+                    // exact string. We are simply supplying the right one. The variant retries
+                    // below keep passing their variants untouched — those are deliberate
+                    // rewrites and must not be overridden.
+                    const fallbackQuery = (fallbackType === 'image' && scene?.webQuery)
+                        ? scene.webQuery
+                        : keyword;
+                    if (fallbackQuery !== keyword) {
+                        console.log(`  🔄 Trying fallback type: ${fallbackType} using the planner's web query: "${fallbackQuery}"`);
+                    } else {
+                        console.log(`  🔄 Trying fallback type: ${fallbackType}...`);
+                    }
+                    if (!_shouldSkipDuplicateQuery(fallbackQuery, fallbackType)) {
                         if (hasOuterSceneBudget(retryMissionBudgetMs(fallbackType), `fallback type ${fallbackType}`)) {
-                            result = await downloadMedia(keyword, fallbackType, `scene-${si}`, sceneDuration, fallbackSourceHint, nicheId, scene, {
+                            result = await downloadMedia(fallbackQuery, fallbackType, `scene-${si}`, sceneDuration, fallbackSourceHint, nicheId, scene, {
                                 forceKeywordQuery: true,
                             });
                         }
@@ -10252,6 +10745,21 @@ async function downloadAllMedia(scenes, scriptContext, options = {}) {
                 _setMediaFinal(scene, { status: 'failed', reason: 'no media after retries' });
                 cleanupSceneTempMedia(`scene-${si}`);
             }
+
+            // Teach the lane scoreboard what actually happened here. Recorded against
+            // the lane the scene was SENT to, not whichever provider happened to answer,
+            // because the lane is the decision we want to get better at. A scene that
+            // ends up borrowing another scene's clip is a loss — the whole point is that
+            // borrowing is a failure, not an outcome.
+            try {
+                const _laneUsed = scene.sourceHint || null;
+                if (_laneUsed) {
+                    const _won = !!scene.mediaFile
+                        && scene.mediaDownloadStatus !== 'failed'
+                        && scene.mediaDownloadStatus !== 'borrowedFromScene';
+                    providerScoreboard.recordLaneOutcome(mediaType, _laneUsed, _won);
+                }
+            } catch (_) {}
 
             _logMediaTrace(scene);
             // Flush this scene's buffered logs as a clean block (no-op in single-scene live mode)
@@ -10598,4 +11106,6 @@ async function downloadBackgroundCanvas(themeId) {
     }
 }
 
-module.exports = { downloadMedia, downloadAllMedia, initProviders, scoreDownloadedMedia: _scoreDownloadedMedia, enableInlineVision, setLogSink, cleanupSceneTempMedia, cleanupSceneRaceTempMedia, _getSmartPriority: getSmartPriority };
+module.exports = { downloadMedia, downloadAllMedia, initProviders, scoreDownloadedMedia: _scoreDownloadedMedia, enableInlineVision, setLogSink, cleanupSceneTempMedia, cleanupSceneRaceTempMedia, _getSmartPriority: getSmartPriority,
+    _isRealSubjectScene, _preferRealSourcesOverStock, _shouldTryControlledStockVideoFallback,
+    _setScriptContextRef: (ctx) => { scriptContextRef = ctx; } };

@@ -3,7 +3,8 @@ const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
 const config = require('../settings/config');
-const { callVisionAI, isVisionAIAvailable, getVisionProviderChain } = require('../brain/ai-provider');
+const { callVisionAI, isVisionAIAvailable, getVisionProviderChain, isVisionProviderUsable } = require('../brain/ai-provider');
+const { renderPersonSubjectRule } = require('../media/person-subject');
 
 /**
  * Vision AI analysis module.
@@ -323,8 +324,34 @@ async function scoreVideoFrame(base64Image, mimeType, keyword, context) {
         // this — grading a frame against the shortened form is how a correct clip
         // gets rejected for "not matching" half of a compound noun.
         const requestedVisual = String(context?.visualIntent || '').trim();
+        // The requested visual is a DIRECTOR'S SHOT NOTE, not a checklist.
+        //
+        // The planner writes it the way a director briefs a crew — it composes an actor, an
+        // action, a prop, a mood and often a graphic overlay into one sentence: "animated
+        // arrow pointing to a honey jar with moisture content label". No stock library,
+        // YouTube video or photograph on earth contains that combination, because half of it
+        // is art direction the renderer adds later, not something a camera ever recorded.
+        //
+        // Graded as a checklist it is unsatisfiable, and the failure is silent and expensive.
+        // Measured on the 2026-09-01 build: 118 of the 154 scenes that ended up reusing
+        // another scene's clip had ALREADY SEEN on-topic footage and rejected it. Real honey
+        // clips were scored 2/10 on honey scenes with reasons like "a hand holds a honey jar
+        // with a white lid, but no arrow or moisture content label is visible" and "close-up
+        // of honey being poured into a jar, no diagram visible". 35% of all rejections were
+        // phrased as a missing-element tick-list. The scene then borrowed a clip from
+        // somewhere else entirely — footage that matched the narration far WORSE than the
+        // one just thrown away.
+        //
+        // So state what the request is for. The subject still has to be right — an off-topic
+        // clip is still an off-topic clip and must still be rejected — but invented overlays,
+        // labels, arrows, staged actors and specific expressions are not evidence of a
+        // mismatch, because no real footage would ever have them.
         const requestedVisualBlock = requestedVisual && requestedVisual.toLowerCase() !== String(keyword || '').trim().toLowerCase()
-            ? `\nWHAT WAS ACTUALLY REQUESTED (the full request; the search keyword below is a shortened form of this): "${requestedVisual}"`
+            ? `\nWHAT WAS ACTUALLY REQUESTED (the full request; the search keyword below is a shortened form of this): "${requestedVisual}"
+HOW TO USE THAT REQUEST: it is a director's shot note, not a checklist. It may describe an actor, a staged action, a mood, or graphic elements (arrows, labels, callouts, text overlays, diagrams, highlights, animated markers) that the renderer adds afterwards and that NO real footage will ever contain. Judge the SUBJECT of the scene's narration — not the staging, and not the specific prop the request happened to name.
+- PASS (7+) when the frame shows the narration's subject in ANY real-world form. Ask: "is what I see part of the same real-world story the narration is telling?" The subject shown as a different object, an earlier or later stage of the same process, the raw material it comes from, a part of it, the place it happens, or the equipment and people involved — all still ARE the subject. A product and its factory, an animal and its habitat, a material and the thing made from it, a machine and its operator: same subject.
+- Do NOT deduct for missing invented extras. "No arrow visible", "no label", "no text overlay", "no diagram", "not holding it", "different expression", "different container", "the specific detail is not visible" are NOT mismatches.
+- REJECT (1-3) only when the frame shows a DIFFERENT subject altogether — something with nothing to do with what this scene is talking about. That has not changed: an off-topic clip is still off-topic.`
             : '';
         const contextBlock = context
             ? `${context.videoTopic ? `\nVideo topic: "${context.videoTopic}"` : ''}${requestedVisualBlock}${context.sceneText ? `\nScene narration: "${context.sceneText}"` : ''}${context.niche ? `\nContent niche: ${context.niche}` : ''}${context.theme ? `\nVisual theme: ${context.theme}` : ''}${context.tone ? `\nTone: ${context.tone}` : ''}${sourceTitleBlock}${context.entities?.length ? `\nKey entities: ${context.entities.slice(0, 5).join(', ')}` : ''}${context.entityContext?.length ? `\nEntity context for relevance (not search terms): ${context.entityContext.slice(0, 8).join(', ')}` : ''}${context.mediaAgent?.viewerNeed ? `\nMedia agent viewer need: ${context.mediaAgent.viewerNeed}` : ''}${context.mediaAgent?.minimumAcceptable || context.mediaAgent?.searchStrategy?.minimumAcceptable ? `\nMedia agent minimum acceptable: ${context.mediaAgent.minimumAcceptable || context.mediaAgent.searchStrategy.minimumAcceptable}` : ''}${context.mediaAgent?.acceptanceTest ? `\nMedia agent acceptance test: ${context.mediaAgent.acceptanceTest}` : ''}${context.mediaAgent?.mandatoryIdentity?.length ? `\nMANDATORY IDENTITY: ${context.mediaAgent.mandatoryIdentity.slice(0, 8).join(', ')} (${context.mediaAgent.identityEvidenceMode || 'frame-visible'})` : ''}${context.mediaAgent?.mandatoryVisible?.length ? `\nMANDATORY FRAME-VISIBLE ENTITY: ${context.mediaAgent.mandatoryVisible.slice(0, 8).join(', ')}` : ''}${context.mediaAgent?.mustShow?.length ? `\nMedia agent must show: ${context.mediaAgent.mustShow.slice(0, 8).join(', ')}` : ''}${context.mediaAgent?.mustAvoid?.length ? `\nMedia agent must avoid: ${context.mediaAgent.mustAvoid.slice(0, 8).join(', ')}` : ''}`
@@ -341,7 +368,8 @@ ${hunter.allowGraphics ? '- Graphics/maps/templates are allowed for this scene.'
 ${hunter.allowScreen ? '- Screen/device/interface footage is allowed if it directly fits the scene.' : ''}
 ${hunter.allowRelevantPeople ? '- Relevant-person exception is enabled: clean footage of the named/relevant subject is allowed if it is not a presenter package.' : ''}
 
-If strict raw footage is YES: score 7+ ONLY for clean live-action footage that visibly matches the target. Do not reward a frame just because text on screen mentions the topic. Anchors, presenters, commentators, picture-in-picture faces, subtitles, lower thirds, charts, infographics, thumbnails, maps/satellite screenshots, route graphics, animated explainers, or studio shots should be capped at 2-3 unless graphics are explicitly allowed. Clean footage of a relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when that person is the subject/context, not the presenter.`
+If strict raw footage is YES: score 7+ ONLY for clean live-action footage that visibly matches the target. Do not reward a frame just because text on screen mentions the topic. Anchors, presenters, commentators, picture-in-picture faces, subtitles, lower thirds, charts, infographics, thumbnails, maps/satellite screenshots, route graphics, animated explainers, or studio shots should be capped at 2-3 unless graphics are explicitly allowed. Clean footage of a relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when that person is the subject/context, not the presenter.
+${renderPersonSubjectRule(hunter.personSubject)}`
             : '';
         const mediaType = String(context?.mediaType || '').toLowerCase();
         const sourceHint = String(context?.sourceHint || '').toLowerCase();
@@ -490,54 +518,40 @@ Reply format (exactly 2 lines):
 [your one-sentence description]
 [score number]`;
 
+        // ── The judge panel ─────────────────────────────────────────────────
+        // Two models score the SAME prompt at the same time and the scores are
+        // averaged. Not redundancy — error cancellation. Measured on 11 labelled
+        // real race frames (logs/vision-judge-bench.json), every judge available
+        // to this account fails in one of two directions, and the two directions
+        // are not equally survivable:
+        //
+        //   OVER-LITERAL  (Qwen3-VL, Nova Pro) — rejects footage that is fine.
+        //                 Costs the scene entirely → placeholder card. Unrecoverable.
+        //   OVER-LENIENT  (Nova Lite)          — passes AI renders and watermarks.
+        //                 Costs one weak clip → retry, referee, manual swap. Recoverable.
+        //
+        // Alone: Nova Lite 8/11, Qwen3-VL 9/11. Averaged: 10/11 — better than
+        // either, because their mistakes point opposite ways and cancel. Note
+        // WHERE they gain: Lite alone keeps 5/5 good clips but lets 3 bad ones
+        // through; Qwen alone kills 6/6 bad ones but throws away 2 good ones.
+        // The average keeps all 5 good clips AND kills 5 of 6 bad ones, which is
+        // the combination neither can reach alone. The only judge that scored
+        // 11/11 alone was Sonnet 4.6, and this account's Sonnet quota is 6-16
+        // frames/minute: a real 50-scene build spent 2 hours parked in the rate
+        // limiter and reached scene 9. The pair runs ~100/minute at ~1/5 the cost.
+        //
+        // Off by default; config.js turns it on for the Bedrock backend only.
+        const panel = _judgePanel();
+        if (panel) {
+            const verdict = await _scoreWithPanel(panel, prompt, base64Image, mimeType);
+            // null = nobody on the panel returned a readable score. Fall through
+            // to the ordinary chain rather than inventing a verdict — the chain
+            // has judges the panel doesn't, and one more call beats a wrong score.
+            if (verdict) return verdict;
+        }
+
         const response = await callVisionAI(prompt, base64Image, mimeType);
-        const lines = response.trim().split('\n').filter(l => l.trim());
-        let description = '';
-        // null = "not parsed yet" — NEVER 0. Every parse path below clamps with
-        // Math.max(1, …), so a successfully parsed score can never BE 0. Using 0
-        // as the sentinel made "I could not read the answer" indistinguishable
-        // from a real verdict: the caller reported it upward as "vision API
-        // unavailable", and one working model rejecting junk could abort an
-        // entire footage race. 1 in 5 judged candidates were binned this way.
-        let score = null;
-
-        // Parse: last line with a number is the score, everything before is description
-        for (let i = lines.length - 1; i >= 0; i--) {
-            const rawLine = lines[i].trim();
-            // Strict original form FIRST, so every response that parsed before
-            // still parses to exactly the same value; the tolerant form only
-            // ever rescues lines that used to fall through as unparseable.
-            const numMatch = rawLine.match(/^(\d+)$/);
-            const parsed = numMatch ? parseInt(numMatch[1]) : _scoreFromScoreLine(rawLine);
-            if (parsed !== null) {
-                score = Math.min(10, Math.max(1, parsed));
-                description = lines.slice(0, i).join(' ').trim();
-                break;
-            }
-        }
-
-        // Fallback: find an explicit score-looking number. Do not grab random
-        // visual numbers like "4K", model numbers, years, or quantities.
-        if (score === null) {
-            const scoreLike = response.match(/(?:score|rating)\D{0,16}(10|[0-9])\s*(?:\/\s*10)?/i)
-                || response.match(/(?:^|\n)\s*(10|[0-9])\s*(?:\/\s*10)?\s*$/m);
-            if (scoreLike) score = Math.min(10, Math.max(1, parseInt(scoreLike[1])));
-            description = lines[0] || response.trim();
-        }
-
-        // Last resort before paying for a retry: the model merged both lines and
-        // appended the score to its description ("… at dusk. 7" / "… at dusk — 7/10").
-        // A punctuation separator is REQUIRED so this can never lift a number out
-        // of prose ("7 floors", "Route 66.", "capacity 80,000").
-        if (score === null && lines.length) {
-            const tail = lines[lines.length - 1].replace(/[*_`]/g, '').trim();
-            const merged = tail.match(/[.!?:;—–-]\s*(10|\d)\s*(?:\/\s*10)?\s*[.!]?$/);
-            if (merged) {
-                score = Math.min(10, Math.max(1, parseInt(merged[1])));
-                description = lines.slice(0, -1).join(' ').trim()
-                    || tail.slice(0, merged.index).trim();
-            }
-        }
+        const { score, description } = _parseScoreResponse(response);
 
         if (score === null) {
             // Score-less response (model rambled or quota-degraded into prose).
@@ -598,6 +612,237 @@ Reply format (exactly 2 lines):
         // (the API was broken, not the candidate).
         return { score: 0, description: 'Vision AI error', apiError: true, errorMessage: err?.message?.slice(0, 200) || 'unknown' };
     }
+}
+
+/**
+ * Turn one vision answer into { score, description }.
+ *
+ * Extracted verbatim from scoreVideoFrame so the judge panel can parse each
+ * judge's answer with the SAME code the single-judge path uses. Do not fork it:
+ * two parsers means two definitions of what a score is, and this one has already
+ * been fixed twice for bugs that only showed up at build scale.
+ *
+ * score === null means "could not read an answer" — NEVER 0. Every path below
+ * clamps with Math.max(1, …), so a successfully parsed score can never BE 0.
+ * Using 0 as the sentinel made "I could not read the answer" indistinguishable
+ * from a real verdict: the caller reported it upward as "vision API unavailable",
+ * and one working model rejecting junk could abort an entire footage race. 1 in 5
+ * judged candidates were binned this way.
+ */
+function _parseScoreResponse(response) {
+    const lines = String(response || '').trim().split('\n').filter(l => l.trim());
+    let description = '';
+    let score = null;
+
+    // Parse: last line with a number is the score, everything before is description
+    for (let i = lines.length - 1; i >= 0; i--) {
+        const rawLine = lines[i].trim();
+        // Strict original form FIRST, so every response that parsed before
+        // still parses to exactly the same value; the tolerant form only
+        // ever rescues lines that used to fall through as unparseable.
+        const numMatch = rawLine.match(/^(\d+)$/);
+        const parsed = numMatch ? parseInt(numMatch[1]) : _scoreFromScoreLine(rawLine);
+        if (parsed !== null) {
+            score = Math.min(10, Math.max(1, parsed));
+            description = lines.slice(0, i).join(' ').trim();
+            break;
+        }
+    }
+
+    // Fallback: find an explicit score-looking number. Do not grab random
+    // visual numbers like "4K", model numbers, years, or quantities.
+    if (score === null) {
+        const text = String(response || '');
+        const scoreLike = text.match(/(?:score|rating)\D{0,16}(10|[0-9])\s*(?:\/\s*10)?/i)
+            || text.match(/(?:^|\n)\s*(10|[0-9])\s*(?:\/\s*10)?\s*$/m);
+        if (scoreLike) score = Math.min(10, Math.max(1, parseInt(scoreLike[1])));
+        description = lines[0] || text.trim();
+    }
+
+    // Last resort before paying for a retry: the model merged both lines and
+    // appended the score to its description ("… at dusk. 7" / "… at dusk — 7/10").
+    // A punctuation separator is REQUIRED so this can never lift a number out
+    // of prose ("7 floors", "Route 66.", "capacity 80,000").
+    if (score === null && lines.length) {
+        const tail = lines[lines.length - 1].replace(/[*_`]/g, '').trim();
+        const merged = tail.match(/[.!?:;—–-]\s*(10|\d)\s*(?:\/\s*10)?\s*[.!]?$/);
+        if (merged) {
+            score = Math.min(10, Math.max(1, parseInt(merged[1])));
+            description = lines.slice(0, -1).join(' ').trim()
+                || tail.slice(0, merged.index).trim();
+        }
+    }
+
+    return { score, description };
+}
+
+// ── The footage judge panel ─────────────────────────────────────────────────
+// See the long note at the call site in scoreVideoFrame for the evidence. This
+// half is the mechanics.
+//
+// Nothing here is topic-, niche- or keyword-aware, and nothing here is a tuned
+// constant pretending to be a rule: the panel is one global mechanism whose
+// inputs are whichever judges the account can actually call right now. It
+// shrinks to one judge when a model dies mid-run and disappears entirely when
+// the backend has no panel configured, and in both cases the build keeps going
+// on exactly the code path it used before.
+
+const PANEL_DEFAULT_JUDGES = 'bedrock-nova,bedrock-qwen-vl';
+let _panelAnnounced = '';
+
+function _envOn(value, dflt = false) {
+    const v = String(value == null ? '' : value).trim();
+    if (!v) return dflt;
+    return /^(1|true|on|yes)$/i.test(v);
+}
+
+/**
+ * Resolve the panel for THIS frame, or null to use the ordinary vision chain.
+ *
+ * Re-resolved per frame on purpose. Judges die mid-run (entitlement 403, model
+ * withdrawn, key pool exhausted) and ai-provider records that; recomputing here
+ * means the panel degrades to a single judge — and then to the plain chain —
+ * the moment that happens, instead of throwing on every remaining frame.
+ */
+function _judgePanel() {
+    if (!_envOn(process.env.VISION_PANEL)) return null;
+
+    const requested = String(process.env.VISION_PANEL_JUDGES || PANEL_DEFAULT_JUDGES)
+        .split(',').map(s => s.trim()).filter(Boolean);
+    const seats = [...new Set(requested)].filter((p) => {
+        try { return isVisionProviderUsable(p); } catch (_) { return false; }
+    });
+
+    // One seat is not a panel — it is the ordinary single-judge path with extra
+    // steps, and the ordinary path has failover this one wouldn't.
+    if (seats.length < 2) {
+        if (_panelAnnounced && _panelAnnounced !== 'off') {
+            console.log(`  ⚠️ [panel] only ${seats.length} of ${requested.length} judges still usable — falling back to the normal vision chain`);
+            _panelAnnounced = 'off';
+        }
+        return null;
+    }
+
+    const key = seats.join('+');
+    if (_panelAnnounced !== key) {
+        console.log(`  ⚖️  [panel] footage judged by ${seats.length} models, scores averaged: ${seats.join(' + ')}`);
+        _panelAnnounced = key;
+    }
+
+    const gapRaw = parseInt(process.env.VISION_PANEL_ESCALATE_GAP || '0', 10);
+    return {
+        seats,
+        // 0 = off (the default). See _scoreWithPanel for why this ships off.
+        escalateGap: Number.isFinite(gapRaw) && gapRaw > 0 ? gapRaw : 0,
+        escalateTo: String(process.env.VISION_PANEL_ESCALATE_JUDGE || 'bedrock-nova-pro').trim(),
+        log: _envOn(process.env.VISION_PANEL_LOG, true),
+    };
+}
+
+/**
+ * Ask every named judge the same question at the same time.
+ *
+ * Each seat is PINNED (options.visionProvider), so a seat cannot quietly fall
+ * back onto its neighbour's model and turn the panel into one model voting
+ * twice. A seat that errors or answers unreadably simply doesn't vote.
+ */
+async function _collectVotes(seats, prompt, base64Image, mimeType) {
+    const settled = await Promise.allSettled(seats.map((provider) =>
+        callVisionAI(prompt, base64Image, mimeType, {
+            visionProvider: provider,
+            // The panel calls the same frame N times; only the first needs to
+            // announce that it was resized.
+            logVisionCompression: false,
+        })
+    ));
+
+    const votes = [];
+    let unreadable = null;
+    settled.forEach((r, i) => {
+        if (r.status === 'rejected') {
+            // An undecodable frame is a defect in the CANDIDATE, not an outage,
+            // and every seat will hit it. Surface it immediately instead of
+            // paying for a full fallback chain to rediscover it.
+            if (r.reason?.visionImageUnreadable) unreadable = r.reason;
+            return;
+        }
+        const { score, description } = _parseScoreResponse(r.value);
+        if (score === null) return;
+        votes.push({ provider: seats[i], score, description });
+    });
+
+    if (!votes.length && unreadable) throw unreadable;
+    return votes;
+}
+
+/** Average the panel's votes into the single 1-10 score the pipeline expects. */
+function _panelVerdict(votes, log) {
+    const avg = votes.reduce((s, v) => s + v.score, 0) / votes.length;
+
+    // FLOOR, not round. Every gate downstream of this asks "is the score >= N"
+    // with N a whole number, and floor(x) >= N is true exactly when x >= N — so
+    // flooring preserves the panel's real decision at every threshold that
+    // exists. Rounding does not: an average of 5.5 rounds up to 6 and passes a
+    // clip BOTH judges put below the bar. That is not hypothetical — it is the
+    // neon-lit tunnel render on the bench (Lite 7, Qwen 4), which rounding
+    // admits and flooring correctly kills.
+    const score = Math.min(10, Math.max(1, Math.floor(avg)));
+
+    // Ship the reason that matches the number. Stable sort → ties go to the
+    // first-listed judge.
+    const closest = votes.slice().sort((a, b) => Math.abs(a.score - avg) - Math.abs(b.score - avg))[0];
+    const description = closest.description
+        || (votes.find(v => v.description) || {}).description
+        || '';
+
+    if (log) {
+        console.log(`  ⚖️  [panel] ${votes.map(v => `${v.provider.replace(/^bedrock-/, '')} ${v.score}`).join(' + ')} → ${score}`);
+    }
+
+    return {
+        score,
+        description,
+        // Diagnostics only. Additive fields — every existing caller reads
+        // .score/.description/.apiError/.parseError and is unaffected.
+        panel: votes.map(v => ({ provider: v.provider, score: v.score })),
+        panelAverage: Math.round(avg * 100) / 100,
+    };
+}
+
+/**
+ * Run the panel for one frame. Returns null when it produced no usable verdict,
+ * which tells the caller to fall through to the ordinary vision chain.
+ */
+async function _scoreWithPanel(panel, prompt, base64Image, mimeType) {
+    const votes = await _collectVotes(panel.seats, prompt, base64Image, mimeType);
+    if (votes.length === 0) return null;
+
+    // Optional third opinion when the two judges fundamentally disagree.
+    //
+    // SHIPS OFF (escalateGap 0). On the bench, escalating at a gap of 4+ turned
+    // 10/11 into 11/11 with a single extra call — but the bench contains exactly
+    // ONE frame with a gap that wide, and it happens to be a frame that SHOULD
+    // be rejected. There is no wide-gap frame in the data that should be kept,
+    // so the rule has never been tested in the direction where it could do harm:
+    // the escalation judge is over-literal, and dragging the average down on a
+    // GOOD clip is how scenes turn into placeholder cards. A rule fitted to one
+    // example is not a rule. Turn it on with VISION_PANEL_ESCALATE_GAP=4 once
+    // there is real evidence; it is deliberately not load-bearing.
+    if (panel.escalateGap > 0 && votes.length >= 2) {
+        const spread = Math.max(...votes.map(v => v.score)) - Math.min(...votes.map(v => v.score));
+        const already = votes.some(v => v.provider === panel.escalateTo);
+        if (spread >= panel.escalateGap && !already && panel.escalateTo) {
+            let usable = false;
+            try { usable = isVisionProviderUsable(panel.escalateTo); } catch (_) { usable = false; }
+            if (usable) {
+                if (panel.log) console.log(`  ⚖️  [panel] judges disagree by ${spread} — asking ${panel.escalateTo}`);
+                const extra = await _collectVotes([panel.escalateTo], prompt, base64Image, mimeType).catch(() => []);
+                votes.push(...extra);
+            }
+        }
+    }
+
+    return _panelVerdict(votes, panel.log);
 }
 
 /**
@@ -663,7 +908,7 @@ Do not infer or copy any filename, source caption, search-result title, metadata
 If present=true, transcribe the exact visible overlay letters. If you cannot transcribe at least 3 visible characters, present MUST be false.
 
 Reply with JSON only:
-{"present":false,"text":"","confidence":0}`, base64Image, mimeType, { maxTokens: 120 });
+{"present":false,"text":"","confidence":0}`, base64Image, mimeType, { maxTokens: 400 });
         return _parseEditorialOverlayVerification(raw);
     } catch (_) {
         return null;
@@ -760,7 +1005,7 @@ Return ONLY JSON: {"focusX": 0.0-1.0, "focusY": 0.0-1.0}
 - focusX: horizontal center of the subject (0=far left, 0.5=center, 1=far right)
 - focusY: vertical center of the subject (0=very top, 0.5=middle, 1=very bottom)
 For a standing/seated person, focusY is usually 0.15-0.4 (the head sits high). If no clear subject, return {"focusX":0.5,"focusY":0.5}. No prose.`;
-        const raw = await callVisionAI(prompt, base64Image, mimeType, { maxTokens: 60 });
+        const raw = await callVisionAI(prompt, base64Image, mimeType, { maxTokens: 400 });
         const m = String(raw || '').match(/\{[^}]*\}/);
         if (!m) return fallback;
         const parsed = JSON.parse(m[0]);
@@ -802,6 +1047,9 @@ module.exports = {
     verifyEditorialTextOverlay,
     _parseEditorialOverlayVerification,
     _scoreFromScoreLine,
+    _parseScoreResponse,
+    _judgePanel,
+    _panelVerdict,
     detectSubjectFocus,
     detectSubjectFocusTrajectory,
     isVisionAvailable,

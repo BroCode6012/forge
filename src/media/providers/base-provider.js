@@ -208,7 +208,13 @@ class BaseProvider {
                     console.log(`  [${this.name}] 403 on download — retrying with ${refIdx === 1 ? 'host-origin' : 'no'} referer`);
                     continue;
                 }
-                if (abortSignal?.aborted || !_isTransientDownloadError(err) || attempt >= maxIters) {
+                // Same reasoning as the socket clamp in _downloadOnce: a retry that can
+                // only finish after the caller stopped waiting is pure cost. Checked here
+                // as well as there because the backoff sleep between attempts is itself
+                // time the scene no longer has.
+                const _deadlineAt = Number(opts.deadlineAt) || 0;
+                const _pastDeadline = _deadlineAt > 0 && Date.now() >= _deadlineAt;
+                if (abortSignal?.aborted || _pastDeadline || !_isTransientDownloadError(err) || attempt >= maxIters) {
                     throw err;
                 }
                 const delay = config.network?.lowBandwidth
@@ -226,7 +232,30 @@ class BaseProvider {
         if (abortSignal?.aborted) {
             throw new Error('aborted before request');
         }
-        const timeoutMs = Math.max(10_000, Number(opts.timeoutMs || config.network?.mediaDownloadTimeoutMs || 45_000) || 45_000);
+        // Never wait past the point where nobody is listening any more.
+        //
+        // The socket timeout used to be a flat 45s with no knowledge of the race running
+        // above it. `download-patience` measures a real per-provider budget from THIS run
+        // and the race hands each soldier its own deadline — Bing images typically got 32s
+        // — but neither number reached the request, so a dead URL sat on a socket for the
+        // full 45s and then the retry loop paid it again (maxIters is 5, so ~225s of
+        // waiting on one dead host). Measured 2026-09-01: 165 such timeouts in one build,
+        // 108 of them Bing.
+        //
+        // `deadlineAt` was already being passed in downloadOptions and simply never read.
+        // Clamping to it can only ever shorten the wait, and only past the moment the
+        // caller has already given up — bytes arriving after the deadline are discarded by
+        // the race regardless, so this removes waiting, never a candidate. Unset
+        // deadlineAt (0) keeps the previous behaviour exactly.
+        const configuredTimeoutMs = Math.max(10_000, Number(opts.timeoutMs || config.network?.mediaDownloadTimeoutMs || 45_000) || 45_000);
+        const deadlineAt = Number(opts.deadlineAt) || 0;
+        const msLeft = deadlineAt > 0 ? deadlineAt - Date.now() : Infinity;
+        if (msLeft <= 0) {
+            // Starting a request we already know will be thrown away costs a connection,
+            // a socket and a retry slot. Fail fast so the next provider gets the time.
+            throw new Error('download deadline already passed');
+        }
+        const timeoutMs = Math.min(configuredTimeoutMs, msLeft);
         const maxBytes = Number(opts.maxBytes) || (
             /\.(?:jpe?g|png|webp|bmp|gif)$/i.test(outputPath)
                 ? 80 * 1024 * 1024
