@@ -9,7 +9,7 @@
  * remembers whether THIS process started the machine so it only stops what it started (a
  * machine the user pre-warmed by hand is left running).
  *
- * bedrock / dashscope have no machine to manage → ensureReady() is a no-op ({ ok, skipped }).
+ * bedrock / dashscope / azure-managed have no machine to manage → ensureReady() is a no-op ({ ok, skipped }).
  */
 
 'use strict';
@@ -23,13 +23,16 @@ function backend() {
 }
 function backendLabel() {
     const b = backend();
-    return b === 'aws' ? 'AWS GPU box' : b === 'lightning' ? 'Lightning Studio' : b;
+    return b === 'aws' ? 'AWS GPU box'
+        : b === 'lightning' ? 'Lightning Studio'
+        : b === 'azure-managed' ? 'Azure Managed Compute'
+        : b;
 }
 function _mod() {
     const b = backend();
     if (b === 'aws') return require('./vision-box');
     if (b === 'lightning') return require('./lightning-box');
-    return null; // bedrock / dashscope — nothing to start/stop
+    return null; // bedrock / dashscope / azure-managed — nothing to start/stop
 }
 
 /** Is auto-control available for the current backend? */
@@ -50,6 +53,14 @@ async function isVisionReady() {
  * boot a cold machine, so stopIfStarted() later knows to shut it down.
  */
 async function ensureReady(opts = {}) {
+    // Footage checks served entirely by an AI Connection: the built-in GPU box
+    // would boot, bill and never be asked a single question.
+    try {
+        const eyes = require('../brain/connections').routeForJob('eyes');
+        if (eyes && !eyes.builtInBackup) {
+            return { ok: true, skipped: true, reason: `footage checks use AI connection "${eyes.connections[0].label}"` };
+        }
+    } catch (_) { /* connections unavailable — behave as before */ }
     const m = _mod();
     if (!m) return { ok: true, skipped: true, reason: `${backend()} has no GPU machine` };
     if (!m.isConfigured || !m.isConfigured()) {
@@ -68,6 +79,19 @@ async function ensureReady(opts = {}) {
     // persistence; set to 1 to disable retries.
     const maxAttempts = Math.max(1, Number(process.env.VISION_GPU_START_ATTEMPTS || 6));
     const baseDelayMs = Math.max(3, Number(process.env.VISION_GPU_RETRY_DELAY_SEC || 20)) * 1000;
+
+    // A WALL-CLOCK cap on the whole wake-up, not just an attempt count. The attempt
+    // budget alone reads as "six tries" but spends 20+40+60+80+90 = 290s ≈ 4.8 minutes
+    // of a build standing still. On 2026-08-27 every second of that was provably wasted:
+    // the pool's failure cooldown is 15 minutes, so no amount of waiting inside the
+    // window could have produced an account. Vision is an OPTIMISATION — Bedrock can
+    // always score — so the wait for it must be bounded by something a human would
+    // accept, and the machine must never decide otherwise. 0 disables the cap.
+    const startBudgetMs = Math.max(0, Number(process.env.VISION_GPU_START_BUDGET_MS || 120000));
+    const startedAt = Date.now();
+    const spent = () => Date.now() - startedAt;
+    const budgetLeft = () => (startBudgetMs === 0 ? Infinity : startBudgetMs - spent());
+
     let r = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try { r = await m.ensureReady(opts); }
@@ -85,7 +109,16 @@ async function ensureReady(opts = {}) {
             break;
         }
         if (attempt < maxAttempts) {
-            const delay = Math.min(baseDelayMs * attempt, 90000); // linear backoff, cap 90s
+            // Never sleep longer than the backend says is useful. A controller that knows
+            // when it can serve again (Lightning's cooling pool) gets to shorten the wait
+            // instead of being guessed at by a fixed backoff.
+            let delay = Math.min(baseDelayMs * attempt, 90000); // linear backoff, cap 90s
+            if (Number(r && r.retryAfterMs) > 0) delay = Math.min(delay, Number(r.retryAfterMs));
+            if (delay >= budgetLeft()) {
+                log(`❌ ${backendLabel()} not up after ${Math.round(spent() / 1000)}s (${(r && r.reason) || 'unknown'}) `
+                    + `— giving up rather than spending more of the build on it; vision falls back to Bedrock.`);
+                break;
+            }
             log(`⚠️ ${backendLabel()} wake-up attempt ${attempt}/${maxAttempts} failed (${(r && r.reason) || 'unknown'}) — retrying in ${Math.round(delay / 1000)}s…`);
             await new Promise((res) => setTimeout(res, delay));
         } else {

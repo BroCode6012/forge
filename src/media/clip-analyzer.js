@@ -17,6 +17,8 @@ const path = require('path');
 const { execFile } = require('child_process');
 const { callVideoAI, isVisionAIAvailable, getVisionProviderChain } = require('../brain/ai-provider');
 const config = require('../settings/config');
+const { renderPersonSubjectRule } = require('./person-subject');
+const { footageAcceptFloor } = require('./niche-strictness');
 // nvidia-client require REMOVED in 2026-05-25 cleanup.
 // pickLightweightTrimStart below is now a no-op (returns null) so callers
 // gracefully skip the trim-probe step.
@@ -192,6 +194,16 @@ function _wantsGraphic(mediaHunter) {
  * asked for is not.
  */
 const REQUESTED_GRAPHIC_RULE = '- This scene REQUESTED a drawn explanation (diagram / cross-section / schematic / chart). Score a clear, on-topic diagram or cutaway as good B-roll — its labels, dimensions and callouts are part of what was asked for, not defects. Still score 2 or lower for anchors, presenters, commentators, picture-in-picture faces, channel logos, news tickers, thumbnails, or a graphic about a DIFFERENT subject.';
+
+/**
+ * Same slot, same polarity flip, for a scene about the video's main character:
+ * the exact-moment requirement stops being a defect, the broadcast packaging we
+ * never want is still named. Resolved once per scene by media-hunter (see
+ * media/person-subject.js) and carried on the profile.
+ */
+function _personSubjectRule(mediaHunter) {
+    return renderPersonSubjectRule(mediaHunter?.personSubject);
+}
 
 function _isPromisingSegmentCandidate(context = {}) {
     const hunter = context.mediaHunter || {};
@@ -513,6 +525,7 @@ ${mediaHunter.prefer?.length ? `- Prefer visible: ${mediaHunter.prefer.slice(0, 
 ${mediaHunter.avoid?.length ? `- Avoid/reject: ${mediaHunter.avoid.slice(0, 10).join(', ')}` : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && !wantsGraphic ? '- If the clip is mainly anchors, presenters, commentators, picture-in-picture faces, subtitles, lower thirds, maps/satellite screenshots, route graphics, charts, infographics, thumbnails, or animated explainers, score it 2 or lower. Clean footage of a named/relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when they are the subject, not the presenter.' : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && wantsGraphic ? REQUESTED_GRAPHIC_RULE : ''}
+${_personSubjectRule(mediaHunter)}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && premiumStock ? `- EXCEPTION: this clip is from ${context.sourceProvider} (premium stock library). If it is a clean reference MAP/satellite/route diagram, 3D map, or map animation that VISIBLY shows the topic's actual place/region/route (e.g. the scene names "Bab el-Mandeb shipping lane" and the map labels Bab el-Mandeb, Red Sea, Suez), score it 6-8 as accurate B-roll. Cartoons, illustrations, non-map animated explainers, and generic world maps that do not visibly depict the topic are NOT exempt.` : ''}
 ${mediaHunter.allowScreen ? '- Screen/device/interface footage is allowed if it directly fits the scene.' : ''}` : '';
 
@@ -1000,6 +1013,7 @@ ${mediaHunter.prefer?.length ? `- Prefer visible: ${mediaHunter.prefer.slice(0, 
 ${mediaHunter.avoid?.length ? `- Avoid/reject: ${mediaHunter.avoid.slice(0, 10).join(', ')}` : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && !wantsGraphicSegment ? '- If a frame is mainly an anchor, presenter, commentator, picture-in-picture face, subtitle/lower-third, map/satellite screenshot, route graphic, chart, infographic, thumbnail, or animated explainer, reject it even when the topic text matches. Clean footage of a named/relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when they are the subject, not the presenter.' : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && wantsGraphicSegment ? REQUESTED_GRAPHIC_RULE : ''}
+${_personSubjectRule(mediaHunter)}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics ? '- Segment hunt rule: prefer exact keyword matches, but accept clean raw domain B-roll that matches the target visual and video topic when the exact place/event label is not visibly provable from the frame.' : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && premiumStockSegment ? `- EXCEPTION: this video is from ${context.sourceProvider} (premium stock library). A clean reference MAP/satellite/route diagram, 3D map, or map animation is ACCEPTABLE when it VISIBLY labels the topic's actual place/region/route. Cartoons, illustrations, non-map animated explainers, and generic world maps without topic labels are NOT exempt.` : ''}
 ${priorityChannelSegment ? '- PRIORITY CHANNEL EXCEPTION: this clip is from a trusted news channel for this niche. Treat baked-in channel logos, news-agency stamps, lower-third banners, and on-screen story captions as INTRINSIC broadcast graphics, NOT watermarks — DO NOT reject for them. Also treat subject-family equivalents within the scene domain as acceptable matches (e.g. for maritime keywords, cargo ship / container ship / oil tanker / bulk carrier / vessel / freighter are all valid; for military keywords, troops / soldiers / convoy / armored vehicle / military aircraft are interchangeable). Reject only when the frame shows a presenter face, animated/illustrated explainer, or a completely unrelated topic.' : ''}
@@ -1219,6 +1233,7 @@ ${mediaHunter.prefer?.length ? `- Prefer visible: ${mediaHunter.prefer.slice(0, 
 ${mediaHunter.avoid?.length ? `- Avoid/reject: ${mediaHunter.avoid.slice(0, 10).join(', ')}` : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && !wantsGraphicWindow ? '- This is strict raw footage. Reject if any frame is mainly an anchor, presenter, commentator, picture-in-picture face, subtitle/lower-third, big text overlay, map/satellite screenshot, route graphic, chart, infographic, thumbnail, or animated explainer. Clean footage of a named/relevant public figure, official, celebrity, athlete, worker, soldier, or event participant is allowed when they are the subject, not the presenter.' : ''}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && wantsGraphicWindow ? REQUESTED_GRAPHIC_RULE : ''}
+${_personSubjectRule(mediaHunter)}
 ${mediaHunter.strictRaw && !mediaHunter.allowGraphics && premiumStockWindow ? `- EXCEPTION: this clip is from ${context.sourceProvider} (premium stock library). PASS the window when it is a clean reference MAP/satellite/route diagram, 3D map, or map animation that VISIBLY labels the topic's actual place/region/route. Cartoons, illustrations, non-map animated explainers, and generic world maps without topic labels are NOT exempt.` : ''}
 ${priorityChannelWindow ? '- PRIORITY CHANNEL EXCEPTION: this window is from a trusted news channel for the scene niche. DO NOT REJECT for: baked-in channel logos, news-agency watermarks, lower-third banners, story-captions, foreign-language burned subtitles — these are intrinsic broadcast graphics, not packaging defects. Also accept subject-family equivalents within the scene domain (maritime: cargo ship / container ship / oil tanker / bulk carrier / vessel / freighter all interchangeable; military: troops / soldiers / armored vehicles / military aircraft interchangeable). Only REJECT for: presenter face on camera, animated/illustrated explainer, picture-in-picture commentary, or a hard cut to a completely unrelated topic.' : ''}
 ${mediaHunter.allowScreen ? '- Screen/device/interface footage is allowed if it directly fits the scene.' : ''}` : '';
@@ -1415,12 +1430,26 @@ function _parseWindowValidation(response, context = {}) {
     const watermarkProblem = /watermark|channel logo|agency stamp/.test(hardIssueText) && !smallWatermarkOnly;
     const hardProblem = nonWatermarkHardProblem || watermarkProblem;
 
+    // A person-subject scene accepts on-subject footage from a different day, so
+    // the window bar drops with it. So does a relaxed niche, where rough real
+    // footage of the actual people beats a polished clip of nobody — see
+    // media/niche-strictness.js. `hardProblem` is deliberately NOT relaxed by
+    // either: anchors, tickers, PiP faces and hard source changes still reject
+    // the window at any score, in every niche.
+    const strictWindowFloor = 6;
+    const windowFloor = footageAcceptFloor({
+        niche: context?.niche,
+        strictFloor: strictWindowFloor,
+        sourceProvider: context?.sourceProvider,
+        personSubjectActive: context?.mediaHunter?.personSubject?.active,
+    });
+
     if (explicitDecision === true) {
-        result.ok = !hardProblem && (!result.score || result.score >= 5);
+        result.ok = !hardProblem && (!result.score || result.score >= Math.min(5, windowFloor));
     } else if (explicitDecision === false) {
         result.ok = false;
     } else {
-        result.ok = Boolean(result.score >= 6 && !hardProblem);
+        result.ok = Boolean(result.score >= windowFloor && !hardProblem);
     }
 
     if (result.score === null) {

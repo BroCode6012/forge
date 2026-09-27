@@ -31,6 +31,15 @@ const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..', '..');
 
+// Pin the brain for this gate. `_getVisionChain()` inserts the azure-managed seat when
+// AI_PROVIDER=azure-managed, so on a machine actually configured that way this file was
+// asserting a chain shape the config never promised and failing for a reason that has
+// nothing to do with the code under test. It already pins VISION_BACKEND; a gate that
+// reads ambient config for the rest is testing the machine, not the software.
+// Found 2026-08-29.
+process.env.AI_PROVIDER = 'bedrock';
+
+
 let failures = 0;
 let checks = 0;
 function check(label, fn) {
@@ -46,7 +55,14 @@ function check(label, fn) {
 
 console.log('\n[vision-backend-routing] vision backend switch\n');
 
-const cfgSrc = fs.readFileSync(path.join(ROOT, 'src', 'settings', 'config.js'), 'utf8');
+// Read config.js with LF endings no matter how git checked it out. Every structural
+// regex below anchors on a bare newline, so on a CRLF working copy the resolver match
+// simply returned null — and every check that reads resolverMatch then reported a parse
+// failure instead of testing the code, including the anti-stacking rule that is the whole
+// point of section 1. A gate that cannot find its subject is a gate that is off. Found
+// 2026-08-28 adding the azure-managed backend: its four new overrides went unchecked.
+const cfgSrc = fs.readFileSync(path.join(ROOT, 'src', 'settings', 'config.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
 
 // ── 1. Anti-stacking: every override a branch writes must be in the snapshot ──────────
 const snapMatch = cfgSrc.match(/const _RAW_VISION_ENV = \{([\s\S]*?)\n\};/);
@@ -71,18 +87,15 @@ check('every env override written by a backend branch is in _RAW_VISION_ENV', ()
         + 'Add each to _RAW_VISION_ENV so the raw .env value is restored.');
 });
 
-// ── 2. The bedrock branch must name a reasoning-tier default, not a cheap one ─────────
-check('bedrock mode defaults its primary judge to a reasoning-tier model', () => {
-    const branch = resolverMatch[1].match(/else if \(backend === 'bedrock'\) \{([\s\S]*?)\n    \} else if/);
-    assert.ok(branch, "the backend === 'bedrock' branch was not found");
-    const def = branch[1].match(/BEDROCK_VISION_CLAUDE_MODEL\s*=\s*[\s\S]*?\|\|\s*'([^']+)'/);
-    assert.ok(def, 'no literal default model in the bedrock branch');
-    assert.ok(!/haiku|nova|lite|micro|mini|flash/i.test(def[1]),
-        `bedrock mode promotes Claude from emergency fallback to the primary judge for every `
-        + `candidate, so the default must be a reasoning-tier model — got "${def[1]}". `
-        + 'The scoring rubric is ~20 rules with an override hierarchy; a cheap tier misreads '
-        + 'the 5-vs-7 band, which is what decides footage vs placeholder card.');
-});
+// ── 2. Bedrock mode scores on a PANEL and leaves Claude as the backstop ─────────────
+//
+// The two checks that used to live here demanded a reasoning-tier Claude DEFAULT for
+// BEDROCK_VISION_CLAUDE_MODEL. That is the SUPERSEDED RULE described in the header
+// above: the branch stopped writing a default on 2026-08-05, when scoring moved to the
+// two-model panel and Claude went back to being the emergency backstop it is on every
+// other path. The checks were never updated to match, and the CRLF bug fixed above meant
+// nobody saw them fail. They are rewritten below, after the resolve, so they assert what
+// the branch actually promises and a real regression fails here instead of a stale rule.
 
 // ── 3. Behavioural: resolve for real and compare against THIS machine's baseline ──────
 const config = require(path.join(ROOT, 'src', 'settings', 'config.js'));
@@ -107,19 +120,38 @@ check('bedrock mode puts a Bedrock provider in the primary slot', () => {
         + 'VISION_EXCLUDE_QWEN, which hands the primary slot to whatever is next in the order');
 });
 
-check('bedrock mode honours VISION_BEDROCK_PRIMARY_MODEL, else the reasoning default', () => {
-    // Read the default out of the source rather than restating it. It was pinned as a
-    // literal here once and had to be edited in lockstep when the model changed
-    // (2026-08-04, sonnet-5 → sonnet-4-6); a gate that needs hand-editing to keep
-    // passing teaches people to edit the gate.
-    const def = resolverMatch[1].match(/BEDROCK_VISION_CLAUDE_MODEL\s*=\s*[\s\S]*?\|\|\s*'([^']+)'/);
-    assert.ok(def, 'no literal default model in the bedrock branch');
-    const expected = process.env.VISION_BEDROCK_PRIMARY_MODEL || def[1];
+check('bedrock mode judges footage with a panel, not one model', () => {
+    assert.strictEqual(process.env.VISION_PANEL, '1',
+        'bedrock mode must score on the two-model panel — no single model this account can '
+        + 'call is both accurate and fast enough to judge alone');
+    const judges = String(process.env.VISION_PANEL_JUDGES || '').split(',').filter(Boolean);
+    assert.ok(judges.length >= 2,
+        `the panel needs at least two judges to average — got [${judges.join(', ')}]`);
+});
+
+check('bedrock mode does not put a scarce-quota model in the chain primary slot', () => {
+    // The descriptive chain (subject position, burned-in text, storyboard windows) is
+    // high-volume and not evaluative, so its primary must be a high-RPM model. Promoting
+    // Claude here is the 2026-08-05 regression: right answers that arrive at 4-16 frames
+    // a minute lose to nearly-right ones that keep up.
+    assert.ok(!/claude/i.test(String(process.env.VISION_PROVIDER || '')),
+        `the chain primary is "${process.env.VISION_PROVIDER}" — Claude is the scarcest quota `
+        + 'on this account and belongs at the tail, not in front of every descriptive call');
+});
+
+check('bedrock mode leaves the Claude tier alone unless explicitly told otherwise', () => {
+    // The branch deliberately writes nothing here, so the .env value must stand untouched.
+    // A default reappearing is the superseded reasoning-tier promotion coming back.
+    const forced = process.env.VISION_BEDROCK_PRIMARY_MODEL;
+    const expected = forced || BASE.claudeModel;
     assert.strictEqual(process.env.BEDROCK_VISION_CLAUDE_MODEL, expected);
 });
 
 check('an Anthropic primary is named by its cross-region inference-profile id', () => {
-    const def = resolverMatch[1].match(/BEDROCK_VISION_CLAUDE_MODEL\s*=\s*[\s\S]*?\|\|\s*'([^']+)'/)[1];
+    // Reads the LIVE resolved value, not a source literal: the branch no longer writes a
+    // default, so the old source-scrape matched nothing and threw on [1] of null before it
+    // asserted anything at all.
+    const def = String(process.env.BEDROCK_VISION_CLAUDE_MODEL || '');
     if (!/anthropic/i.test(def)) return; // a non-Anthropic default is judged elsewhere
     assert.match(def, /^[a-z]{2,3}\.anthropic\./,
         `"${def}" is a bare model id. Anthropic models on Bedrock are INFERENCE_PROFILE-only, `
@@ -153,6 +185,124 @@ check('re-selecting bedrock re-applies identically (idempotent)', () => {
     config.resolveVisionBackend();
     assert.deepStrictEqual(
         { p: process.env.VISION_PROVIDER, m: process.env.BEDROCK_VISION_CLAUDE_MODEL }, first);
+});
+
+// ── 2b. Azure Managed Compute: the brain and the footage judge on ONE endpoint ────────
+//
+// 2026-08-27: picking "Azure Managed" in the AI Provider dropdown moved the TEXT brain
+// only. Vision Backend was a separate setting still reading `lightning`, so the build
+// spent five minutes on six doomed Lightning wake-ups ("all accounts exhausted") before
+// dumping footage scoring onto a Bedrock account whose token is invalid — every scene a
+// placeholder. The pairing is now explicit; this is the gate on it.
+process.env.VISION_BACKEND = 'azure-managed';
+config.resolveVisionBackend();
+
+check('azure-managed vision leads with azure-managed, not a GPU box', () => {
+    assert.strictEqual(process.env.VISION_PROVIDER, 'azure-managed',
+        `primary is "${process.env.VISION_PROVIDER}" — the deployment must own seat 0`);
+    assert.strictEqual(process.env.VISION_EXCLUDE_QWEN, '1',
+        'there is no self-hosted/DashScope Qwen endpoint in this mode, so leaving qwen in '
+        + 'the chain puts a dead URL in front of the live judge');
+    assert.strictEqual(process.env.VISION_PANEL, '0',
+        'the scoring panel is a Bedrock-only fix for Bedrock-only problems and must not '
+        + 'follow you onto a path whose primary judge is a dedicated deployment');
+});
+
+check('azure-managed starts no GPU machine (that is the whole point)', () => {
+    const gpu = require(path.join(ROOT, 'src', 'vision', 'vision-gpu.js'));
+    assert.strictEqual(gpu.isConfigured(), false,
+        'vision-gpu claims a machine to boot for azure-managed — that is the Lightning '
+        + 'wake-up storm coming back');
+});
+
+check('the azure-managed chain still keeps a fallback behind it', () => {
+    const chain = ai.getVisionProviderChain();
+    assert.strictEqual(chain[0], 'azure-managed', `chain leads with ${chain[0]}`);
+    assert.ok(chain.length > 1, 'no fallback behind the deployment');
+});
+
+check('AI_PROVIDER=azure-managed is the ONE value config.aiProvider honours', () => {
+    // AI_PROVIDER is a decoy for every other value — config.aiProvider is pinned to
+    // bedrock because the hybrid brains sit BESIDE it through their own task gates.
+    // azure-managed REPLACES Bedrock, so _getTextRoute has to see it as primary. While
+    // this was hardcoded, the dropdown option could never take effect: requests fell
+    // through to the hybrid AZURE_OPENAI_TASK_TYPES gate and 401'd against the wrong
+    // endpoint (2026-08-27 headless-build.log).
+    const cfgPath = require.resolve(path.join(ROOT, 'src', 'settings', 'config.js'));
+    const before = process.env.AI_PROVIDER;
+    try {
+        for (const [value, expected] of [['azure-managed', 'azure-managed'],
+            ['bedrock', 'bedrock'], ['ollama', 'bedrock'], ['', 'bedrock']]) {
+            process.env.AI_PROVIDER = value;
+            delete require.cache[cfgPath];
+            assert.strictEqual(require(cfgPath).aiProvider, expected,
+                `AI_PROVIDER="${value}" should resolve config.aiProvider to "${expected}"`);
+        }
+    } finally {
+        if (before === undefined) delete process.env.AI_PROVIDER;
+        else process.env.AI_PROVIDER = before;
+        delete require.cache[cfgPath];
+        require(cfgPath);
+    }
+});
+
+check('every AI Provider choice reaches the build child AND is locked', () => {
+    // Two halves, both required. config.aiProvider reading AI_PROVIDER (checked above)
+    // is useless if AI_PROVIDER never arrives: the schema marks aiProvider env:null, so
+    // it is not in the settings loop and must be written explicitly.
+    //
+    // The LOCK half is the subtle one. Only keys in `own` reach YTA_ENV_LOCK, and only
+    // locked keys survive the .env stack. applyBrainProvider() writes AI_PROVIDER into
+    // the repo .env on every dropdown change, so a choice that is passed conditionally
+    // — e.g. 'skip it when it equals the default' — leaves that default as the one value
+    // a stale file can overrule: pick Azure Managed, switch back to Bedrock, and the
+    // build keeps running on Azure while the UI says Bedrock.
+    const buildEnv = require(path.join(ROOT, 'src', 'settings', 'build-env.js'));
+    for (const pick of ['azure-managed', 'bedrock', undefined]) {
+        const { env } = buildEnv.applyOptionsToEnv({ aiProvider: pick },
+            { projectDir: path.join(ROOT, 'temp') });
+        const expected = pick || 'bedrock';
+        assert.strictEqual(env.AI_PROVIDER, expected,
+            `UI picked ${JSON.stringify(pick)} but the child would see ` +
+            `${JSON.stringify(env.AI_PROVIDER)}`);
+        const locked = String(env[buildEnv.ENV_LOCK_VAR] || '').split(',');
+        assert.ok(locked.includes('AI_PROVIDER'),
+            `AI_PROVIDER is not in ${buildEnv.ENV_LOCK_VAR} for choice ` +
+            `${JSON.stringify(pick)}, so a stale .env line still overrules the dropdown`);
+    }
+});
+
+check('an azure-managed brain carries the vision backend with it', () => {
+    // Azure Managed serves the reasoning model AND the footage judge from ONE endpoint,
+    // so the two settings are not independent. ui/js/app.js pairs the dropdowns, but that
+    // only fires when a human changes a <select> in the Electron app — a headless build,
+    // or a project saved before the Vision Backend control existed, arrives with
+    // visionBackend undefined. On 2026-08-29 that shipped a build whose whole text
+    // surface ran on the Azure deployment while every frame was offered first to a
+    // Lightning pool with no credits left, demoting the live judge to a fallback slot.
+    // The derivation therefore has to live in applyOptionsToEnv, which BOTH entry
+    // points call — not in the renderer.
+    const buildEnv = require(path.join(ROOT, 'src', 'settings', 'build-env.js'));
+    const run = (opts) => buildEnv.applyOptionsToEnv(opts, { projectDir: path.join(ROOT, 'temp') }).env;
+
+    const derived = run({ aiProvider: 'azure-managed' });
+    assert.strictEqual(derived.VISION_BACKEND, 'azure-managed',
+        'an azure-managed brain with no saved vision choice must bring vision with it; '
+        + `got ${JSON.stringify(derived.VISION_BACKEND)}`);
+    assert.ok(String(derived[buildEnv.ENV_LOCK_VAR] || '').split(',').includes('VISION_BACKEND'),
+        'the derived backend is not locked, so the repo .env can still overrule it');
+
+    // A deliberate choice is not a blank to fill.
+    assert.strictEqual(run({ aiProvider: 'azure-managed', visionBackend: 'lightning' }).VISION_BACKEND,
+        'lightning', 'an explicit vision choice must survive the pairing');
+
+    // And the pairing must not reach past its own brain. Assert on the LOCK, not the
+    // value: applyOptionsToEnv returns the merged environment, so an ambient
+    // VISION_BACKEND from the repo .env shows through legitimately. The lock list is what
+    // says whether THIS build claimed the key.
+    const bedrockEnv = run({ aiProvider: 'bedrock' });
+    assert.ok(!String(bedrockEnv[buildEnv.ENV_LOCK_VAR] || '').split(',').includes('VISION_BACKEND'),
+        'a bedrock brain claimed a vision backend it never asked for');
 });
 
 // ── 4. Verdicts stay versioned, so a judge change can be invalidated ──────────────────

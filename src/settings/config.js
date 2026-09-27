@@ -85,7 +85,10 @@ function parseEnvList(raw) {
 //   lightning — Lightning.ai serverless vLLM endpoint (LIGHTNING_VISION_URL/MODEL/API_KEY)
 //   bedrock   — AWS Bedrock vision (no self-hosted endpoint; routes the chain to Bedrock)
 //   dashscope — Alibaba DashScope hosted Qwen-VL
-// 'aws'/'dashscope' leave QWEN_* as configured; 'lightning'/'bedrock' override at load.
+//   azure-managed — Azure Managed Compute deployment (same endpoint as the azure-managed
+//               text brain; no GPU machine to start, no key pool to rotate)
+// 'aws'/'dashscope' leave QWEN_* as configured; 'lightning'/'bedrock'/'azure-managed'
+// override at load.
 //
 // resolveVisionBackend() is re-runnable: it snapshots the raw .env baseline ONCE, then
 // every call restores that baseline before applying the chosen backend. That makes it safe
@@ -103,11 +106,18 @@ const _RAW_VISION_ENV = {
     QWEN_OMNI_API_KEY: process.env.QWEN_OMNI_API_KEY,
     VISION_PROVIDER: process.env.VISION_PROVIDER,
     VISION_EXCLUDE_QWEN: process.env.VISION_EXCLUDE_QWEN,
+    VISION_FALLBACK_ORDER: process.env.VISION_FALLBACK_ORDER,
     QWEN_VISION_MAX_CONCURRENCY: process.env.QWEN_VISION_MAX_CONCURRENCY,
     // Set by the 'bedrock' branch below. Listed here so switching back to aws/lightning
     // restores the cheap fallback-tier model instead of leaving Sonnet stacked on a path
     // where Claude is only the emergency fallback.
     BEDROCK_VISION_CLAUDE_MODEL: process.env.BEDROCK_VISION_CLAUDE_MODEL,
+    // Also set by the 'bedrock' branch. The judge panel is a Bedrock-only idea —
+    // it exists because no SINGLE Bedrock model this account can call is both
+    // accurate and fast. On the GPU-box paths the primary judge is the rented
+    // Qwen box, which has neither problem, so the panel must not follow you there.
+    VISION_PANEL: process.env.VISION_PANEL,
+    VISION_PANEL_JUDGES: process.env.VISION_PANEL_JUDGES,
 };
 function _restoreRawVisionEnv() {
     for (const [k, v] of Object.entries(_RAW_VISION_ENV)) {
@@ -150,37 +160,129 @@ function resolveVisionBackend() {
         // next in VISION_PROVIDER_ORDER (bedrock-qwen-vl). Honour an explicit *Bedrock*
         // choice; ignore a stale non-Bedrock one. VISION_PROVIDER is in _RAW_VISION_ENV, so
         // the .env value comes back untouched when the user switches away.
-        if (!/^bedrock/.test(String(process.env.VISION_PROVIDER || '').toLowerCase())) {
-            process.env.VISION_PROVIDER = 'bedrock-claude';
-        }
-        // Bedrock mode promotes Claude from emergency fallback to PRIMARY judge for every
-        // candidate, so it runs at the reasoning tier. The scoring rulebook in
-        // vision/ai-vision.js is ~20 rules with an override hierarchy plus one genuinely
-        // subtle call (truthful proxy evidence vs symbolism); that call decides the 5-vs-7
-        // band, and the 5-vs-7 band decides whether a scene gets footage or a placeholder
-        // card. A wrong verdict costs a rebuild, the upgrade costs about a dollar.
-        // BEDROCK_VISION_CLAUDE_MODEL is deliberately NOT consulted as the input here: it
-        // carries the cheap fallback-tier value the aws/lightning chains want, where
-        // bedrock-claude is only an emergency backstop. Override the primary with
-        // VISION_BEDROCK_PRIMARY_MODEL. Writing the resolved value back into
-        // BEDROCK_VISION_CLAUDE_MODEL is safe because that key is in _RAW_VISION_ENV.
+        // ── Bedrock mode splits vision into two jobs with two different answers ──
         //
-        // 2026-08-04: the default was `us.anthropic.claude-sonnet-5`, which this account
-        // has NO entitlement for — every call 403'd and silently fell back to
-        // bedrock-qwen-vl. Measured on 9 labelled real race frames
-        // (scripts/vision-judge-bench.js), that stand-in judge scored 0/3 on footage a
-        // human would happily use, which is exactly the "no footage — placeholder stands
-        // in" symptom. Sonnet 4.6 was the only probed model that both keeps good footage
-        // and catches all three rule-traps. Re-measure with the bench before changing it;
+        // SCORING footage (scoreVideoFrame) is a judgement call under a ~20-rule
+        // rubric with an override hierarchy, and it decides whether a scene gets
+        // real footage or a placeholder card. It runs on a two-model PANEL.
+        // EVERY OTHER vision call — where is the subject, is there text burned
+        // into this frame, which second of this YouTube video shows the thing —
+        // is descriptive, not evaluative, and runs on the ordinary failover chain.
+        //
+        // 2026-08-04: the primary default was `us.anthropic.claude-sonnet-5`, which
+        // this account has NO entitlement for — every call 403'd and silently fell
+        // back to bedrock-qwen-vl, and that stand-in judge scored 0/3 on footage a
+        // human would happily use: exactly the "no footage — placeholder stands in"
+        // symptom.
+        //
+        // 2026-08-05 measured on 11 labelled real race frames, 6 models
+        // (scripts/vision-judge-bench.js; frames in <project>/.bench-frames). Two
+        // failure modes, fatal in OPPOSITE directions — OVER-LITERAL rejects good
+        // footage (→ placeholder cards), OVER-LENIENT passes AI renders and
+        // watermarks (→ junk in the video):
+        //
+        //   Sonnet 4.6      keeps 5/5  kills 6/6  traps 4/4   3.4s   ← only clean sweep
+        //   Qwen3-VL 235B   keeps 3/5  kills 6/6  traps 4/4   1.7s   over-literal
+        //   Nova Lite       keeps 5/5  kills 3/6  traps 3/4   1.2s   over-lenient
+        //   Nova Pro        keeps 3/5  kills 6/6  traps 4/4   1.2s   over-literal
+        //   Nova Premier    keeps 0/5  degenerate            48.9s   unusable
+        //   Nova 2 Lite     errored on all 11 frames                 not callable here
+        //
+        // Sonnet won and is still unusable: this account's Sonnet 4.6 vision quota
+        // cannot be raised, and the AIMD pacer measured the real ceiling at 4-16
+        // frames/minute under a live build's concurrency. Log
+        // app-2026-08-05T13-19-16: 23 minutes, 800 rate-limit waits totalling ~2
+        // hours of dead time, scene 9 of 50. A judge that is right and never
+        // arrives loses to a judge that is nearly right and does.
+        //
+        // Re-measure with the bench before changing any of this;
         // scripts/bedrock-vision-probe.js proves entitlement, `ListFoundationModels`
-        // does not.
-        process.env.BEDROCK_VISION_CLAUDE_MODEL =
-            process.env.VISION_BEDROCK_PRIMARY_MODEL || 'us.anthropic.claude-sonnet-4-6';
+        // does not, and the AWS quota tables list models (Gemma 3, Nemotron Nano 2 VL)
+        // this account cannot call at all.
+
+        // ── Job 1: scoring → the panel ──────────────────────────────────────
+        // Nova Lite and Qwen3-VL judge the same frame at the same time and the
+        // scores are averaged. Alone: Lite 8/11, Qwen 9/11. Averaged: 10/11 —
+        // and the gain is structural, not luck. Lite keeps every good clip but
+        // waves 3 bad ones through; Qwen kills every bad clip but bins 2 good
+        // ones. Averaged, the pair keeps all 5 good AND kills 5 of 6 bad.
+        // ~100 frames/minute (separate per-model quotas, so the pair's throughput
+        // adds), 1.7s/frame, ~1/5 the cost of Sonnet. See src/vision/ai-vision.js.
+        //
+        // This is Bedrock-only by design. On the aws/lightning paths the primary
+        // judge is the rented Qwen box, which is neither slow nor rate-limited, so
+        // there is nothing for a panel to fix. Both keys are in _RAW_VISION_ENV.
+        process.env.VISION_PANEL = process.env.VISION_BEDROCK_PANEL || '1';
+        process.env.VISION_PANEL_JUDGES =
+            process.env.VISION_BEDROCK_PANEL_JUDGES || 'bedrock-nova,bedrock-qwen-vl';
+
+        // ── Job 2: everything else → the failover chain ─────────────────────
+        // Qwen3-VL leads here even though it is the over-literal one, because
+        // "over-literal" is a scoring flaw: it means refusing to accept a proxy
+        // shot as good enough. The chain no longer scores anything. For reading
+        // pixels back — subject position, burned-in text, does frame N contain
+        // the thing — literal is exactly what you want, and Qwen3-VL is the
+        // strongest model this account can call at 100 RPM. Nova Lite backs it
+        // (200 RPM, cheapest), Claude last as the emergency backstop it is on
+        // every other path.
+        if (!/^bedrock/.test(String(process.env.VISION_PROVIDER || '').toLowerCase())) {
+            process.env.VISION_PROVIDER = 'bedrock-qwen-vl';
+        }
         process.env.VISION_EXCLUDE_QWEN = '1';
+        // The .env VISION_FALLBACK_ORDER is NOT treated as consent here: it ships
+        // as `bedrock-qwen-vl,bedrock-claude,bedrock-nova`, the correct tail for the
+        // aws/lightning paths, where the rented box leads and Bedrock is backup.
+        // Reusing it here would put Claude — the scarcest quota on the account —
+        // second in line for every descriptive call. VISION_BEDROCK_FALLBACK_ORDER
+        // is the deliberate per-mode override. VISION_FALLBACK_ORDER is in
+        // _RAW_VISION_ENV, so switching back to aws/lightning restores the .env
+        // value untouched.
+        process.env.VISION_FALLBACK_ORDER =
+            process.env.VISION_BEDROCK_FALLBACK_ORDER || 'bedrock-nova,bedrock-claude';
+        // BEDROCK_VISION_CLAUDE_MODEL is deliberately left at whatever .env says
+        // (default: Haiku 4.5). Claude is the last-resort backstop again, not the
+        // primary, so the reasoning-tier upgrade that used to happen here would now
+        // just be an expensive way to answer "where is the subject in this frame".
+        // VISION_BEDROCK_PRIMARY_MODEL still forces it for anyone who wants it.
+        if (process.env.VISION_BEDROCK_PRIMARY_MODEL) {
+            process.env.BEDROCK_VISION_CLAUDE_MODEL = process.env.VISION_BEDROCK_PRIMARY_MODEL;
+        }
         const _primary = process.env.VISION_PROVIDER === 'bedrock-claude'
             ? process.env.BEDROCK_VISION_CLAUDE_MODEL
             : process.env.VISION_PROVIDER;
-        console.log(`👁️  Vision backend: AWS Bedrock (primary ${_primary}, fallback Qwen3 VL 235B → Nova)`);
+        console.log(`👁️  Vision backend: AWS Bedrock (scoring panel ${process.env.VISION_PANEL === '1' ? process.env.VISION_PANEL_JUDGES : 'OFF'}, other vision ${_primary} → ${process.env.VISION_FALLBACK_ORDER})`);
+    } else if (backend === 'azure-managed') {
+        // Azure Managed Compute hosts the vision model as a normal deployment on the
+        // SAME endpoint as the text brain — there is no GPU machine to boot, no tunnel
+        // to capture and no DashScope key pool to rotate. vision-gpu.js already treats
+        // any backend it has no controller for as "nothing to start", so picking this
+        // is what actually stops the Lightning Studio wake-up from running.
+        //
+        // 2026-08-27: picking "Azure Managed" in the AI Provider dropdown moved the
+        // TEXT brain only. VISION_BACKEND was a separate setting still reading
+        // `lightning`, so every build spent ~5 minutes on six doomed Lightning wake-up
+        // attempts ("all Lightning accounts are exhausted") before dumping scoring onto
+        // a Bedrock account whose token is invalid. Hence this backend.
+        process.env.VISION_PROVIDER = 'azure-managed';
+        // No self-hosted/DashScope Qwen endpoint exists in this mode — leaving 'qwen'
+        // at the head of the chain would put a dead URL in front of the live judge.
+        process.env.VISION_EXCLUDE_QWEN = '1';
+        // Bedrock is the tail, not the head: same emergency-backstop role it has on the
+        // aws/lightning paths. VISION_AZURE_MANAGED_FALLBACK_ORDER overrides deliberately.
+        process.env.VISION_FALLBACK_ORDER =
+            process.env.VISION_AZURE_MANAGED_FALLBACK_ORDER || 'bedrock-qwen-vl,bedrock-nova,bedrock-claude';
+        // The two-judge scoring panel is a Bedrock-only fix for Bedrock-only problems
+        // (no single callable model there is both accurate and fast). It must not follow
+        // you onto a path whose primary judge is a dedicated deployment.
+        process.env.VISION_PANEL = '0';
+        const _am = process.env.AZURE_MANAGED_ENDPOINT || '';
+        const _amModel = process.env.AZURE_MANAGED_VISION_MODEL
+            || process.env.AZURE_MANAGED_DEFAULT_MODEL || 'qwen--qwen38-27b';
+        if (!_am || !process.env.AZURE_MANAGED_API_KEY) {
+            console.warn('⚠️  VISION_BACKEND=azure-managed but AZURE_MANAGED_ENDPOINT/AZURE_MANAGED_API_KEY is empty — vision falls back to the Bedrock chain');
+        } else {
+            console.log(`👁️  Vision backend: Azure Managed Compute (${_amModel} @ ${_am} → ${process.env.VISION_FALLBACK_ORDER})`);
+        }
     } else if (backend === 'dashscope') {
         process.env.QWEN_BASE_URL = process.env.QWEN_DASHSCOPE_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
         console.log('👁️  Vision backend: DashScope (hosted Qwen-VL)');
@@ -195,10 +297,23 @@ function resolveVisionBackend() {
 resolveVisionBackend();
 
 const config = {
-    // Text provider is always Bedrock (DeepSeek V3.2 + Claude Sonnet/Haiku).
-    // Other providers (ollama, openai, claude, deepseek, gemini, nvidia, groq)
-    // were removed 2026-05-25.
-    aiProvider: 'bedrock',
+    // Text provider is Bedrock (DeepSeek V3.2 + Claude Sonnet/Haiku) for every value
+    // of AI_PROVIDER except ONE. Other providers (ollama, openai, claude, deepseek,
+    // gemini, nvidia, groq) were removed 2026-05-25, and the hybrid brains (AiLink,
+    // APlink, Azure Claude, Azure OpenAI) sit BESIDE Bedrock through their own
+    // *_TASK_TYPES gates rather than through this field — so AI_PROVIDER stayed a
+    // decoy and this was hardcoded 'bedrock'.
+    //
+    // 'azure-managed' is the exception: Azure Managed Compute REPLACES Bedrock
+    // (one endpoint, two deployments, no Bedrock fallback), so _getTextRoute has to
+    // see it as the primary. Hardcoding 'bedrock' meant the dropdown's Azure Managed
+    // option could never take effect — the request fell through to the hybrid
+    // AZURE_OPENAI_TASK_TYPES gate and 401'd against the wrong endpoint
+    // (2026-08-27 headless-build.log). Every OTHER value still pins to bedrock, so
+    // nothing outside this one option changes behavior.
+    aiProvider: String(process.env.AI_PROVIDER || '').trim().toLowerCase() === 'azure-managed'
+        ? 'azure-managed'
+        : 'bedrock',
     // Vision provider override. When empty, _getVisionChain picks direct
     // DashScope Qwen first to use free quota, then Bedrock quality fallbacks.
     visionProvider: process.env.VISION_PROVIDER || '',
@@ -301,6 +416,24 @@ const config = {
         plannerModel: process.env.AZURE_OPENAI_PLANNER_MODEL || '',
         plannerTaskTypes: ['brain', 'planner-outline', 'planner-large', 'planner-small'],
         allowedTasks: (process.env.AZURE_OPENAI_TASK_TYPES || '')
+            .split(',').map(s => s.trim()).filter(Boolean),
+    },
+
+    // Azure AI Foundry — Managed Compute (single endpoint, two models).
+    // Brain-tier tasks route to AZURE_MANAGED_BRAIN_MODEL; everything else
+    // (default text, vision, scoring) uses AZURE_MANAGED_DEFAULT_MODEL.
+    // Gated by AZURE_MANAGED_TASK_TYPES set from the dropdown.
+    azureManaged: {
+        apiKey: process.env.AZURE_MANAGED_API_KEY || '',
+        baseUrl: process.env.AZURE_MANAGED_ENDPOINT || '',
+        brainModel: process.env.AZURE_MANAGED_BRAIN_MODEL || 'deepreinforce-ai--ornith-10-397b',
+        defaultModel: process.env.AZURE_MANAGED_DEFAULT_MODEL || 'qwen--qwen38-27b',
+        // Vision is configured separately from text for the same reason it is on the
+        // other Azure providers: one resource can host a strong text deployment and a
+        // different vision-capable one, and moving text must not silently move the
+        // footage judge. Unset → the default text deployment.
+        visionModel: process.env.AZURE_MANAGED_VISION_MODEL || '',
+        brainTaskTypes: (process.env.AZURE_MANAGED_BRAIN_TASK_TYPES || '')
             .split(',').map(s => s.trim()).filter(Boolean),
     },
 

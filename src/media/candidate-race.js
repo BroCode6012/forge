@@ -28,6 +28,104 @@
 
 const fs = require('fs');
 const { refereeAcceptedCandidates } = require('./candidate-referee');
+const { footageSourceClass, realSourceScoreBonus } = require('./niche-strictness');
+const { withCostPurpose } = require('../brain/cost-tracker');
+
+// ── Screen-aware racing ─────────────────────────────────────────────────────
+// Before any download, the Thumbnail Screen looks at up to 25 preview pictures
+// in ONE vision call and says, per candidate, whether it shows the subject.
+// Without this, a batch of 5 soldiers was filled straight past the 2 the screen
+// had confirmed and into 3 it had just watched show something else — each one
+// downloaded and judged again, at a vision call apiece, to learn what the grid
+// already said. On the Sep-3 bench build 68% of downloaded clips scored 3/10 or
+// lower, and 71% of races ended with no winner at all.
+//
+// Still a RANKING, never a gate — nothing the screen declined is thrown away:
+//   1. candidates it declined race only after every other candidate has had
+//      its turn, and never in the same batch as them;
+//   2. when their turn comes, a small PROBE goes first. If the probe finds
+//      nothing either, the screen has now been confirmed twice and the race
+//      stops instead of downloading the rest;
+//   3. the screen has to keep earning that trust. Every probe is scored, and a
+//      provider whose declined candidates win about as often as the ones the
+//      screen liked stops being deferred for the rest of the run.
+// Learns inside the run only — nothing here is persisted between builds.
+const SCREEN_TRUST_MIN_PROBED = 6;
+const _screenRecord = new Map(); // providerKey -> { lead, leadAccepted, declined, declinedAccepted }
+const _economy = {
+    races: 0,
+    screenedRaces: 0,
+    soldiers: 0,
+    leadSoldiers: 0,
+    leadAccepted: 0,
+    declinedSoldiers: 0,
+    declinedAccepted: 0,
+    probes: 0,
+    racesEndedByProbe: 0,
+    declinedNeverDownloaded: 0,
+    heldWinnersKept: 0,
+    distrustedProviders: [],
+};
+
+function _screenRecordFor(providerKey) {
+    const key = providerKey || 'unknown';
+    if (!_screenRecord.has(key)) _screenRecord.set(key, { lead: 0, leadAccepted: 0, declined: 0, declinedAccepted: 0 });
+    return _screenRecord.get(key);
+}
+
+/**
+ * Is this provider's "the picture shows something else" still worth acting on?
+ * It is until the probes prove otherwise: once enough declined candidates have
+ * been raced, they must win clearly less often than the ones the screen liked.
+ */
+function screenDeferralTrusted(providerKey) {
+    if (String(process.env.FOOTAGE_RACE_SCREEN_DEFER || '').trim() === '0') return false;
+    const rec = _screenRecordFor(providerKey);
+    if (rec.declined < SCREEN_TRUST_MIN_PROBED) return true;
+    const declinedRate = rec.declinedAccepted / Math.max(1, rec.declined);
+    const leadRate = rec.leadAccepted / Math.max(1, rec.lead);
+    return declinedRate < leadRate * 0.5;
+}
+
+function _noteSoldiers(providerKey, band, count, acceptedCount) {
+    const rec = _screenRecordFor(providerKey);
+    if (band === 'declined') {
+        rec.declined += count;
+        rec.declinedAccepted += acceptedCount;
+        _economy.declinedSoldiers += count;
+        _economy.declinedAccepted += acceptedCount;
+    } else {
+        rec.lead += count;
+        rec.leadAccepted += acceptedCount;
+        _economy.leadSoldiers += count;
+        _economy.leadAccepted += acceptedCount;
+    }
+}
+
+function getRaceEconomy() {
+    return JSON.parse(JSON.stringify(_economy));
+}
+
+function resetRaceEconomy() {
+    _screenRecord.clear();
+    for (const key of Object.keys(_economy)) {
+        _economy[key] = Array.isArray(_economy[key]) ? [] : 0;
+    }
+}
+
+function describeRaceEconomy() {
+    const e = _economy;
+    if (!e.races) return '';
+    const pct = (a, b) => (b ? `${Math.round((a / b) * 100)}%` : 'n/a');
+    return [
+        `[Race Economy] ${e.races} race(s), ${e.soldiers} candidate(s) downloaded + judged`,
+        `  screen-liked candidates: ${e.leadSoldiers} raced, ${e.leadAccepted} passed (${pct(e.leadAccepted, e.leadSoldiers)})`,
+        `  screen-declined candidates: ${e.declinedSoldiers} raced as probes, ${e.declinedAccepted} passed (${pct(e.declinedAccepted, e.declinedSoldiers)})`,
+        `  ${e.racesEndedByProbe} race(s) stopped after a probe confirmed the screen — ${e.declinedNeverDownloaded} declined candidate(s) never downloaded`,
+        `  ${e.heldWinnersKept} held winner(s) committed after a later batch found nothing (the old race kept searching and could delete them)`,
+        e.distrustedProviders.length ? `  screen stopped being trusted for: ${e.distrustedProviders.join(', ')}` : '',
+    ].filter(Boolean).join('\n');
+}
 
 // Per-provider parallel concurrency. The "army size" per batch.
 // Keep public/video scrapers conservative so full builds survive rate limits.
@@ -71,7 +169,32 @@ function _candidateLabel(candidate, fallback = '') {
     return text.slice(0, 100) || '(untitled clip)';
 }
 
-function _winnerQuality(value) {
+/**
+ * Where did this candidate actually come from? A race pool is normally one
+ * provider's results, but topic-bank and media-memory candidates are merged into
+ * it and carry their own origin — so the candidate's own field is read first and
+ * the race's provider is only the fallback.
+ */
+function _candidateSourceClass(value, fallbackProviderKey) {
+    const candidate = value?._candidate || value?.candidate || value?.selected || {};
+    const own = candidate._provider
+        || candidate._topicScout?.providerKey
+        || candidate._topicScout?.providerName
+        || candidate.provider
+        || value?.providerKey
+        || value?.provider;
+    const fromCandidate = footageSourceClass(own);
+    if (fromCandidate !== 'unknown') return fromCandidate;
+    return footageSourceClass(fallbackProviderKey);
+}
+
+/**
+ * `baseScore * 100` is the dominant term, so one point of vision score is worth
+ * 100 quality points. The real-source bonus is expressed on the same 0-10 scale
+ * and scaled the same way, which is what makes "stock must beat real by MORE than
+ * the tolerance" a statement about vision scores and not about weights.
+ */
+function _winnerQuality(value, opts = {}) {
     const candidate = value?._candidate || value?.candidate || value?.selected || {};
     const baseScore = _clip(value?.score, 0, 10);
     const postScore = _clip(value?.postScore, 0, 10);
@@ -80,8 +203,12 @@ function _winnerQuality(value) {
     const mediaScoutScore = _clip(candidate?._mediaScoutScore || value?.selected?._mediaScoutScore, 0, 20);
     const previewScore = _clip(candidate?._previewScoutScore || value?.selected?._previewScoutScore, 0, 10);
     const thumbnailBonus = (candidate?._thumbnailVisionPassed === true || value?.selected?._thumbnailVisionPassed === true) ? 1 : 0;
+    const realBonus = opts.niche
+        ? realSourceScoreBonus(opts.niche, _candidateSourceClass(value, opts.providerKey))
+        : 0;
 
     return (baseScore * 100)
+        + (realBonus * 100)
         + (deepScore * 8)
         + (postScore * 5)
         + (finalistScore * 4)
@@ -95,8 +222,8 @@ function _obviousWinnerVerdict(best, runner, opts = {}) {
     const score = _clip(best.score, 0, 10);
     const postScore = _clip(best.postScore, 0, 10);
     const deepScore = _clip(best.deepScore || best.clipAnalysis?.score, 0, 10);
-    const quality = _winnerQuality(best);
-    const runnerQuality = runner ? _winnerQuality(runner) : 0;
+    const quality = _winnerQuality(best, opts);
+    const runnerQuality = runner ? _winnerQuality(runner, opts) : 0;
     const qualityGap = runner ? quality - runnerQuality : Infinity;
 
     const minScore = _clip(opts.earlyAcceptScore || process.env.FOOTAGE_RACE_EARLY_ACCEPT_SCORE || 8, 1, 10);
@@ -160,6 +287,13 @@ function _obviousWinnerVerdict(best, runner, opts = {}) {
  * @param {number} [opts.perCandidateTimeoutMs] — kill any soldier slower than this (default 75000; <=0 disables)
  * @param {Function} [opts.log]       — log sink, default console.log
  * @param {Function} [opts.shouldStop] — return true to abort between batches
+ * @param {Object} [opts.stats]       — out-param, filled with how the race ended:
+ *        `{soldiersRun, soldiersTimedOut, soldiersErrored, soldiersReturned}`.
+ *        The caller needs this to tell "this provider's footage was bad" from
+ *        "we never let this provider finish" — the return value alone cannot
+ *        say, because a quality rejection and an abandoned download both come
+ *        back as a plain `{accepted:false}`. Accumulated across every batch, so
+ *        it is already correct at each of this function's exits.
  */
 async function runCandidateRace(opts = {}) {
     const candidates = Array.isArray(opts.candidates) ? opts.candidates : [];
@@ -190,7 +324,31 @@ async function runCandidateRace(opts = {}) {
     const refereeNowScore = _clip(opts.refereeNowScore || process.env.FOOTAGE_RACE_REFEREE_NOW_SCORE || 8, 1, 10);
     const refereeNowMinCandidates = Math.max(2, Math.min(10, Number(opts.refereeNowMinCandidates || process.env.FOOTAGE_RACE_REFEREE_NOW_MIN_CANDIDATES || 4)));
 
-    log(`  🏁 [Candidate Race] starting: ${candidates.length} candidate(s), ${concurrency} in parallel per batch, max ${maxBatches} batches, per-candidate cap ${perCandidateTimeoutMs > 0 ? `${Math.round(perCandidateTimeoutMs / 1000)}s` : 'none'}`);
+    // Screen-aware order — see the note at the top of this file. `ordered` keeps
+    // every candidate; the ones the Thumbnail Screen declined simply move behind
+    // the rest, keeping their relative order, and `leadCount` marks where they
+    // start so no batch ever mixes the two.
+    const screenVerdicts = opts.screenVerdicts instanceof Map && opts.screenVerdicts.size ? opts.screenVerdicts : null;
+    const isDeclined = (candidate) => !!screenVerdicts && screenVerdicts.get(candidate) === 'no';
+    const deferDeclined = !!screenVerdicts && screenDeferralTrusted(providerKey);
+    let ordered = candidates;
+    let leadCount = candidates.length;
+    if (deferDeclined) {
+        const leads = [];
+        const declined = [];
+        for (const candidate of candidates) (isDeclined(candidate) ? declined : leads).push(candidate);
+        if (declined.length) {
+            ordered = [...leads, ...declined];
+            leadCount = leads.length;
+        }
+    }
+    const probeSize = Math.max(1, Math.min(2, concurrency));
+    let probeDone = false;
+    _economy.races++;
+    if (leadCount < ordered.length) _economy.screenedRaces++;
+
+    log(`  🏁 [Candidate Race] starting: ${candidates.length} candidate(s), ${concurrency} in parallel per batch, max ${maxBatches} batches, per-candidate cap ${perCandidateTimeoutMs > 0 ? `${Math.round(perCandidateTimeoutMs / 1000)}s` : 'none'}`
+        + (leadCount < ordered.length ? `; ${ordered.length - leadCount} the thumbnail screen declined wait behind the other ${leadCount}` : ''));
 
     // Wrap a processOne call with a timeout. Slow stragglers don't drag the
     // batch wall-clock — they get killed and counted as losers.
@@ -243,6 +401,16 @@ async function runCandidateRace(opts = {}) {
     let acceptedPool = [];
     const raceStartedAt = Date.now();
 
+    // See the `opts.stats` doc above. Written through, never replaced, so the
+    // caller's own object is the one that gets filled.
+    const stats = (opts.stats && typeof opts.stats === 'object') ? opts.stats : null;
+    if (stats) {
+        stats.soldiersRun = _num(stats.soldiersRun);
+        stats.soldiersTimedOut = _num(stats.soldiersTimedOut);
+        stats.soldiersErrored = _num(stats.soldiersErrored);
+        stats.soldiersReturned = _num(stats.soldiersReturned);
+    }
+
     const cleanupPaths = (items, keep = null) => {
         for (const item of items || []) {
             if (!item || item === keep) continue;
@@ -253,16 +421,30 @@ async function runCandidateRace(opts = {}) {
         }
     };
 
-    while (cursor < candidates.length && batchNo < maxBatches) {
+    while (cursor < ordered.length && batchNo < maxBatches) {
         if (shouldStop()) {
             log(`  🛑 [Candidate Race] aborted before batch ${batchNo + 1} (shouldStop=true)`);
             break;
         }
         batchNo++;
-        const slice = candidates.slice(cursor, cursor + concurrency);
+        // A batch stops at the edge of the declined band, and the first batch
+        // inside it is a small probe.
+        let batchSize = concurrency;
+        let probing = false;
+        if (cursor < leadCount) {
+            batchSize = Math.min(concurrency, leadCount - cursor);
+        } else if (leadCount < ordered.length && !probeDone) {
+            batchSize = Math.min(probeSize, ordered.length - cursor);
+            probing = true;
+            probeDone = true;
+            _economy.probes++;
+        }
+        const slice = ordered.slice(cursor, cursor + batchSize);
         cursor += slice.length;
 
-        log(`  🏁 [Candidate Race] batch ${batchNo}: launching ${slice.length} candidate(s) in parallel`);
+        log(probing
+            ? `  🏁 [Candidate Race] batch ${batchNo}: probing ${slice.length} candidate(s) the thumbnail screen declined`
+            : `  🏁 [Candidate Race] batch ${batchNo}: launching ${slice.length} candidate(s) in parallel`);
 
         const startedAt = Date.now();
         const outcomes = await Promise.allSettled(
@@ -288,6 +470,43 @@ async function runCandidateRace(opts = {}) {
         // service ANSWERED, so it must never feed the abort rule below.
         const visionUnparsedCount = losers.filter(l => l.value?._visionUnparsed).length;
         const storyblocksAuthDeadCount = losers.filter(l => l.value?._storyblocksAuthDead).length;
+
+        // Record how this batch's soldiers ended, for the caller's provider
+        // record. `errored` is a soldier that threw or came back empty — a real
+        // failure. `returned` is one that finished and had an answer, whether
+        // that answer was "accepted" or "not good enough". Only `timedOut` means
+        // we ended it ourselves, and that is the one the caller must not hold
+        // against the provider.
+        if (stats) {
+            const erroredCount = losers.filter(l => !l.value?.timedOut && (!l.value || l.value.error)).length;
+            stats.soldiersRun += slice.length;
+            stats.soldiersTimedOut += timedOutCount;
+            stats.soldiersErrored += erroredCount;
+            stats.soldiersReturned += Math.max(0, slice.length - timedOutCount - erroredCount);
+        }
+
+        // What this batch teaches about the screen. Only soldiers that came back
+        // with a real verdict count: a timeout, a crash or a vision outage says
+        // nothing about whether the preview picture told the truth.
+        _economy.soldiers += slice.length;
+        if (screenVerdicts) {
+            const wasTrusted = screenDeferralTrusted(providerKey);
+            const tally = { lead: [0, 0], declined: [0, 0] };
+            for (let i = 0; i < outcomes.length; i++) {
+                const value = outcomes[i].status === 'fulfilled' ? outcomes[i].value : null;
+                if (!value || value.timedOut || value.error || value._visionApiFailed || value._abandoned) continue;
+                const band = isDeclined(slice[i]) ? 'declined' : 'lead';
+                tally[band][0]++;
+                if (value.accepted && Number(value.score || 0) >= minAcceptScore) tally[band][1]++;
+            }
+            if (tally.lead[0]) _noteSoldiers(providerKey, 'lead', tally.lead[0], tally.lead[1]);
+            if (tally.declined[0]) _noteSoldiers(providerKey, 'declined', tally.declined[0], tally.declined[1]);
+            if (wasTrusted && !screenDeferralTrusted(providerKey) && !_economy.distrustedProviders.includes(providerKey)) {
+                _economy.distrustedProviders.push(providerKey);
+                log(`  [Race Economy] ${providerKey}: candidates the thumbnail screen declined keep passing — no longer deferring them this run`);
+            }
+        }
+
         const tagBits = [];
         if (timedOutCount) tagBits.push(`${timedOutCount} timed out`);
         if (visionApiFailCount) tagBits.push(`${visionApiFailCount} vision API failed`);
@@ -341,22 +560,46 @@ async function runCandidateRace(opts = {}) {
         // With this guard the batch falls through to `collectBudgetSpent` below,
         // which already says "budget spent → commit the best held candidate (even 1)".
         if (maxCollectMs > 0 && acceptedPool.length === 0 && accepted.length === 0
-            && (Date.now() - raceStartedAt) >= maxCollectMs && cursor < candidates.length) {
+            && (Date.now() - raceStartedAt) >= maxCollectMs && cursor < ordered.length) {
             cleanupPaths(accepted);
             for (const loser of losers) {
                 const p = loser.value?.path;
                 if (p) { try { fs.unlinkSync(p); } catch (_) {} }
             }
-            log(`  ⏱️ [Candidate Race] ${Math.round(maxCollectMs / 1000)}s budget spent with 0 accepted — bailing (no relevant media) instead of churning ${candidates.length - cursor} more candidate(s)`);
+            log(`  ⏱️ [Candidate Race] ${Math.round(maxCollectMs / 1000)}s budget spent with 0 accepted — bailing (no relevant media) instead of churning ${ordered.length - cursor} more candidate(s)`);
             break;
         }
 
-        if (accepted.length > 0) {
+        // The probe found nothing and nothing is held: the screen said "this
+        // shows something else" and two downloads just agreed. Stop here rather
+        // than download the rest of what it declined. Only the candidates this
+        // race could still have reached are counted as saved.
+        const probeConfirmedScreen = probing && accepted.length === 0;
+        if (probeConfirmedScreen && acceptedPool.length === 0) {
+            const remaining = ordered.length - cursor;
+            const reachable = Math.min(remaining, Math.max(0, maxBatches - batchNo) * concurrency);
+            _economy.racesEndedByProbe++;
+            _economy.declinedNeverDownloaded += reachable;
+            for (const loser of losers) {
+                const p = loser.value?.path;
+                if (p) { try { fs.unlinkSync(p); } catch (_) {} }
+            }
+            log(`  🛑 [Candidate Race] probe of ${slice.length} screen-declined candidate(s) found nothing — the thumbnail screen was right; not downloading the other ${remaining}`);
+            break;
+        }
+
+        // Decide whenever something is HELD, not only when this batch accepted.
+        // Before, a race that was holding an accepted clip for comparison and
+        // then drew a batch with nothing in it walked past the decision, kept
+        // launching batches, and at the end deleted the clip it was holding and
+        // reported "no winner" — paying for a vision verdict it then threw away.
+        if (accepted.length > 0 || acceptedPool.length > 0) {
             {
+                const decidingOnHeldOnly = accepted.length === 0;
                 acceptedPool.push(...accepted);
-                acceptedPool.sort((a, b) => (_winnerQuality(b) - _winnerQuality(a)) || (_num(a._raceIndex) - _num(b._raceIndex)));
+                acceptedPool.sort((a, b) => (_winnerQuality(b, opts) - _winnerQuality(a, opts)) || (_num(a._raceIndex) - _num(b._raceIndex)));
                 const hasEnoughForReferee = acceptedPool.length >= refereeMinCandidates;
-                const noMoreCandidates = cursor >= candidates.length;
+                const noMoreCandidates = cursor >= ordered.length;
                 const collectionDone = batchNo >= refereeCollectBatches;
                 const bestHeld = acceptedPool[0];
                 const runnerHeld = acceptedPool.find(item => item !== bestHeld) || null;
@@ -379,7 +622,9 @@ async function runCandidateRace(opts = {}) {
                     ? `${acceptedPool.length} accepted candidate(s), best ${bestHeld.score}/10`
                     : collectBudgetSpent
                         ? `collection budget ${Math.round(maxCollectMs / 1000)}s spent with ${acceptedPool.length} accepted candidate(s)`
-                        : '';
+                        : probeConfirmedScreen
+                            ? `probe of screen-declined candidates found nothing better than the ${acceptedPool.length} held`
+                            : '';
                 if (!obviousVerdict && forceDecisionReason) {
                     log(`  [Candidate Race] forcing referee/score decision now (${forceDecisionReason}); not launching another batch`);
                 }
@@ -410,7 +655,7 @@ async function runCandidateRace(opts = {}) {
                 if (!verdict && refereeEnabled && refereePool.length >= 2) {
                     try {
                         log(`  [AI Referee] comparing ${refereePool.length} accepted candidate(s)`);
-                        verdict = await refereeAcceptedCandidates(refereePool, opts.refereeContext || {});
+                        verdict = await withCostPurpose('race-referee', () => refereeAcceptedCandidates(refereePool, opts.refereeContext || {}));
                         if (verdict?.rejectAll) {
                             log(`  [AI Referee] rejected shortlist: ${verdict.reason || 'no editorial fit'}`);
                             cleanupPaths(acceptedPool);
@@ -442,7 +687,7 @@ async function runCandidateRace(opts = {}) {
                 const winner = verdict?.winner || refereePool[0] || acceptedPool[0];
                 const c = winner._candidate || winner.candidate || winner.selected || {};
                 const runner = acceptedPool.find(item => item !== winner) || null;
-                const winnerEvidence = `quality ${_winnerQuality(winner).toFixed(1)}${runner ? ` vs runner ${_winnerQuality(runner).toFixed(1)}` : ''}`;
+                const winnerEvidence = `quality ${_winnerQuality(winner, opts).toFixed(1)}${runner ? ` vs runner ${_winnerQuality(runner, opts).toFixed(1)}` : ''}`;
                 const winnerTitle = String(
                     c.title
                     || c._cachedMeta?.title
@@ -451,17 +696,21 @@ async function runCandidateRace(opts = {}) {
                     || (c.url ? `from ${c.url.replace(/^https?:\/\//, '').slice(0, 70)}` : '')
                     || (winner.path ? `file ${winner.path.split(/[\\/]/).pop()}` : '(untitled clip)')
                 ).replace(/\s+/g, ' ').trim().slice(0, 100);
+                if (decidingOnHeldOnly) {
+                    _economy.heldWinnersKept++;
+                    log(`  [Candidate Race] committing the held candidate — batch ${batchNo} found nothing better`);
+                }
                 log(`  [Candidate Race] winner: ${winner.score}/10 - ${winnerTitle || '(untitled clip)'}`);
                 log(`  [Candidate Race] winner evidence: ${winnerEvidence}${winner._referee?.reason ? ` | referee: ${winner._referee.reason}` : ''}`);
                 cleanupPaths(acceptedPool, winner);
                 cleanupPaths(losers.map(l => l.value));
                 return winner;
             }
-            accepted.sort((a, b) => (_winnerQuality(b) - _winnerQuality(a)) || (_num(a._raceIndex) - _num(b._raceIndex)));
+            accepted.sort((a, b) => (_winnerQuality(b, opts) - _winnerQuality(a, opts)) || (_num(a._raceIndex) - _num(b._raceIndex)));
             const winner = accepted[0];
             const c = winner._candidate || winner.candidate || {};
             const runner = accepted[1] || null;
-            const winnerEvidence = `quality ${_winnerQuality(winner).toFixed(1)}${runner ? ` vs runner ${_winnerQuality(runner).toFixed(1)}` : ''}`;
+            const winnerEvidence = `quality ${_winnerQuality(winner, opts).toFixed(1)}${runner ? ` vs runner ${_winnerQuality(runner, opts).toFixed(1)}` : ''}`;
             const winnerTitle = String(
                 c.title
                 || c._cachedMeta?.title
@@ -507,4 +756,8 @@ async function runCandidateRace(opts = {}) {
 module.exports = {
     runCandidateRace,
     getProviderConcurrency,
+    screenDeferralTrusted,
+    getRaceEconomy,
+    resetRaceEconomy,
+    describeRaceEconomy,
 };

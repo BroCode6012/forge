@@ -314,12 +314,21 @@ check('the pipeline calls the borrow after the rescue and before the audit', () 
     const iBorrowReq = BV.indexOf("require('../media/footage-borrow')");
     const iRescue = BV.indexOf('rescueUncovered({');
     const iBorrow = BV.indexOf('borrowForUncovered({');
-    const iSummarize = BV.indexOf("require('../media/scene-coverage')");
+    // scene-coverage is required twice — once to snapshot coverage BEFORE the
+    // sweep, once for the audit — so this has to name the audit's copy.
+    const iSummarize = BV.indexOf("const { summarize } = require('../media/scene-coverage')");
+    const iClassify = BV.indexOf("const { classifyScene } = require('../media/scene-coverage')");
     assert.ok(iBorrowReq > 0, 'build-video.js never requires footage-borrow');
     assert.ok(iRescue > 0 && iBorrow > iRescue,
         'the borrow must run AFTER the rescue — searching for a scene\'s own footage always beats reusing someone else\'s');
     assert.ok(iSummarize > iBorrow,
         'the coverage audit must run AFTER the borrow, or it reports scenes as broken that were just filled');
+    // The merge may only re-attach a scene the sweep actually fixed, so the
+    // "was it already covered" snapshot has to be taken while it is still
+    // uncovered. Taken after the rescue it marks every scene covered, the merge
+    // re-attaches nothing, and a rescued scene renders as a hole.
+    assert.ok(iClassify > 0 && iClassify < iRescue,
+        'the pre-sweep coverage snapshot must be taken BEFORE the rescue, or it sees the sweep\'s own repairs');
 });
 
 check('the audit line reports borrowed scenes separately from found ones', () => {

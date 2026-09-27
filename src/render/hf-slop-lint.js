@@ -2240,6 +2240,14 @@ module.exports = {
     OVERUSED_FONTS,
     FX_EXEMPT_PREFIXES,
     VIDEO,
+    // exported so hf-author-repair can test exactly what the contract rules
+    // test. A repair that restated any of these would drift out of step with
+    // the rule it is trying to clear, and would then be silently discarded.
+    CONTRACT_COLOR_PROPS,
+    CONTRACT_COLOR_TOKEN_RE,
+    GENERIC_FONT_FAMILIES,
+    splitFontStack,
+    hueDistance,
     parseBlocks,
     parseDecls,
     parseColor,

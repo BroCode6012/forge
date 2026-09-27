@@ -58,7 +58,11 @@ function check(label, condition, detail) {
 
 console.log('[verify] hyperframes extract cache');
 
-const main = fs.readFileSync(MAIN_PATH, 'utf8');
+// Normalized to LF: the anchors below are bare newlines, which never match on a
+// CRLF working copy — the gate then reports its own subject as missing and the
+// `npm run verify` && chain aborts before every later check. Found 2026-08-28.
+const main = fs.readFileSync(MAIN_PATH, 'utf8')
+    .split(String.fromCharCode(13)).join('');
 const pkg = JSON.parse(fs.readFileSync(PKG_PATH, 'utf8'));
 
 // --- the patch survives a reinstall -----------------------------------------
@@ -80,7 +84,8 @@ check(
 if (!fs.existsSync(CLI_PATH)) {
     console.log('  skip hyperframes not installed; cannot verify the CLI contract');
 } else {
-    const cli = fs.readFileSync(CLI_PATH, 'utf8');
+    const cli = fs.readFileSync(CLI_PATH, 'utf8')
+        .split(String.fromCharCode(13)).join('');
 
     check(
         'the CLI still keys its frame cache through canonicalKeyBlob',
@@ -359,7 +364,8 @@ try { ffmpegPath = require('ffmpeg-static'); } catch (_) { /* checked below */ }
 if (!ffmpegPath || !fs.existsSync(ffmpegPath) || !fs.existsSync(BRIDGE_PATH)) {
     console.log('  skip ffmpeg/bridge unavailable; cannot verify transcode determinism');
 } else {
-    const bridge = fs.readFileSync(BRIDGE_PATH, 'utf8');
+    const bridge = fs.readFileSync(BRIDGE_PATH, 'utf8')
+        .split(String.fromCharCode(13)).join('');
     const bStart = bridge.indexOf('const buildArgs = (off) => {');
     const bEnd = bStart >= 0 ? bridge.indexOf('\n    };', bStart) : -1;
     if (bStart < 0 || bEnd < 0) {

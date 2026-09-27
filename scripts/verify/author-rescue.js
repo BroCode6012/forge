@@ -189,10 +189,12 @@ check(
 // "after" assertion pass for free.
 // ---------------------------------------------------------------------------
 
+const LINT_ALL = { theme: THEME, kind: 'fullscreen', source: 'composition' };
+
 function lint(css, only) {
     return slopLint(
         { html: FIXTURE_HTML, css, timeline: FIXTURE_TL },
-        { theme: THEME, kind: 'fullscreen', source: 'composition', only: [only] }
+        { ...LINT_ALL, only: [only] }
     );
 }
 
@@ -482,12 +484,88 @@ check(
 );
 
 check(
-    'every auto-repair still targets a live error-severity rule',
-    repair.STYLE_REPAIRS.length > 0 && repair.STYLE_REPAIRS.every(r =>
-        RULE_BY_ID.has(r.id) && RULE_BY_ID.get(r.id).severity === 'error'),
+    'every auto-repair still targets a rule the checker actually enforces',
+    repair.STYLE_REPAIRS.length > 0 && repair.STYLE_REPAIRS.every(r => RULE_BY_ID.has(r.id)),
     repair.STYLE_REPAIRS.filter(r => !RULE_BY_ID.has(r.id)).map(r => r.id).join(', ')
     + ' no longer names a rule the checker enforces — a repair whose rule was '
     + 'renamed is dead code that reports success by never firing'
+);
+
+// Warnings used to be unrepairable by construction: the loop asked the checker
+// `ok`, and `ok` only counts errors, so a warn-severity rule could never even
+// enter the loop. Two of the ugliest defects in the shipped build — letter
+// spacing wide enough to read as gaps, and strokes too thin to survive the
+// encoder — are warnings. They are repairable now, and this pins it, because
+// the regression is completely silent: the repair stays in the list, keeps
+// looking correct, and simply never runs.
+const WARN_REPAIRS = repair.STYLE_REPAIRS
+    .filter(r => RULE_BY_ID.has(r.id) && RULE_BY_ID.get(r.id).severity === 'warn')
+    .map(r => r.id);
+check(
+    'a warning-level defect is repaired too, not silently skipped',
+    WARN_REPAIRS.length > 0,
+    'no repair targets a warn-severity rule any more — if that was deliberate, '
+    + 'fine, but if the repair loop went back to gating on `ok` then every '
+    + 'warning became unrepairable again and nothing here would have noticed'
+);
+
+const WIDE_TRACKING = `${FRAME_BLOCK}
+.auth1-h { font-family: ${THEME.typography.heading}; font-size: 72px; line-height: 1.1; letter-spacing: 0.9em; }
+.auth1-b { font-family: ${THEME.typography.body}; font-size: 30px; line-height: 1.4; }
+`;
+const wideBefore = slopLint({ html: FIXTURE_HTML, css: WIDE_TRACKING, timeline: FIXTURE_TL }, LINT_ALL);
+check(
+    'the wide-tracking fixture really is flagged today (letters far enough apart to read as gaps)',
+    wideBefore.findings.some(f => f.id === 'wide-tracking'),
+    'the fixture stopped tripping the rule, so what follows proves nothing'
+);
+const wideFixed = repair.repairStyle(
+    { html: FIXTURE_HTML, css: WIDE_TRACKING, timeline: FIXTURE_TL },
+    { theme: THEME, themeId: 'crime', kind: 'fullscreen' }
+);
+const wideAfter = slopLint({ html: FIXTURE_HTML, css: wideFixed.css, timeline: FIXTURE_TL }, LINT_ALL);
+check(
+    'the repair pass clears wide-tracking instead of leaving it in the render',
+    !wideAfter.findings.some(f => f.id === 'wide-tracking') && wideFixed.fixes.length > 0,
+    'a warning-level defect went out the door untouched'
+);
+
+// Easing is the one repair that has to reach into the timeline rather than the
+// stylesheet, and the caller only picks that up because repairStyle returns it.
+// If the return shape ever narrows back to { css, fixes }, the CSS half of a
+// bounce fix would land and the GSAP half would vanish.
+const BOUNCE_TL = `const tl = gsap.timeline();
+tl.from('#auth1-root .auth1-h', { y: 40, opacity: 0, duration: 0.8, ease: 'back.out(1.7)' }, 0);
+tl.from('#auth1-root .auth1-b', { y: 20, opacity: 0, duration: 0.7 }, 0.6);
+`;
+const bounceBefore = slopLint({ html: FIXTURE_HTML, css: CLEAN, timeline: BOUNCE_TL }, LINT_ALL);
+check(
+    'the bounce fixture really is rejected today (easing that overshoots and springs back)',
+    bounceBefore.findings.some(f => f.id === 'bounce-easing'),
+    'the fixture stopped tripping the rule, so what follows proves nothing'
+);
+const bounceFixed = repair.repairStyle(
+    { html: FIXTURE_HTML, css: CLEAN, timeline: BOUNCE_TL },
+    { theme: THEME, themeId: 'crime', kind: 'fullscreen' }
+);
+const bounceAfter = slopLint(
+    { html: FIXTURE_HTML, css: bounceFixed.css, timeline: bounceFixed.timeline },
+    LINT_ALL
+);
+check(
+    'the repaired timeline comes back out of the repair pass',
+    typeof bounceFixed.timeline === 'string'
+    && !bounceAfter.findings.some(f => f.id === 'bounce-easing')
+    && bounceFixed.timeline !== BOUNCE_TL,
+    'the easing fix either did not happen or had nowhere to go — the caller '
+    + 'reads styled.timeline, and a { css, fixes } return silently drops it'
+);
+check(
+    'the easing repair leaves the choreography alone',
+    /y: 40/.test(bounceFixed.timeline) && /duration: 0\.8/.test(bounceFixed.timeline)
+    && /0\.6\)/.test(bounceFixed.timeline),
+    'the repair rewrote more than the ease — timings and offsets are the '
+    + "author's decisions, not this file's"
 );
 
 const numberFixture = { ...BROKEN, html: FIXTURE_HTML.replace('dawn.', 'dawn, 1,847 stranded.') };
@@ -495,6 +573,63 @@ check(
     'a number the narration never mentioned is still a rejection',
     !author.validateComposition(numberFixture, 'auth1', 3.5, [], BRIEF).ok,
     'the numeric whitelist stopped firing — invented facts would now render'
+);
+
+// ---------------------------------------------------------------------------
+// 6. A failure is one bad sample, not a life sentence.
+//
+// Everything above makes a rejected composition recoverable WITHIN a build. It
+// is all worthless if the first failure is then frozen into the cache, because
+// the marker outlives every later improvement: the repair pass could grow to
+// fifty fixes and the graphic that failed on 2026-08-05 would still serve its
+// hardcoded card forever. The user rebuilds, sees the identical ugly card, and
+// nothing they or we do can dislodge it — the exact "why am I fixing the same
+// thing over and over" complaint this whole effort exists to end.
+//
+// The marker keeps ONE job: open mode (project open / refresh) must cost zero
+// AI calls no matter what changed since the save, so there it still stands.
+const failedBranch = authorSrc.indexOf('if (cache[hash].failed) {');
+const staleLookup = authorSrc.indexOf('.filter(value => value && !value.failed && value.ns === brief.ns)');
+const branchSrc = failedBranch > 0 && staleLookup > failedBranch
+    ? authorSrc.slice(failedBranch, staleLookup)
+    : '';
+
+check(
+    'a build re-authors a brief that failed on an earlier build',
+    /\bpending\.push\(\{\s*brief,\s*hash,\s*i,\s*attempts:/.test(branchSrc),
+    'the cached failure branch no longer queues the brief for authoring, so a '
+    + 'graphic that failed once falls back to the generic card in every future '
+    + 'build of that video — permanently, and invisibly'
+);
+check(
+    'the retry is gated on it NOT being open mode',
+    /if \(!openMode && !RETRY_FAILED_OFF\)/.test(branchSrc),
+    'the retry is not fenced off from open mode. Opening a saved project would '
+    + 'start spending AI, which is the one thing open mode guarantees it never does'
+);
+check(
+    'open mode still honours the marker instead of authoring',
+    /openMode/.test(branchSrc) && !/authorComposition\(/.test(branchSrc),
+    'the open-mode arm of the failure branch calls the author directly'
+);
+check(
+    'a cached failure no longer short-circuits both modes at once',
+    !/cache\[hash\]\.failed \|\| cachedComp/.test(authorSrc),
+    'the old combined condition is back — it treated "this sample failed" and '
+    + '"this composition is reusable" as the same outcome, which is what made '
+    + 'the failure permanent'
+);
+check(
+    'the marker counts how many builds have failed on this brief',
+    /attempts: retry \+ 1/.test(authorSrc),
+    'failures are recorded without an attempt count, so a chronically '
+    + 'unauthorable brief is indistinguishable in the log from a first miss'
+);
+check(
+    'the retry can be switched off without editing code',
+    /HF_AUTHOR_RETRY_FAILED/.test(authorSrc),
+    'there is no kill switch, so a build cannot be made cheap and reproducible '
+    + 'on demand'
 );
 
 console.log(`\n[verify] author rescue: ${checks - failures}/${checks} passed`);

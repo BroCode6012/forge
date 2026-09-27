@@ -983,18 +983,38 @@ class YouTubeVideoProvider extends BaseProvider {
             try {
                 const vid = (url.match(/[?&]v=([^&]+)/) || [])[1] || '';
                 if (vid) {
-                    const { locateWindow } = require('../storyboard-scout');
-                    const win = await locateWindow(keyword, vid, {
+                    const scout = require('../storyboard-scout');
+                    // THE PREP CLOCK, not the scene clock. The scene clock is the
+                    // outer guard — it stops one candidate eating a whole scene.
+                    // But this candidate also has its OWN, much shorter budget, and
+                    // the scout used to ignore it: on the Aug-5 build a 56s YouTube
+                    // budget sat next to a scene deadline the race had just pushed
+                    // 120s out, the scout took 47s of the 56, the download started
+                    // with 9s left, and all four soldiers were aborted mid-transfer.
+                    // Zero clips judged, zero YouTube footage in a 64-scene build
+                    // whose own topic ranked YouTube first.
+                    //
+                    // `prepDeadlineAt` is the caller's per-candidate deadline minus
+                    // what its download and judging measurably need. If a scout run
+                    // does not fit inside it we take the blind window and spend the
+                    // time on bytes — a blind window the post-download judge still
+                    // scores beats a perfect window that never downloads. Callers
+                    // that set no prep clock fall back to the scene clock exactly as
+                    // before.
+                    const prepDeadline = Number(options.prepDeadlineAt) > 0
+                        ? Number(options.prepDeadlineAt)
+                        : (Number(options.deadlineAt) > 0 ? Number(options.deadlineAt) : 0);
+                    const prepLeftMs = prepDeadline > 0 ? prepDeadline - Date.now() : Infinity;
+                    const scoutCostMs = typeof scout.estimatedRunMs === 'function' ? scout.estimatedRunMs() : 0;
+                    const win = prepLeftMs < scoutCostMs ? null : await scout.locateWindow(keyword, vid, {
                         ytdlpPath: this._ytdlpPath,
                         signal: options.abortSignal,
                         sceneText: options.sceneText || '',
-                        // The scene's own clock. Without it the deep scout (~40 vision
-                        // calls) ran to completion no matter how little time was left,
-                        // which is how one candidate could eat the whole scene and
-                        // leave later providers with nothing. Absent (0) = no limit,
-                        // exactly as before for callers that don't set one.
-                        deadline: Number(options.deadlineAt) > 0 ? Number(options.deadlineAt) : 0,
+                        deadline: prepDeadline,
                     });
+                    if (prepLeftMs < scoutCostMs) {
+                        console.log(`  ⏭️  [Storyboard Scout] skipped — ${Math.max(0, Math.round(prepLeftMs / 1000))}s of look-inside time left, a run costs about ${Math.round(scoutCostMs / 1000)}s. Downloading the heuristic window so this candidate actually gets judged.`);
+                    }
                     if (win) {
                         options._storyboardScout = win;
                         startTime = win.startTime;

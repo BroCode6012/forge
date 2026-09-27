@@ -104,6 +104,23 @@ function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
 }
 
+// The HyperFrames CLI gives its DIAGNOSTIC browser (lint/keyframes/check/snapshot)
+// only 10s at page.goto — a tenth of the 60s its real capture browser gets — and
+// PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS is the only input that reaches it. A heavy
+// project (270 scenes / 474 media files) cannot bundle+parse the proof composition
+// that fast, so `check` reported check_runtime_failure "Navigation timeout of 10000
+// ms exceeded" and Motion QA hard-failed every render before capture ever started.
+// Default to the CLI's own capture-path budget; HF_MOTION_QA_NAV_TIMEOUT_MS tunes it.
+const MOTION_QA_DEFAULT_NAV_TIMEOUT_MS = 60_000;
+
+function motionQaNavigationTimeoutMs() {
+    const configured = numeric(
+        process.env.HF_MOTION_QA_NAV_TIMEOUT_MS,
+        numeric(process.env.PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS, MOTION_QA_DEFAULT_NAV_TIMEOUT_MS)
+    );
+    return Math.round(clamp(configured, 10_000, 600_000));
+}
+
 function compactText(value, max = 140) {
     const text = String(value || '').replace(/\s+/g, ' ').trim();
     return text.length > max ? `${text.slice(0, Math.max(0, max - 1)).trim()}…` : text;
@@ -1751,7 +1768,7 @@ async function captureProofSnapshots({
                 PRODUCER_HEADLESS_SHELL_PATH: browserPath,
             } : {}),
         },
-        timeoutMs: 180_000,
+        timeoutMs: 180_000 + motionQaNavigationTimeoutMs(),
         nodePath,
         onProcess,
         isCancelled,
@@ -2774,6 +2791,7 @@ async function runDiagnostics({
     onProcess,
     isCancelled,
     runVision,
+    log = () => {},
 }) {
     const cli = resolveHyperframesCli(appRoot);
     // Hardware by default, with an explicit emergency opt-out (HF_MOTION_QA_BROWSER_GPU=0).
@@ -2784,20 +2802,23 @@ async function runDiagnostics({
     // diagnostic JSON — these checks read geometry and timing, which the rasterizer does not
     // change. Flip the flag off if a driver ever makes the audit browsers unstable.
     const diagnosticBrowserGpuMode = flagOff('HF_MOTION_QA_BROWSER_GPU') ? 'software' : 'hardware';
+    const navTimeoutMs = motionQaNavigationTimeoutMs();
     const cliEnv = {
         PRODUCER_BROWSER_GPU_MODE: diagnosticBrowserGpuMode,
+        PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS: String(navTimeoutMs),
         ...(browserPath ? {
             HYPERFRAMES_BROWSER_PATH: browserPath,
             PRODUCER_HEADLESS_SHELL_PATH: browserPath,
         } : {}),
     };
+    log(`[Motion QA] HyperFrames diagnostic page.goto navigation timeout: ${navTimeoutMs} ms.`);
     const lint = await runCli({
         cli,
         command: 'lint',
         args: [project.projectDir, '--json'],
         cwd: appRoot,
         env: cliEnv,
-        timeoutMs: 90_000,
+        timeoutMs: 90_000 + navTimeoutMs,
         nodePath,
         onProcess,
         isCancelled,
@@ -2810,7 +2831,7 @@ async function runDiagnostics({
         args: [project.projectDir, '--json', '--runtime', 'all'],
         cwd: appRoot,
         env: cliEnv,
-        timeoutMs: 120_000,
+        timeoutMs: 120_000 + navTimeoutMs,
         nodePath,
         onProcess,
         isCancelled,
@@ -2831,7 +2852,9 @@ async function runDiagnostics({
         ],
         cwd: appRoot,
         env: cliEnv,
-        timeoutMs: quick ? 120_000 : 240_000,
+        // `check` navigates the composition more than once (layout audit re-goes-to
+        // after aligning the viewport), so it needs the nav budget twice over.
+        timeoutMs: (quick ? 120_000 : 240_000) + (2 * navTimeoutMs),
         nodePath,
         onProcess,
         isCancelled,
@@ -3055,6 +3078,7 @@ async function runMotionQa({
             onProcess,
             isCancelled,
             runVision: !quick && pass < passLimit,
+            log: logFn,
         });
         const passFindings = [...diagnostics.findings];
         if (pass >= passPolicy.hardPassCap && (diagnostics.vision?.repairs || []).length > 0) {

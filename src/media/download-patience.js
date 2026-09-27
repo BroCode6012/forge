@@ -57,10 +57,17 @@
  *      little more patience; one that keeps losing earns less. See
  *      `provider-scoreboard.js`.
  *
- *   4. SCENE SHARE — a hard clamp. No single candidate may consume more than
+ *   4. SCENE SHARE — a clamp. No single candidate may consume more than
  *      MAX_SCENE_SHARE of the time the scene has left, so the rescue ladder
  *      behind it always has a real window to run in. This is the part that
  *      turns "0 footage found" into "found it on the second try".
+ *
+ *      It yields to the min-viable line, and it has to. A share is protection
+ *      only while it still buys a whole candidate; once it drops below the
+ *      one-candidate minimum, the clamp is reserving time for a rescue rung
+ *      that cannot finish either, and the budget in front is a scheduled loss
+ *      rather than a tight one. See the last-chance branch in
+ *      `resolveCandidatePatienceMs` — it is the Aug-5 YouTube bug.
  *
  * Env overrides are still honoured for back-compat:
  *   unset / empty  -> adaptive (this module)
@@ -275,7 +282,14 @@ function _minViableCandidateMs(type, providerKey) {
     // p25 = "a quick one from this provider". Not the median: this is the
     // best case, the question being "could even a fast candidate finish?".
     const download = pool ? _percentile(pool, 25) : FLOOR_MS[type];
-    return Math.round(Math.max(FLOOR_MS[type], download) + _judgingAllowanceMs(type));
+    // Bounded by the same ceiling every other budget obeys. Without this a run
+    // that measured one very slow provider could produce a "minimum" no budget
+    // is ever allowed to reach, and the last-chance grant below would quietly
+    // become unreachable — the exact failure this floor exists to prevent.
+    return Math.round(Math.min(
+        CEILING_MS[type],
+        Math.max(FLOOR_MS[type], download) + _judgingAllowanceMs(type)
+    ));
 }
 
 /**
@@ -377,11 +391,15 @@ function _envOverride(mediaType, providerKey) {
  * @param {string} [p.nicheId] from scriptContext
  * @param {number} [p.remainingSceneMs] what the scene deadline has left; Infinity/undefined = no clamp
  * @param {(msg:string)=>void} [p.log]
- * @returns {{ms:number, disabled:boolean, explain:string, viable:boolean, minViableMs:number}}
+ * @returns {{ms:number, disabled:boolean, explain:string, viable:boolean, minViableMs:number, lastChance:boolean}}
  *          ms = 0 means "no per-candidate cap" (only reachable via an explicit env 0)
  *          viable = false means the scene does not have enough time left for even
  *          one candidate to finish; starting a race here can only produce a
  *          placeholder, so the caller should stop instead of burning the rest.
+ *          lastChance = true means the scene-share clamp was overridden because the
+ *          share had fallen below the one-candidate minimum: there is room for one
+ *          real attempt and no rescue rung behind it, so this race gets the whole
+ *          minimum rather than a share it was guaranteed to be killed inside.
  */
 function resolveCandidatePatienceMs({ mediaType, providerKey, nicheId, remainingSceneMs, log }) {
     const type = mediaType === 'image' ? 'image' : 'video';
@@ -430,12 +448,40 @@ function resolveCandidatePatienceMs({ mediaType, providerKey, nicheId, remaining
     }
     ms = Math.max(FLOOR_MS[type], Math.min(CEILING_MS[type], ms));
 
-    // The scene-share clamp. This is what keeps the fallback ladder alive.
+    // The scene-share clamp. This is what keeps the fallback ladder alive —
+    // but only for as long as a ladder can still run.
+    //
+    // THE AUG-5 BUG. The clamp had a floor of FLOOR_MS/2 and no re-check of the
+    // min-viable line raised just above, so it could hand out a budget the
+    // module had already computed to be too short for one candidate to finish.
+    // On that build it gave YouTube 56s against a ~60s+ one-candidate minimum,
+    // on scene after scene. Every pull was aborted mid-flight, the provider was
+    // recorded as a loser for it, the record multiplier shortened the NEXT
+    // budget, and YouTube won 0 of 47 scenes in a build whose own topic ranks it
+    // first. Scene 25's best candidate — a 9/10 finalist, exactly the footage
+    // the scene was about — died on that timer and the scene took a placeholder.
+    //
+    // Reserving 45% of the clock for a rescue rung is only protection while the
+    // rung can itself finish. Once the scene has less time left than TWO
+    // candidates need, the reservation protects nothing and the budget in front
+    // is a scheduled loss. So: keep the share while the share still buys a whole
+    // candidate; below that line the scene has room for exactly one real
+    // attempt, and the honest move is to spend what is left on it.
+    //
+    // Nothing here is a fixed number. `minViableMs` is measured per provider,
+    // per media type, from this run's own download and judging timings, so the
+    // line moves with the topic, the network and the GPU queue.
     let clampedByScene = false;
+    let lastChance = false;
     if (sceneBounded) {
         const share = Math.floor(left * MAX_SCENE_SHARE);
         if (share < ms) {
-            ms = Math.max(FLOOR_MS[type] / 2, share);
+            if (share < minViableMs) {
+                ms = Math.min(left, minViableMs);
+                lastChance = true;
+            } else {
+                ms = share;
+            }
             clampedByScene = true;
         }
     }
@@ -450,10 +496,72 @@ function resolveCandidatePatienceMs({ mediaType, providerKey, nicheId, remaining
     ];
     if (record !== 1.0) bits.push(`record x${record.toFixed(2)}`);
     if (raisedToViable) bits.push(`raised to the ${Math.round(minViableMs / 1000)}s one-candidate minimum`);
-    if (clampedByScene) bits.push(`clamped to ${Math.round(MAX_SCENE_SHARE * 100)}% of remaining scene time`);
+    if (lastChance) {
+        bits.push(`last full attempt this scene — ${Math.round(left / 1000)}s left fits one candidate but not a rescue rung, `
+            + `so it gets the whole ${Math.round(minViableMs / 1000)}s minimum instead of a ${Math.round(MAX_SCENE_SHARE * 100)}% share it could not finish in`);
+    } else if (clampedByScene) {
+        bits.push(`clamped to ${Math.round(MAX_SCENE_SHARE * 100)}% of remaining scene time`);
+    }
     if (!viable) bits.push(`NOT VIABLE — ${Math.round(left / 1000)}s left, one candidate needs ~${Math.round(minViableMs / 1000)}s`);
 
-    return { ms, disabled: false, explain: bits.join(', '), viable, minViableMs };
+    return { ms, disabled: false, explain: bits.join(', '), viable, minViableMs, lastChance };
+}
+
+/**
+ * THE PREP CLOCK — how long a candidate may spend LOOKING at a source before it
+ * starts downloading one.
+ *
+ * Some providers inspect a source before they fetch it. YouTube's storyboard
+ * scout reads the free sprite sheet of a 13-minute video to find the one 4s
+ * window that actually matches the scene — real work, worth paying for, and it
+ * costs tens of seconds.
+ *
+ * THE AUG-5 BUG. That inspection was bounded by the SCENE deadline, which the
+ * race had just pushed 120s into the future to protect the download. The
+ * candidate's own budget was 56s. The scout spent 47 of them, the download began
+ * with 9s left, and all four candidates were aborted mid-transfer: four opens,
+ * zero verdicts, zero YouTube footage in a 64-scene build whose own topic ranked
+ * YouTube first. The same shape as every clock bug in this subsystem — inner
+ * work measured against the outer clock.
+ *
+ * So prep gets its own, tighter deadline: this candidate's own end, minus what a
+ * download plus a verdict measurably needs. That reserve is `minViableMs`, which
+ * this module measures per provider from the current run, so the line moves with
+ * the topic, the network and the GPU queue instead of being a constant that goes
+ * stale on someone else's machine.
+ *
+ * When the reserve eats the whole budget the answer lands in the past, the
+ * provider takes its blind window, and every second goes to the bytes. That is
+ * the right trade: a blind window the post-download judge still scores beats a
+ * perfect window that never finishes downloading.
+ *
+ * @param {object} o
+ * @param {number} [o.startedAt]        when this candidate started (ms epoch);
+ *   defaults to now, because a missing start time must not be read as "no clock"
+ * @param {number} o.candidateTimeoutMs this candidate's whole budget
+ * @param {number} o.minViableMs        measured download+verdict reserve
+ * @param {number} [o.sceneDeadlineAt]  the outer scene guard (ms epoch), if any
+ * @returns {number} absolute ms deadline. Never 0 when a candidate budget
+ *   exists — downstream, 0 means "no limit", which is the bug being closed.
+ */
+function resolvePrepDeadlineAt({ startedAt, candidateTimeoutMs, minViableMs, sceneDeadlineAt } = {}) {
+    const budget = Number(candidateTimeoutMs) || 0;
+    // A capped candidate that forgot to say when it started is the one input
+    // that could still return 0 — and 0 means "unlimited" to every caller, which
+    // is precisely the bug this function exists to remove. So a missing start
+    // time means "now": slightly tighter than the truth, never unbounded.
+    const start = Number(startedAt) > 0 ? Number(startedAt) : (budget > 0 ? Date.now() : 0);
+    const reserve = Math.max(0, Number(minViableMs) || 0);
+    const scene = Number(sceneDeadlineAt) || 0;
+
+    // 1, not 0, for the same reason: a budget smaller than the reserve must come
+    // back already-expired, not unlimited.
+    let at = (start > 0 && budget > 0) ? Math.max(1, start + budget - reserve) : 0;
+
+    // The scene guard still applies — prep may be tighter than the scene, never
+    // looser.
+    if (scene > 0) at = at > 0 ? Math.min(at, scene) : scene;
+    return at;
 }
 
 /** Reset measured state. Used by tests. */
@@ -464,6 +572,7 @@ function reset() {
 
 module.exports = {
     resolveCandidatePatienceMs,
+    resolvePrepDeadlineAt,
     recordDownload,
     recordCandidate,
     recordJudging,

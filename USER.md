@@ -3,7 +3,7 @@
 - **Name:** Abdessamad
 - **What to call them:** Abdessamad or bro
 - **Timezone:** Africa/Casablanca
-- **Notes:** Owns and develops YTA EMPIRE WEBGL. Values direct communication, strong AI reasoning, practical automation, and preservation of existing work.
+- **Notes:** Owns and develops Forge. Values direct communication, strong AI reasoning, practical automation, and preservation of existing work.
 
 ## Current Focus
 

@@ -320,6 +320,46 @@
                     </label>
                     <small class="ai-instructions-hint" id="smart-ai-hint">When OFF: no AI calls, uses Whisper segments + random keywords/transitions/MGs. Free!</small>
                     </div>
+                    <details id="ai-connections-group" class="diagnostic-settings" open style="margin-top:4px">
+                    <summary>AI Connections — where each AI job runs</summary>
+                    <small class="ai-instructions-hint">Rent a GPU or an AI service, paste its address, key and model name, press Test, then pick it for a job. Jobs left on "Built-in setup" use the AI Provider below, exactly as before.</small>
+                    <div id="ai-connections-jobs" style="margin-top:8px"></div>
+                    <div id="ai-connections-list" style="margin-top:10px"></div>
+                    <button id="ai-connections-add" class="btn-small" style="margin-top:6px;padding:4px 10px;font-size:11px">+ Add connection</button>
+                    <div id="ai-connections-form" class="hidden" style="margin-top:8px;padding:8px;border:1px solid #333;border-radius:6px;background:#141414">
+                        <label>Type:</label>
+                        <select id="ai-conn-preset"></select>
+                        <small id="ai-conn-preset-note" class="ai-instructions-hint"></small>
+                        <label style="margin-top:6px">Name:</label>
+                        <input type="text" id="ai-conn-label" maxlength="80" placeholder="e.g. Modal Qwen" style="width:100%;padding:5px 8px;border:1px solid #555;border-radius:4px;background:#2a2a2a;color:#eee;font-size:12px">
+                        <label style="margin-top:6px">Address:</label>
+                        <input type="text" id="ai-conn-url" maxlength="500" style="width:100%;padding:5px 8px;border:1px solid #555;border-radius:4px;background:#2a2a2a;color:#eee;font-size:12px">
+                        <label style="margin-top:6px">Key:</label>
+                        <input type="password" id="ai-conn-key" autocomplete="off" style="width:100%;padding:5px 8px;border:1px solid #555;border-radius:4px;background:#2a2a2a;color:#eee;font-size:12px">
+                        <label style="margin-top:6px">Model name:</label>
+                        <input type="text" id="ai-conn-model" maxlength="200" placeholder="exactly as the server names it" style="width:100%;padding:5px 8px;border:1px solid #555;border-radius:4px;background:#2a2a2a;color:#eee;font-size:12px">
+                        <label style="margin-top:6px">Model that sees images <span style="opacity:0.6;font-weight:normal">(optional)</span>:</label>
+                        <input type="text" id="ai-conn-vision-model" maxlength="200" placeholder="leave empty if the model above also sees images" style="width:100%;padding:5px 8px;border:1px solid #555;border-radius:4px;background:#2a2a2a;color:#eee;font-size:12px">
+                        <details style="margin-top:6px">
+                            <summary style="font-size:11px;opacity:0.8">Advanced</summary>
+                            <label style="margin-top:6px">How the key is sent:</label>
+                            <select id="ai-conn-auth">
+                                <option value="bearer">Authorization: Bearer (most servers)</option>
+                                <option value="api-key">api-key header (Azure)</option>
+                                <option value="none">No key</option>
+                            </select>
+                            <label style="margin-top:6px">Requests at the same time:</label>
+                            <input type="number" id="ai-conn-concurrency" min="1" max="64" value="8" style="width:80px;padding:4px 6px;border:1px solid #555;border-radius:4px;background:#2a2a2a;color:#eee;font-size:12px">
+                        </details>
+                        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+                            <button id="ai-conn-test" class="btn-small" style="padding:4px 10px;font-size:11px">Test</button>
+                            <button id="ai-conn-save" class="btn-small" style="padding:4px 10px;font-size:11px">Save</button>
+                            <button id="ai-conn-cancel" class="btn-small" style="padding:4px 10px;font-size:11px">Cancel</button>
+                        </div>
+                        <div id="ai-conn-test-result" style="margin-top:6px"></div>
+                    </div>
+                    <small id="ai-connections-status" class="ai-instructions-hint"></small>
+                    </details>
                     <div id="ai-provider-group">
                     <label>AI Provider:</label>
                     <select id="ai-provider">
@@ -328,8 +368,10 @@
                         <option value="bedrock-aplink">AWS Bedrock + Claude Opus 4.6 (APlink) — replaces Sonnet</option>
                         <option value="bedrock-azure">AWS Bedrock + Claude Sonnet 4.6 (Azure) — replaces Sonnet</option>
                         <option value="bedrock-azure-grok">AWS Bedrock + Grok 4.3 (Azure) — replaces Sonnet</option>
+                        <option value="azure-split">Azure split — Claude Opus thinking + GPT-5.6 everything else</option>
+                        <option value="azure-managed">Azure Managed — Ornith brain + Qwen default/vision (contact-5371)</option>
                     </select>
-                    <small class="ai-instructions-hint">Text: Bedrock only, or send the Sonnet-tier tasks (Visual Planner, Director scene-split, effects/icon/transition directors) to AiLink, APlink, Azure Claude, or Azure Grok. DeepSeek + utility tasks always stay on Bedrock, which is also the automatic fallback. Vision: DashScope Qwen free-quota pool first, Bedrock Qwen-VL/Claude/Nova fallback.</small>
+                    <small class="ai-instructions-hint">Text: Bedrock only, or send the Sonnet-tier tasks (Visual Planner, Director scene-split, effects/icon/transition directors) to AiLink, APlink, Azure Claude, or Azure Grok. DeepSeek + utility tasks always stay on Bedrock, which is also the automatic fallback. "Azure split" is the exception — it runs both Azure deployments at once, reasoning tasks on the Claude one and the cheap high-volume ones on the GPT-5.6 one, leaving nothing on Bedrock. "Azure Managed" replaces Bedrock entirely — brain tasks on Ornith, everything else (text + vision + scoring) on Qwen. Vision: DashScope Qwen free-quota pool first, Azure GPT-5.6 next, Bedrock Qwen-VL/Claude/Nova last.</small>
                     </div>
                     <div id="ai-thinking-group">
                     <label style="margin-top:8px">AI Thinking:</label>
@@ -346,6 +388,28 @@
                     <textarea id="ai-instructions" rows="3" placeholder="Plain-English rules for THIS video — they override the defaults everywhere. e.g. &quot;95% footage, almost no templates&quot; · &quot;no text cards at all&quot; · &quot;keep it under 10 minutes&quot; · &quot;cinematic, no glitchy effects&quot; · &quot;use maps heavily early on&quot;"></textarea>
                     <small class="ai-instructions-hint" id="ai-instructions-hint">Sent to every decision brain — Director, Visual Planner, templates, motion graphics, effects. Highest priority: overrides the system defaults.</small>
                     </div>
+                    <details id="agent-access-group" class="diagnostic-settings" style="margin-top:12px">
+                    <summary>Agent access — let an AI agent run Forge (MCP / API)</summary>
+                    <label class="toggle-row" style="margin-top:8px">
+                        <input type="checkbox" id="agent-access-toggle">
+                        <span class="toggle-label">Agent access</span>
+                    </label>
+                    <small class="ai-instructions-hint">OFF by default. When ON, Forge listens on this computer only (127.0.0.1) and every request must carry the access key below. An agent — Claude Code, Meta Muse, ChatGPT, a script — can then open projects, import narration, change these settings, build, render, read the build log and download the finished file. To reach it from outside this PC, put a tunnel (Tailscale Funnel, cloudflared) in front of it; nothing has to listen on your network.</small>
+                    <div id="agent-access-details" class="hidden" style="margin-top:8px">
+                        <label>MCP address:</label>
+                        <input type="text" id="agent-access-url" readonly style="width:100%;padding:5px 8px;border:1px solid #555;border-radius:4px;background:#2a2a2a;color:#eee;font-size:11px">
+                        <label style="margin-top:6px">Access key:</label>
+                        <input type="password" id="agent-access-key" readonly style="width:100%;padding:5px 8px;border:1px solid #555;border-radius:4px;background:#2a2a2a;color:#eee;font-size:11px">
+                        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+                            <button id="agent-access-copy-url" class="btn-small" style="padding:4px 10px;font-size:11px">Copy address</button>
+                            <button id="agent-access-copy-key" class="btn-small" style="padding:4px 10px;font-size:11px">Copy key</button>
+                            <button id="agent-access-show-key" class="btn-small" style="padding:4px 10px;font-size:11px">Show key</button>
+                            <button id="agent-access-copy-command" class="btn-small" style="padding:4px 10px;font-size:11px">Copy Claude Code command</button>
+                            <button id="agent-access-rotate" class="btn-small" style="padding:4px 10px;font-size:11px">New key</button>
+                        </div>
+                        <small class="ai-instructions-hint" id="agent-access-status">Checking…</small>
+                    </div>
+                    </details>
                     </div><!-- /ai panel -->
                     <div class="stab-panel media-settings-panel" data-stab="media">
                     <div id="veo-ai-video-row" style="margin-top:12px;padding:8px;background:#141414;border:1px solid #2a2a2a;border-radius:6px">
@@ -387,8 +451,9 @@
                         <option value="aws">🟦 AWS GPU box — auto-starts during build</option>
                         <option value="lightning">🟨 Lightning.ai — auto-starts during build (or manual)</option>
                         <option value="bedrock">☁️ AWS Bedrock — always on, no GPU box</option>
+                        <option value="azure-managed">🟪 Azure Managed Compute — always on, no GPU box</option>
                     </select>
-                    <small style="display:block; margin-top:4px; color:#888">Where B-roll images get scored by the vision model. <b>AWS</b> &amp; <b>Lightning</b> are both woken automatically when the build needs vision and stop themselves when idle (Lightning needs <code>LIGHTNING_API_KEY</code> set, else it's manual). <b>Bedrock</b> has no box to manage.</small>
+                    <small style="display:block; margin-top:4px; color:#888">Where B-roll images get scored by the vision model. <b>AWS</b> &amp; <b>Lightning</b> are both woken automatically when the build needs vision and stop themselves when idle (Lightning needs <code>LIGHTNING_API_KEY</code> set, else it's manual). <b>Bedrock</b> and <b>Azure Managed</b> have no box to manage. Picking <b>Azure Managed</b> as the AI Provider above switches this to Azure Managed too, so the brain and the footage judge stay on one endpoint.</small>
                     <button id="btn-manage-lightning" class="btn-small" style="margin-top:6px;padding:5px 12px;font-size:11px;background:#3a3416;color:#fbbf24;border:1px solid #f59e0b;border-radius:4px;cursor:pointer;font-weight:600;" title="Add Lightning accounts and manage their free monthly credit (rotation pool)">🟨 Manage Lightning accounts</button>
                     </div><!-- /vision-backend-group -->
                 <div id="resource-control-group" class="panel-section footage-resource-compact">
@@ -1375,6 +1440,9 @@
     <script src="js/app.js"></script>
     <script src="js/editor-agent-request-retry.js"></script>
     <script src="js/editor-agent-panel.js"></script>
+    <script src="js/remote-control.js"></script>
+    <script src="js/agent-access-panel.js"></script>
+    <script src="js/ai-connections-panel.js"></script>
 </body>
 
 </html>

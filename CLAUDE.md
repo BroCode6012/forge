@@ -33,7 +33,8 @@ npm run start:v2    # EXPORT_V2=1 (legacy in-process-GPU export path)
 npm run verify      # FULL gate: 23 checks + verify:extended. Run before committing.
 npm run verify:ci   # verify + npx tsc --noEmit
 npm run verify:extended   # 11 settings/registry/directive/effects/presenter/sfx/veo checks
-npm run verify:runtime    # 6 checks that BOOT ELECTRON (slow, needs a display)
+npm run verify:runtime    # 7 checks that BOOT ELECTRON (slow, needs a display)
+npm run verify:remote     # agent remote control (MCP/REST) gate, 141 checks
 npm run verify:paths      # require-path resolution only (fastest sanity check)
 npm run verify:sacred     # sacred-invariants tripwire only
 
@@ -56,7 +57,8 @@ ui/                Renderer: 6 HTML pages + ui/js/ (app.js is 13.5k lines)
 src/
   pipeline/        build-video.js (4.8k, 31 steps), build-orchestrator.js, transcribe.js,
                    final-review.js, pacing-verify.js, rebuild-motion-graphics.js
-  brain/           ai-provider.js (callAI/callVisionAI), cost-tracker.js, strict-json.js, vertex-auth.js
+  brain/           ai-provider.js (callAI/callVisionAI), cost-tracker.js, strict-json.js, vertex-auth.js,
+                   connections.js + connection-transport.js (AI Connections: the universal plug)
   agents/          Pipeline directors + planners (ai-director, ai-visual-planner, ceo, scene-*),
                    registry.js, base-director.js
     workers/       Brain workers (effects/transition/icon/sound/presenter directors,
@@ -70,13 +72,16 @@ src/
   vision/          ai-vision.js prompts + GPU cost control (vision-gpu/vision-box/lightning-*)
   map/             map-assignment, map-compiler, map-provider, map-hf-builder, map-style-packs
   data/            themes.js, niches.js, languages.js, class-treatment-map.js   ← pure data
-  settings/        schema.js (SSOT), config.js, build-env.js, recipe-loader.js
+  settings/        schema.js (SSOT), config.js, build-env.js, recipe-loader.js,
+                   ai-connections-store.js (encrypted connection storage)
   categories/      Category registry (faceless | talkingHead)
   formats/         listicle-format.js only (registry not built yet)
   directives/      directive-compiler + actuator + compliance-loop + presets
   project/         project-store.js, timeline-contract.js, plan-range.js
   studio/          QA Studio / QA Chat / Style Learner / Style Studio agents
   security/        safe-download.js (SSRF-hardened fetch)
+  remote/          Agent remote control: tools.js (catalog) + mcp.js + server.js
+                   + control-service.js + access-config.js + openapi.js
   util/            logger.js, promise.js, url-utils.js
 scripts/verify/    The verification harness + sacred-invariants.json
 skills/hyperframes-template/  The composition-author skill pack
@@ -161,10 +166,17 @@ Alternate entries into the same file: resume-from-checkpoint, repeat-from-Step-4
 Unified `callAI()` / `callVisionAI()` / `callVideoAI()`. Config in `src/settings/config.js`.
 
 - **Text**: **AWS Bedrock** is the base brain, with a per-task model split (`BEDROCK_PLANNER_MODEL`, `BEDROCK_UTILITY_MODEL`, `BEDROCK_FALLBACK_MODEL`). Hybrid routing via `_normalizeTextTaskType` / `_textRouteKey` can put **AiLink** (GPT-5.5), **APlink** (Claude relay), **Azure Claude**, or **Azure OpenAI** (grok) *beside* Bedrock for specific task types, with Bedrock as automatic fallback.
-- **`AI_PROVIDER` is a decoy**: main.js writes it, nothing reads it, and `config.aiProvider` is hardcoded `'bedrock'`. Real routing is `AILINK_TASK_TYPES` / `APLINK_TASK_TYPES` / `AZURE_TASK_TYPES` / `AZURE_OPENAI_TASK_TYPES`.
+- **`AI_PROVIDER` is a decoy for every value but one.** The hybrid brains sit *beside* Bedrock through their own gates, so real routing is `AILINK_TASK_TYPES` / `APLINK_TASK_TYPES` / `AZURE_TASK_TYPES` / `AZURE_OPENAI_TASK_TYPES`, and `config.aiProvider` resolves to `'bedrock'` regardless. The exception is **`azure-managed`**, which *replaces* Bedrock (one endpoint, two deployments, no Bedrock fallback) and therefore has to be visible to `_getTextRoute` as the primary — `config.aiProvider` reads `AI_PROVIDER` for that one value only. While it was hardcoded, picking "Azure Managed" in the dropdown could never take effect: requests fell through to the hybrid `AZURE_OPENAI_TASK_TYPES` gate and 401'd against the wrong endpoint. Gated by `scripts/verify/vision-backend-routing.js`.
 - **`VERTEX_*` is dead** — only `GOOGLE_APPLICATION_CREDENTIALS` survives, and only for the Studio (Gemini) path.
 - `cost-tracker.js` prices every call per run, broken down by provider/model/task.
 - Removed providers: NVIDIA client, Gemini vision, Ollama/OpenAI/DeepSeek/Groq direct, Google CSE.
+
+**AI Connections — the universal plug (`brain/connections.js` + `brain/connection-transport.js`).** The data-driven replacement for hand-wiring providers. A *connection* = address + key + model name(s) on any **OpenAI-compatible** server (vLLM/SGLang/TGI on Modal, DigitalOcean, AWS, GCP, Oracle, RunPod; Azure AI Foundry; OpenRouter; Meta Model API; Ollama). Three *jobs* — **Thinking** (brain, planner-*, review, motion-graphics, template), **Everyday** (utility, general, classifier), **Eyes** (all vision + `callVideoAI`) — each point at a connection, a backup, or `builtin`.
+- Hooks are the two front doors only: `_getTextRoute` (wraps the untouched `_getBuiltInTextRoute`) and `_getVisionChain` (wraps `_getBuiltInVisionChain`); entries are `connection:<id>`. **A job on `builtin` routes byte-for-byte as before**, and `providerOverride` always takes the built-in route. `vision-gpu.ensureReady()` skips the rented box when Eyes is fully on a connection.
+- The transport **learns each server's dialect from its own 400s** (`max_tokens`↔`max_completion_tokens`, temperature omitted) instead of guessing from model names; strips a leading `<think>` block; retries 429/5xx/transport; per-connection concurrency; `testConnection()` returns plain-English steps (reach / write / see a red square).
+- Storage: `settings/ai-connections-store.js` → `<userData>/ai-connections.json`, keys encrypted with Electron `safeStorage` (injected crypto; honest "not encrypted" fallback). The renderer only ever gets `hasKey`. Main applies it in-process via `connections.setRuntime()`; a build child receives it ONLY as `buildEnv.FORGE_AI_CONNECTIONS` (never `process.env`, so ffmpeg/yt-dlp/render children never see keys).
+- UI: AI settings → *AI Connections* (`ui/js/ai-connections-panel.js`, textContent only). IPC: `ai-connections-get/save/test`.
+- Gated by `scripts/verify/ai-connections.js` (81 checks, fake OpenAI server, incl. a real child process routing through its env) and `npm run verify:runtime-ai-connections` (boots Electron, fills the form, Save → Test → pick job, checks the key is encrypted on disk; 18 checks).
 
 **`agents/base-director.js`** is the one copy of the 12-step control-flow skeleton the six "triad" brain directors used to hand-roll each. **`agents/registry.js`** is the declarative catalog of those directors:
 
@@ -183,7 +195,7 @@ Unified `callAI()` / `callVisionAI()` / `callVideoAI()`. Config in `src/settings
 
 Prompts live in `vision/ai-vision.js`; transport is `brain/ai-provider.js:callVisionAI`.
 
-- **Backends**: `VISION_BACKEND` = `aws` (default) | `lightning` | `bedrock` | `dashscope`, resolved by `config.resolveVisionBackend()`. It snapshots the raw `.env` baseline once (`_RAW_VISION_ENV`) and restores it on every call so the UI dropdown can switch backends live. **Add a new `QWEN_*`/`VISION_*` override to `_RAW_VISION_ENV` or it will stack across switches.**
+- **Backends**: `VISION_BACKEND` = `aws` (default) | `lightning` | `bedrock` | `dashscope` | `azure-managed`, resolved by `config.resolveVisionBackend()`. `azure-managed` is the vision half of the Azure Managed brain — same endpoint, no GPU machine, no key pool; the AI Provider dropdown switches this setting with it, because a `VISION_BACKEND` written behind the UI's back loses to the stale value the UI republishes through `YTA_ENV_LOCK`. It snapshots the raw `.env` baseline once (`_RAW_VISION_ENV`) and restores it on every call so the UI dropdown can switch backends live. **Add a new `QWEN_*`/`VISION_*` override to `_RAW_VISION_ENV` or it will stack across switches.**
 - **Fallback chain**: `qwen` → `bedrock-qwen-vl` → `bedrock-claude` → `bedrock-nova`. Nova is the *last* emergency fallback, not the first choice. `VISION_EXCLUDE_QWEN=1` drops the GPU (per-scene Retry does this).
 - **Cost model**: `vision-gpu.js` is the ONE control surface, dispatching to `vision-box.js` (AWS EC2) or `lightning-box.js` (Lightning Studio via `python src/lightning-control.py`). The GPU starts **just-in-time at Step 5** and is **stopped the moment scoring+framing end (Step 5.1)** — never during transcribe/Director/render. `_weStarted` means a user-pre-warmed box is left running.
 - `vision-rewake.js` is a mid-build watchdog, deliberately **disarmed** after the media phase so the light Step 7.6 review can't trigger a multi-minute cold boot.
@@ -196,6 +208,8 @@ Prompts live in `vision/ai-vision.js`; transport is `brain/ai-provider.js:callVi
 `footage-manager.js` (~10k lines) is the orchestrator: downloads scenes in parallel with per-scene priority from `sourceHint` (stock/youtube/web-image), inline vision scoring. It is the only consumer of the provider registry.
 
 Layers above it: `media-intent-controller.js` (deterministic lane authority) → `media-agent.js` (AI scene brief) → `media-hunter.js` (what "good footage" means in the lane) → `media-scout.js` (pre-download metadata rejection) → `candidate-finalist-scout.js` → `candidate-race.js` (parallel download+score) → `candidate-referee.js` (final AI editor pass, clean-beats-defective rule). Support: `clip-prescreen.js` (cheap ffmpeg black/frozen detect before paying for vision), `clip-analyzer.js` (multi-frame clip vetting), `retrievability-rescue.js` (rewrites un-findable visual intents into findable B-roll BEFORE download), `media-memory-bank.js`, `title-sanity.js` (deliberately non-blocking), `source-policy.js`, `transcript-scout.js`, `topic-footage-scout.js`.
+
+**Screen-aware racing** (`candidate-race.js`): the Thumbnail Screen (`vision/thumbnail-vision.js`) judges ~25 previews in ONE call and hands its per-candidate verdicts to the race. Candidates it declined wait behind the rest, never share a batch with them, and get a 2-candidate probe; a failed probe ends the race. Still a ranking, never a gate — and it learns in-run per provider (declined candidates must pass at < half the liked rate once ≥6 are raced, or deferral switches off; `FOOTAGE_RACE_SCREEN_DEFER=0` disables). The race also commits a HELD accepted clip when a later batch finds nothing — it used to delete it and return null. Every build prints `[Race Economy]` and writes `race-economy.json`. Vision spend is split by purpose in the cost report via `withCostPurpose()` (`brain/cost-tracker.js`, report-only, never routing). Gated by `scripts/verify/race-economy.js`.
 
 **Providers** (`src/media/providers/`) all extend `base-provider.js`: pexels-image/video, pixabay-image/video, brave-image, bing-image (keyless scraper — Bing's APIs retired 2025-08), reddit-video, youtube-video, storyblocks-video, plus `ytdlp-utils.js`.
 
@@ -233,6 +247,18 @@ Pattern for the agentic workers: ONE cached batch brain call, disk-cached, with 
 
 `src/directives/directive-compiler.js` turns the creator's one free-text "AI Instructions" order into a **single structured directives object every stage reads the same way** — replacing ~4 divergent ad-hoc parsers. Applied per-scene/time at Step 4.1 (`directive-util.js`), verified and deterministically repaired at Step 7.7 (`compliance-loop.js`). `directive-actuator.js` is the post-build acting bridge (QA chat / right-click free text) and deliberately **reuses the build-time machinery** rather than adding a parallel intent parser. Presets: `effect-preset.js`, `framing-preset.js`, `transition-preset.js`, `numeric-signals.js`. User directives beat niche bans.
 
+## Agent Remote Control (`src/remote/`)
+
+Lets an **outside** agent drive the app: Claude Code, Meta Muse, ChatGPT actions, n8n, a curl script. **OFF by default** — AI settings → *Agent access* (`ui/js/agent-access-panel.js`), stored in `<userData>/agent-access.json` (`{enabled, port, token}`), never in `settings/schema.js` because main needs it before any window exists. Env: `FORGE_AGENT_SERVER`, `FORGE_AGENT_PORT`, `FORGE_AGENT_HOST` (loopback or Tailscale CGNAT only; anything else needs `FORGE_AGENT_ALLOW_NETWORK=1`).
+
+- **`tools.js` is the ONE catalog** (12 `forge_*` tools + `SERVER_INSTRUCTIONS`). MCP `tools/list`, the REST routes and `openapi.json` are all generated from it, so transports cannot drift. Adding a tool = one entry + one handler in `control-service.js` (the verify gate asserts the two sets are equal).
+- **Transports** (`server.js`, one `node:http` server): `POST /mcp` (Streamable HTTP, stateless JSON — no SSE, no session ids), `GET /api/tools` + `POST /api/tools/<name>`, `GET /files/<name>` (Range, confined to `OUTPUT_PATH` by real path + extension allowlist), `GET /openapi.json` and `/health` (the only keyless routes).
+- **Guards**: 127.0.0.1 by default (a Tailscale Funnel / cloudflared tunnel reaches it through loopback, so nothing listens on the LAN); constant-time bearer/`X-Forge-Key` check; **any request carrying an `Origin` header is refused**, which closes the DNS-rebinding hole the MCP spec warns about; 1 MB JSON bodies.
+- **THE RULE: an agent presses the same controls a human does.** Anything user-facing is forwarded to `ui/js/remote-control.js`, which writes real DOM controls (+ fires their `change` events) and calls the real `generateVideo()` / `renderVideo()` / `cancelProcess()` / `adoptImportedAudio()`. There is no agent-only build path. Long jobs return a `jobId` immediately; the agent polls `forge_get_status` (which reads `state.lastProgress`, i.e. exactly what the progress bar says).
+- Narration import has one implementation (`main.js:_importNarrationFile`) shared by the drop zone and `forge_import_narration`; the URL form goes through `security/safe-download.js`.
+- Only the primary instance serves (`_isProjectChildInstance` opts out). `scripts/forge-mcp-stdio.js` bridges stdio-only MCP clients to the HTTP endpoint.
+- Gated by `scripts/verify/remote-control.js` (141 checks) **and** `npm run verify:runtime-remote`, which boots Electron and drives the live app over HTTP (38 checks).
+
 ## Map System (`src/map/`)
 
 - **Step 3.5** `map-assignment.js` — deterministic `must_map | can_map | must_not_map` per scene. **Hard pre-filter**: only 6 niches are scored at all (news.politics, news.military, explainer.politics/military/history/nature). Presenter HOLD beats and CTA zones force `must_not_map`.
@@ -268,6 +294,8 @@ Load-bearing vars: `BUILD_PRODUCTION_MODE`, `BUILD_FORMAT`, `BUILD_THEME`, `BUIL
 
 `EDITOR_AGENT` is the biggest undocumented switch (13 read sites, must be the literal string `'true'`, never set by build-env.js). `HF_TEMPLATE_AUTHOR` is the master switch above the `HF_AUTHOR_*` family. Other HF flags: `HF_AUTHOR_PERFECTIONIST`, `HF_AUTHOR_SUBJECT_FETCH`, `HF_AUTHOR_OVERLAYS`, `HF_AUTHOR_REFRESH`, `HF_TRANSITION_DIRECTOR`, `HF_ICON_DIRECTOR`, `HF_SOUND_DESIGNER`, `HF_FX_AGENT`, `HF_PRESENTER_DIRECTOR`, `HF_BACKGROUND_PACKS`, `HF_FACE_ANCHOR`, `HF_MOTION_DIRECTOR`, `HF_MAP_BUILDER`, `HF_ADAPTIVE_CONTRAST`, `HF_KEEP_PROJECTS`, `HF_MIN_FREE_GB`, `HF_HARD_MIN_FREE_GB`, `HF_MOTION_QA_*`, `AUDIO_FINISHING`, `MUSIC_BED_PATH`, `KARAOKE_CAPTIONS`, `MAX_FULLSCREEN_MAPS_PER_VIDEO`, `USE_CAMERA_PLAN_STOPS`, `USE_SCENE_CLASSES`, `AGENT_VISUAL_QA`, `DIRECTIVE_COMPILER`, `YTA_REMOTE_DEBUG(_PORT)`, `EXPORT_V2`.
 
+`HF_MOTION_QA_NAV_TIMEOUT_MS` (default `60000`) is the one that unblocks heavy projects: the HyperFrames CLI gives its *diagnostic* browser only **10s** at `page.goto` (`resolveDiagnosticNavigationTimeoutMs`), a tenth of the 60s its capture browser gets, and `PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS` is the only input that reaches it. Motion QA now exports that var to every `lint`/`keyframes`/`check`/`snapshot` child, so a 270-scene proof composition no longer hard-fails with `check_runtime_failure: Navigation timeout of 10000 ms exceeded`.
+
 ## Verification Harness (`scripts/verify/`)
 
 This is what makes the reorg safe. **Run `npm run verify` before committing.**
@@ -284,7 +312,7 @@ This is what makes the reorg safe. **Run `npm run verify` before committing.**
 
 **Moving any of these requires editing that JSON in the same commit.** That is the point — it forces the move to be deliberate.
 
-Other notable checks: `require-paths.js` (every require resolves), `electron-security.js` / `ipc-security.js` / `network-security.js`, `package-hygiene.js`, `settings-surface.js` (schema ↔ UI ↔ env agreement), `timeline-contract.js`, `partial-render-range.js`, `stage-handoff.js`, `hyperframes-bridge-smoke.js`, `overlay-transparency.js`, `graphic-shells.js`, `adaptive-contrast.js`, `motion-qa.js`, `editor-agent*.js`, `visual-observer.js`, `lightning-compat.py`.
+Other notable checks: `remote-control.js` (agent MCP/REST surface), `require-paths.js` (every require resolves), `electron-security.js` / `ipc-security.js` / `network-security.js`, `package-hygiene.js`, `settings-surface.js` (schema ↔ UI ↔ env agreement), `timeline-contract.js`, `partial-render-range.js`, `stage-handoff.js`, `hyperframes-bridge-smoke.js`, `overlay-transparency.js`, `graphic-shells.js`, `adaptive-contrast.js`, `motion-qa.js`, `editor-agent*.js`, `visual-observer.js`, `lightning-compat.py`.
 
 ## Key Data Flow
 

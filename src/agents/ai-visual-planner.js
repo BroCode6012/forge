@@ -451,6 +451,13 @@ function _applySemanticSourceRouting(scenes, scriptContext = {}, plannerDirectiv
                     reason = 'AI-declared real moving footage should use a real-footage source';
                 }
             } else if ((before === 'youtube' || before === 'reddit') && _sanitizeMediaNeed(scene.mediaNeed) === 'generic-broll') {
+                // REVERTED 2026-09-02. This branch briefly required the scene's own signals
+                // to agree before demoting to stock, on the theory that it was wrongly
+                // starving the web-image lane. Measured: it moved ~100 scenes off stock (54%
+                // success) and onto youtube (42%), and the borrow rate went 45.3% -> 47.5%.
+                // The premise was wrong — web-image's 89% was a property of the easy scenes
+                // the planner sent it, not of the lane — so leave the original behaviour
+                // alone. See SPEED-PLAN.md Stage 5.
                 afterSource = 'stock';
                 reason = 'AI-declared generic b-roll should use stock';
             }
@@ -723,7 +730,7 @@ function _restoreFootageLaneAfterDisplayStrip(scene, scenes, scriptContext = {},
         scene.templateBgQuery ||
         scene.visualIntent ||
         _pickConcreteFootageKeywordFromText(scene.text || '') ||
-        extractFallbackKeyword(scene.text || '');
+        extractFallbackKeyword(scene.text || '', scene, scriptContext);
 
     scene.templateHint = null;
     scene.templateBgQuery = null;
@@ -1590,12 +1597,20 @@ function _snapshotRawAIChoice(scene) {
     };
 }
 
-function _restoreFootageAfterFullscreenDrop(scene, nicheId, plannerDirectives = null) {
+// scriptContext is a PARAMETER, not a closure variable. This is a module-level helper —
+// every other extractFallbackKeyword call site sits inside a function that has
+// scriptContext in scope, and this one silently did not, so the third fallback branch
+// threw `ReferenceError: scriptContext is not defined` the moment the first two missed:
+// a scene whose keyword is empty/weak, with no editor intent and no concrete keyword in
+// its text. That is the ordinary case for a map scene in a niche that bans mapChart, so
+// the niche map ban crashed Step 4 outright. Threaded through rather than defaulted to
+// null so _subjectFallbackKeyword keeps its subject awareness.
+function _restoreFootageAfterFullscreenDrop(scene, nicheId, plannerDirectives = null, scriptContext = null) {
     if (!scene.keyword || scene.keyword === 'none' || _isWeakFootageKeyword(scene.keyword)) {
         scene.keyword =
             scene._editorIntent?.footageKeyword ||
             _pickConcreteFootageKeywordFromText(scene.text || '') ||
-            extractFallbackKeyword(scene.text || '');
+            extractFallbackKeyword(scene.text || '', scene, scriptContext);
     }
     scene.mediaType = scene.mediaType || 'video';
     scene.sourceHint = scene.sourceHint || _pickPreferredVideoSource(nicheId || 'general', plannerDirectives, 'stock');
@@ -1604,7 +1619,7 @@ function _restoreFootageAfterFullscreenDrop(scene, nicheId, plannerDirectives = 
     scene.visualIntent = scene.visualIntent || scene.keyword;
 }
 
-function _dropForbiddenMapChart(scene, nicheId, plannerDirectives = null, restoreFootage = false) {
+function _dropForbiddenMapChart(scene, nicheId, plannerDirectives = null, restoreFootage = false, scriptContext = null) {
     const fsType = _fullscreenMGType(scene.fullscreenMG);
     if (!fsType || !fsType.toLowerCase().startsWith('map')) return null;
     if (_nicheAllowsMapChartById(nicheId)) return null;
@@ -1617,18 +1632,18 @@ function _dropForbiddenMapChart(scene, nicheId, plannerDirectives = null, restor
     scene.mapVariant = null;
     scene._nicheMapDrop = { before, reason: `niche ${nicheId || 'general'} excludes mapChart` };
     if (restoreFootage) {
-        _restoreFootageAfterFullscreenDrop(scene, nicheId, plannerDirectives);
+        _restoreFootageAfterFullscreenDrop(scene, nicheId, plannerDirectives, scriptContext);
     }
     return { index: scene.index, before, after: scene.keyword || 'footage fallback', reason: scene._nicheMapDrop.reason };
 }
 
-function _enforceNicheMapChartBan(scenes, nicheId, plannerDirectives = null) {
+function _enforceNicheMapChartBan(scenes, nicheId, plannerDirectives = null, scriptContext = null) {
     if (_nicheAllowsMapChartById(nicheId)) return [];
     // Creator authority: an explicit "use maps" order beats the niche ban entirely.
     if (_userExplicitlyWantsMaps(plannerDirectives)) return [];
     const fixes = [];
     for (const scene of scenes || []) {
-        const fix = _dropForbiddenMapChart(scene, nicheId, plannerDirectives, true);
+        const fix = _dropForbiddenMapChart(scene, nicheId, plannerDirectives, true, scriptContext);
         if (fix) fixes.push(fix);
     }
     return fixes;
@@ -2091,7 +2106,7 @@ function _applyPlannerMediaMix(scenes, scriptContext, plannerDirectives, stats) 
             if (flipped >= needed) break;
             scene.mediaType = 'video';
             scene.sourceHint = topSource;
-            scene.stockQuery = scene.stockQuery || _autoStockQuery(scene.keyword || extractFallbackKeyword(scene.text));
+            scene.stockQuery = scene.stockQuery || _autoStockQuery(scene.keyword || extractFallbackKeyword(scene.text, scene, scriptContext));
             flipped++;
         }
         if (flipped > 0) stats.styleMixAdjusted += flipped;
@@ -2439,7 +2454,7 @@ function _enforceNumericLowerThirdDirective(scenes, scriptContext = {}, director
             || scene.webQuery
             || scene.ideaVisual
             || scene.visualIntent
-            || extractFallbackKeyword(scene.text || '');
+            || extractFallbackKeyword(scene.text || '', scene, scriptContext);
         scene.fullscreenMG = null;
         scene.templateHint = null;
         scene.templateType = null;
@@ -2494,7 +2509,7 @@ async function _finalizeVisualPlan(enrichedScenes, scriptContext, directorsBrief
     if (_useLeanVpFinalizer()) {
         console.log('   [VP Lean Mode] active: AI visual plan is source-of-truth; skipped heavy rewrite stacks, kept hard source/provider sanity checks');
 
-        const nicheMapFixes = _enforceNicheMapChartBan(enrichedScenes, scriptContext.nicheId, plannerDirectives);
+        const nicheMapFixes = _enforceNicheMapChartBan(enrichedScenes, scriptContext.nicheId, plannerDirectives, scriptContext);
         if (nicheMapFixes.length > 0) {
             console.log(`   [Niche Map Rule] removed ${nicheMapFixes.length} forbidden mapChart scene(s):`);
             for (const f of nicheMapFixes) {
@@ -2542,6 +2557,14 @@ async function _finalizeVisualPlan(enrichedScenes, scriptContext, directorsBrief
                 console.log(`      ... ${semanticSourceFixes.length - 12} more`);
             }
         }
+        const stillRunBreaks = _breakStillRuns(enrichedScenes, scriptContext, plannerDirectives);
+        if (stillRunBreaks.length > 0) {
+            console.log(`   [Still Run Breaker] flipped ${stillRunBreaks.length} scene(s) to footage so no more than ${MAX_CONSECUTIVE_STILLS} stills play back-to-back:`);
+            for (const b of stillRunBreaks) {
+                console.log(`      Scene ${b.index}: ${b.before.mediaType || 'none'}/${b.before.sourceHint || 'none'} -> video/${b.after.sourceHint} — ${b.reason}`);
+            }
+        }
+
         const queryBackfills = _ensureFootageSearchQueries(enrichedScenes, scriptContext);
         if (queryBackfills > 0) {
             console.log(`   [Search Query Policy] backfilled ${queryBackfills} missing stock/web query field(s)`);
@@ -2635,7 +2658,7 @@ async function _finalizeVisualPlan(enrichedScenes, scriptContext, directorsBrief
             // Clean footage-query fields first; visualIntent is a treatment
             // description on graphics scenes ("Fullscreen ... template presenting").
             scene.keyword = scene.templateBgQuery || scene.bgQuery || scene.stockQuery
-                || scene.webQuery || scene.visualIntent || extractFallbackKeyword(scene.text || '');
+                || scene.webQuery || scene.visualIntent || extractFallbackKeyword(scene.text || '', scene, scriptContext);
         }
         if (!scene.mediaType) scene.mediaType = 'video';
         if (!scene.sourceHint) {
@@ -2726,7 +2749,7 @@ async function _finalizeVisualPlan(enrichedScenes, scriptContext, directorsBrief
     // Final niche map gate. Parser-time stripping catches raw AI output; this
     // pass catches later compliance/class rewrites that might reintroduce a
     // map lane after the parse step.
-    const nicheMapFixes = _enforceNicheMapChartBan(enrichedScenes, scriptContext.nicheId, plannerDirectives);
+    const nicheMapFixes = _enforceNicheMapChartBan(enrichedScenes, scriptContext.nicheId, plannerDirectives, scriptContext);
     if (nicheMapFixes.length > 0) {
         console.log(`   [Niche Map Rule] removed ${nicheMapFixes.length} forbidden mapChart scene(s):`);
         for (const f of nicheMapFixes) {
@@ -2803,6 +2826,18 @@ async function _finalizeVisualPlan(enrichedScenes, scriptContext, directorsBrief
             console.log(`      ... ${semanticSourceFixes.length - 12} more`);
         }
     }
+    // ── Still-run distribution ──
+    // Runs last, after every source/class/template rewrite has settled, so it
+    // measures the runs the build will actually ship — and before query backfill
+    // so the scenes it flips to footage get their stock/web queries.
+    const stillRunBreaks = _breakStillRuns(enrichedScenes, scriptContext, plannerDirectives);
+    if (stillRunBreaks.length > 0) {
+        console.log(`   [Still Run Breaker] flipped ${stillRunBreaks.length} scene(s) to footage so no more than ${MAX_CONSECUTIVE_STILLS} stills play back-to-back:`);
+        for (const b of stillRunBreaks) {
+            console.log(`      Scene ${b.index}: ${b.before.mediaType || 'none'}/${b.before.sourceHint || 'none'} -> video/${b.after.sourceHint} — ${b.reason}`);
+        }
+    }
+
     const queryBackfills = _ensureFootageSearchQueries(enrichedScenes, scriptContext);
     if (queryBackfills > 0) {
         console.log(`   [Search Query Policy] backfilled ${queryBackfills} missing stock/web query field(s)`);
@@ -4411,7 +4446,7 @@ function parseBatchResponse(rawText, scenes, nicheId, themeId, scriptContext, pl
             // map-dropped visible in the Planner Summary when the model ignores
             // a niche that forbids mapChart.
             _snapshotRawAIChoice(scene);
-            _dropForbiddenMapChart(scene, nicheId, plannerDirectives, false);
+            _dropForbiddenMapChart(scene, nicheId, plannerDirectives, false, scriptContext);
 
             // templateHint and fullscreenMG are mutually exclusive — fullscreenMG wins
             if (scene.templateHint && scene.fullscreenMG) {
@@ -4447,7 +4482,7 @@ function parseBatchResponse(rawText, scenes, nicheId, themeId, scriptContext, pl
         } else if (!scene.fullscreenMG) {
             // Fallback: Generate keyword from scene text if missing
             if (!scene.keyword || scene.keyword.length < 3) {
-                scene.keyword = _pickConcreteFootageKeywordFromText(scene.text || '') || extractFallbackKeyword(scene.text);
+                scene.keyword = _pickConcreteFootageKeywordFromText(scene.text || '') || extractFallbackKeyword(scene.text, scene, scriptContext);
             }
 
             // Default values
@@ -4554,22 +4589,94 @@ function parseBatchResponse(rawText, scenes, nicheId, themeId, scriptContext, pl
     return enrichedScenes;
 }
 
-/**
- * Extract a fallback keyword from scene text (used when AI fails).
- * Takes the most important nouns/verbs from the scene.
- */
-function extractFallbackKeyword(text) {
-    // Remove common words
-    const stopWords = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been', 'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those', 'it', 'its', 'they', 'them', 'their']);
+// Connectives, interrogatives and light verbs. None of them can BE the subject
+// of a footage search, so a query that opens on one — or is made of nothing
+// else — is a sentence fragment rather than a thing to go and film. The old
+// "first four long-ish words of the narration" rule turned "When it turns on
+// issues a wildcard entry..." into the query "when turns issues wildcard",
+// which every provider answers with nothing. Only unambiguous glue is listed:
+// words that double as real nouns ("issues", "work", "show") stay searchable.
+const KEYWORD_FRAGMENT_WORDS = new Set([
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+    'from', 'as', 'is', 'was', 'are', 'were', 'been', 'be', 'have', 'has', 'had', 'do',
+    'does', 'did', 'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can',
+    'this', 'that', 'these', 'those', 'it', 'its', 'they', 'them', 'their',
+    'when', 'while', 'then', 'than', 'there', 'here', 'what', 'which', 'who', 'whom',
+    'whose', 'where', 'why', 'how', 'because', 'though', 'although', 'unless', 'until',
+    'since', 'after', 'before', 'once', 'whether', 'however', 'also', 'even', 'just',
+    'very', 'really', 'quite', 'still', 'again', 'ever', 'never', 'always', 'often',
+    'about', 'above', 'below', 'under', 'over', 'into', 'onto', 'through', 'during',
+    'without', 'within', 'between', 'among', 'across', 'around', 'against', 'upon',
+    'being', 'doing', 'done', 'shall', 'something', 'anything', 'nothing', 'everything',
+    'someone', 'anyone', 'everyone', 'somebody', 'anybody', 'much', 'many', 'more',
+    'most', 'some', 'other', 'another', 'such', 'same', 'each', 'every', 'both',
+    'either', 'neither', 'none', 'turns', 'turned', 'turning', 'makes', 'made',
+    'making', 'takes', 'taking', 'taken', 'goes', 'going', 'went', 'comes', 'coming',
+    'came', 'gets', 'getting', 'seems', 'seemed', 'said', 'says', 'told', 'thought',
+    'specific', 'deliberate', 'important', 'simple', 'certain', 'various', 'several',
+]);
 
-    const words = text.toLowerCase()
+function _keywordWordsFromProse(text) {
+    return String(text || '').toLowerCase()
         .replace(/[^a-z0-9\s]/g, ' ')
         .split(/\s+/)
-        .filter(w => w.length > 3 && !stopWords.has(w));
+        .filter(w => w.length > 3 && !KEYWORD_FRAGMENT_WORDS.has(w));
+}
 
-    // Take first 3-4 meaningful words
-    const keyword = words.slice(0, 4).join(' ');
-    return keyword.length > 0 ? keyword : text.substring(0, 50);
+/**
+ * A keyword is degenerate when it names no subject: empty, or opening on a
+ * connective, or built entirely out of glue. Such a query is not merely weak,
+ * it is grammatically broken, and it costs a real download attempt to learn so.
+ */
+function _isDegenerateKeyword(keyword) {
+    const tokens = String(keyword || '').toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(Boolean);
+    if (tokens.length === 0) return true;
+    if (KEYWORD_FRAGMENT_WORDS.has(tokens[0])) return true;
+    return tokens.every(t => KEYWORD_FRAGMENT_WORDS.has(t));
+}
+
+/**
+ * What this scene is actually meant to SHOW, in the words the Director and the
+ * Planner already wrote. Preferred over mining the narration whenever the
+ * narration only yields a fragment — these fields describe a picture, so they
+ * name a subject by construction.
+ */
+function _subjectFallbackKeyword(scene, scriptContext) {
+    if (!scene && !scriptContext) return '';
+    const protectedTerms = Array.isArray(scene?.protectedTerms) ? scene.protectedTerms.filter(Boolean) : [];
+    const sources = [
+        protectedTerms.join(' '),
+        scene?.visualIntent,
+        scene?.ideaVisual,
+        scene?.ideaAnchor,
+        scriptContext?.eventAnchor,
+    ];
+    for (const source of sources) {
+        const words = _keywordWordsFromProse(source);
+        if (!words.length) continue;
+        const candidate = words.slice(0, 4).join(' ');
+        if (!_isDegenerateKeyword(candidate)) return candidate;
+    }
+    return '';
+}
+
+/**
+ * Extract a fallback keyword from scene text (used when AI fails).
+ * Takes the most important nouns/verbs from the scene, and — when the prose
+ * only yields a fragment — the scene's declared visual subject instead.
+ */
+function extractFallbackKeyword(text, scene = null, scriptContext = null) {
+    const keyword = _keywordWordsFromProse(text).slice(0, 4).join(' ');
+    if (keyword && !_isDegenerateKeyword(keyword)) return keyword;
+
+    const subject = _subjectFallbackKeyword(scene, scriptContext);
+    if (subject) return subject;
+
+    // Nothing named a subject anywhere. A fragment still beats an empty query.
+    return keyword || String(text || '').substring(0, 50);
 }
 
 // ============================================================
@@ -4622,6 +4729,141 @@ function _enforceVideoRatio(scenes, nicheId) {
         const newRatio = Math.round(((videoCount + flipped) / totalScenes) * 100);
         console.log(`   📊 Video ratio enforcement: flipped ${flipped} image→video (${Math.round(currentRatio * 100)}% → ${newRatio}% video) [target: ${Math.round(targetVideoRatio * 100)}%]`);
     }
+}
+
+// ============================================================
+// STILL-RUN DISTRIBUTION (anti-slideshow)
+// ============================================================
+
+/**
+ * scene-risk.js warns at 6 and FAILS the build at 10 consecutive base-track
+ * still images with no icon/motion-graphic activity (`still_run`). That run is
+ * created here — the planner decides mediaType scene by scene with no view of
+ * its neighbours, so a stretch of "exact still" beats can pile up 13 deep. This
+ * is the still-image twin of the "Never place cards back-to-back" prompt rule.
+ *
+ * Two things the planner CANNOT use as breakers, both verified against a real
+ * build rather than assumed:
+ *   - `_iconMoments`: icon-director treats any pre-set `_iconMoments` as "this
+ *     is a saved project, the lane already ran" and skips itself entirely, so
+ *     writing one here would cost every OTHER scene its icons.
+ *   - `fullscreenMG`: Step 6 rejects most fullscreen hints and the scene falls
+ *     back to a background image on the base track, so promoting a scene to a
+ *     card can leave the run exactly as long while inflating `card_heavy`.
+ * Footage is the one lever the planner owns end to end, and it is also what the
+ * detector's own message asks for ("break it up with footage").
+ */
+const MAX_CONSECUTIVE_STILLS = 4;
+
+// Keywords that name a still on purpose — flipping these to video would fetch
+// the wrong thing, not better footage.
+const _STILL_LOCKED_KEYWORD_RE = /\b(portrait|headshot|mugshot|\bface\b|photo|chart|graph|infographic|diagram|schematic|blueprint|screenshot|document|newspaper|nameplate|model plate|logo|poster)\b/i;
+
+/**
+ * Does this scene read as a still on the base track? Mirrors scene-risk's
+ * `isStill(s) && !isCard(s)`, translated to the fields that exist at plan time:
+ * a template card owns its frame, anything else without a video lane resolves
+ * to a background image.
+ */
+function _plannerSceneReadsAsStill(scene) {
+    if (!scene) return false;
+    if (scene.templateHint || scene.templateType || scene.isTemplate) return false;
+    return scene.mediaType !== 'video';
+}
+
+/**
+ * Can this scene carry real footage instead of a still, and how willingly?
+ * Lower tier = better break. Ordering is driven by the planner's OWN declared
+ * `mediaNeed` contract first: a scene that asked for `real-demo-video` and
+ * landed on an image already violates `_mediaNeedMatchesSource`, so flipping it
+ * is a repair rather than an override of an editorial choice.
+ */
+function _stillRunBreakCandidate(scene, scenes, scriptContext) {
+    if (!scene || !_plannerSceneReadsAsStill(scene)) return null;
+    if (scene.fullscreenMG) return null;
+    const keyword = scene.keyword && scene.keyword !== 'none' ? String(scene.keyword) : '';
+    if (!keyword) return null;
+    if (scene._personLock) return null; // exact person stills stay on web-image
+
+    const need = _sanitizeMediaNeed(scene.mediaNeed);
+    if (need === 'real-demo-video') return { tier: 1, reason: 'mediaNeed=real-demo-video was left on a still' };
+    if (need === 'data-graphic' || need === 'template-only') return null;
+
+    const signals = _deriveSceneSignals(scene, scenes, scriptContext);
+    if (signals.hasMapCandidate) return null;      // map lane owns this frame
+    if (signals.likelyDataImage) return null;      // a number/chart beat wants the graphic lane, not B-roll
+    if (_STILL_LOCKED_KEYWORD_RE.test(keyword)) return null;
+
+    if (need === 'generic-broll') return { tier: 2, reason: 'mediaNeed=generic-broll was left on a still' };
+    if (signals.likelyAction) return { tier: 3, reason: 'narration describes action that moves' };
+    if (signals.isAbstractMood) return { tier: 4, reason: 'mood/scenery beat plays better as moving B-roll' };
+    if (need !== 'exact-still') return { tier: 5, reason: 'no exact-still requirement on this beat' };
+    return { tier: 6, reason: 'generic query, nothing about it demands a frozen frame' };
+}
+
+/**
+ * Walk the timeline and make sure no more than MAX_CONSECUTIVE_STILLS stills
+ * play back-to-back. Niche-agnostic: every decision reads the scene's own
+ * planner fields (mediaNeed, keyword, person lock, derived signals).
+ * Returns one entry per scene it converted.
+ */
+function _breakStillRuns(scenes, scriptContext = {}, plannerDirectives = null) {
+    const ordered = (scenes || []).filter(Boolean);
+    if (ordered.length <= MAX_CONSECUTIVE_STILLS) return [];
+
+    const videoSource = _pickPreferredVideoSource(
+        scriptContext.nicheId || 'general',
+        plannerDirectives || { user: {} },
+        'youtube'
+    );
+    const breaks = [];
+    // `segmentStart` is the first still of the stretch currently on screen. Once
+    // that stretch would exceed the limit we must convert one of its last
+    // MAX_CONSECUTIVE_STILLS + 1 scenes; if none of them can carry footage the
+    // window slides forward one scene at a time and keeps trying, so an
+    // unbreakable clump (person portraits, data beats) shortens the run it is
+    // in instead of hiding the rest of it behind a reset counter.
+    let segmentStart = 0;
+
+    for (let i = 0; i < ordered.length; i++) {
+        if (!_plannerSceneReadsAsStill(ordered[i])) { segmentStart = i + 1; continue; }
+        if (i - segmentStart + 1 <= MAX_CONSECUTIVE_STILLS) continue;
+
+        let best = null;
+        for (let j = segmentStart; j <= i; j++) {
+            const candidate = _stillRunBreakCandidate(ordered[j], ordered, scriptContext);
+            if (!candidate) continue;
+            // Lowest tier wins; on a tie break as late as possible so one flip
+            // buys the most runway.
+            if (!best || candidate.tier < best.tier || (candidate.tier === best.tier && j > best.at)) {
+                best = { ...candidate, at: j, scene: ordered[j] };
+            }
+        }
+
+        if (!best) { segmentStart++; continue; }
+
+        const scene = best.scene;
+        const before = { mediaType: scene.mediaType || null, sourceHint: scene.sourceHint || null };
+        scene.mediaType = 'video';
+        scene.sourceHint = videoSource;
+        scene._stillRunBreak = true;
+        const queryBase = scene.searchKeyword || scene.keyword;
+        scene.stockQuery = _autoStockQuery(queryBase);
+        scene.webQuery = _autoWebQuery(queryBase, videoSource);
+        _rememberSourcePolicyFix(scene, before.sourceHint, videoSource, 'still-run breaker', before.mediaType, 'video');
+        breaks.push({
+            index: scene.index,
+            mode: 'video',
+            tier: best.tier,
+            reason: best.reason,
+            keyword: scene.keyword,
+            before,
+            after: { mediaType: 'video', sourceHint: videoSource },
+        });
+        segmentStart = best.at + 1;
+    }
+
+    return breaks;
 }
 
 // ============================================================
@@ -5979,7 +6221,7 @@ async function _planScenesIndividuallyForBatch(missingScenes, parentScenes, scri
             const fallbackHint = nicheId.startsWith('news') ? 'youtube' : 'stock';
             repaired.push({
                 ...scene,
-                keyword: extractFallbackKeyword(scene.text),
+                keyword: extractFallbackKeyword(scene.text, scene, scriptContext),
                 protectedTerms: [],
                 mediaNeed: 'generic-broll',
                 sourceReason: 'fallback scene uses generic video b-roll',
@@ -6175,8 +6417,38 @@ async function _planVisualsChunked(scenes, scriptContext, directorsBrief, chunkS
     const allEnriched = [];
     const usedKeywords = []; // Track keywords across chunks to prevent repeats
 
-    for (let c = 0; c < chunks.length; c++) {
+    // ── Chunks run in WAVES, not one-at-a-time ────────────────────────────────
+    //
+    // This was a plain serial `for` over ~35 chunks: 345 scenes / 10 per chunk, each an
+    // AI call of ~7s, so ~4 minutes of the build spent waiting on one request at a time.
+    // Measured 2026-08-31: planner-large was 124 calls / 14.1 min of the run.
+    //
+    // It was serial for a REASON, not by oversight: `usedKeywords` is threaded through
+    // every chunk so later scenes are told what earlier ones already used and footage
+    // does not repeat across the video. Fire them all off at once and that signal is
+    // gone.
+    //
+    // Waves keep the signal at coarser grain. Every chunk in a wave sees the keywords
+    // from ALL earlier waves; only its own wave-mates are invisible to it. With
+    // VP_PARALLEL_CHUNKS=4 that is ~9 waves instead of 35 serial calls — roughly 4x —
+    // while the de-dup window stays 40 scenes wide. The global outline
+    // (globalOutline.sceneHints) still covers cross-scene consistency on top.
+    //
+    // VP_PARALLEL_CHUNKS=1 restores the exact previous behaviour, byte for byte.
+    const WAVE = Math.max(1, parseInt(process.env.VP_PARALLEL_CHUNKS, 10) || 4);
+    if (WAVE > 1) {
+        console.log(`   ⚡ Planning ${chunks.length} batches ${WAVE} at a time (de-dup window = previous waves)`);
+    }
+
+    // The body below is unchanged from the serial version. It works in parallel because
+    // `allEnriched` and `usedKeywords` are SHADOWED per chunk: reads see the snapshot
+    // this wave started with, writes land in a local array, and the wave driver merges
+    // them afterwards in chunk order.
+    const runChunk = async (c, keywordSnapshot) => {
         const chunk = chunks[c];
+        const allEnriched = [];
+        const usedKeywords = keywordSnapshot.slice();
+        const keywordsBefore = usedKeywords.length;
         console.log(`   📦 Batch ${c + 1}/${chunks.length} (scenes ${chunk[0].index}-${chunk[chunk.length - 1].index})...`);
         if (globalOutline) {
             const hinted = chunk.filter(scene => globalOutline.sceneHints[scene.index]).length;
@@ -6265,7 +6537,7 @@ async function _planVisualsChunked(scenes, scriptContext, directorsBrief, chunkS
                     const fallbackHint = nicheId.startsWith('news') ? 'youtube' : 'stock';
                     allEnriched.push({
                         ...scene,
-                        keyword: extractFallbackKeyword(scene.text),
+                        keyword: extractFallbackKeyword(scene.text, scene, scriptContext),
                         protectedTerms: [],
                         mediaNeed: 'generic-broll',
                         sourceReason: 'fallback scene uses generic video b-roll',
@@ -6278,6 +6550,23 @@ async function _planVisualsChunked(scenes, scriptContext, directorsBrief, chunkS
                     console.log(`      Scene ${scene.index}: fallback keyword`);
                 }
             }
+        }
+        return { enriched: allEnriched, newKeywords: usedKeywords.slice(keywordsBefore) };
+    };
+
+    for (let w = 0; w < chunks.length; w += WAVE) {
+        const ids = [];
+        for (let c = w; c < Math.min(w + WAVE, chunks.length); c++) ids.push(c);
+        const snapshot = usedKeywords.slice();
+        const results = await Promise.all(ids.map(c => runChunk(c, snapshot).catch((e) => {
+            // runChunk already handles per-chunk failure internally; this only catches a
+            // throw from the wrapper itself, and must not take the other chunks down.
+            console.log(`   ⚠️ [VP] batch ${c + 1} wrapper failed: ${e.message}`);
+            return { enriched: [], newKeywords: [] };
+        })));
+        for (const r of results) {
+            allEnriched.push(...r.enriched);
+            for (const k of r.newKeywords) usedKeywords.push(k);
         }
     }
 
@@ -6320,7 +6609,7 @@ async function planVisualsPerScene(scenes, scriptContext, directorsBrief, global
             const fallbackHint = nicheId.startsWith('news') ? 'youtube' : 'stock';
             enrichedScenes.push({
                 ...scene,
-                keyword: extractFallbackKeyword(scene.text),
+                keyword: extractFallbackKeyword(scene.text, scene, scriptContext),
                 protectedTerms: [],
                 mediaNeed: 'generic-broll',
                 sourceReason: 'fallback scene uses generic video b-roll',
@@ -6409,4 +6698,6 @@ module.exports.__test = {
     _userExplicitlyWantsMaps,
     _enforceNicheMapChartBan,
     _enforceNicheTemplateBan,
+    breakStillRuns: _breakStillRuns,
+    MAX_CONSECUTIVE_STILLS,
 };

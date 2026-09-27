@@ -38,6 +38,7 @@
  */
 
 const fs = require('fs');
+const { withCostPurpose } = require('../brain/cost-tracker');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
@@ -439,11 +440,11 @@ async function _ask(ai, images, desc, single, minConf, limit, deadline = 0) {
             let raw = '';
             try {
                 out.asked++;
-                raw = await ai.callVisionAI(_presencePrompt(desc, single), images[i].toString('base64'), 'image/jpeg', {
+                raw = await withCostPurpose('storyboard', () => ai.callVisionAI(_presencePrompt(desc, single), images[i].toString('base64'), 'image/jpeg', {
                     maxTokens: 200,
                     maxSide: envInt('YOUTUBE_STORYBOARD_MAX_SIDE', 1600),
                     logVisionCompression: false,
-                });
+                }));
             } catch (_) { continue; }
             const j = _parsePresence(raw);
             if (j && j.present && j.confidence >= minConf) out[i] = j;

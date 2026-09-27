@@ -71,6 +71,38 @@ function applyOptionsToEnv(options = {}, { projectDir, baseEnv = process.env } =
     const isSmartAI = options.smartAI !== false && options.smartAI !== 'false';
     own.SMART_AI = isSmartAI ? 'true' : 'false';
 
+    // AI provider — the schema marks this env:null so it is not in the SETTINGS loop.
+    // But the text router reads process.env.AI_PROVIDER (for the one value that is not a
+    // decoy, 'azure-managed'), so it has to be passed explicitly.
+    //
+    // Set it UNCONDITIONALLY, including for 'bedrock'. Only keys present in `own` reach
+    // YTA_ENV_LOCK, and only locked keys survive the .env stack — so skipping the default
+    // makes 'bedrock' the one choice a stale file can overrule. That is not hypothetical:
+    // applyBrainProvider() writes AI_PROVIDER into the repo .env whenever the dropdown
+    // changes, so picking Azure Managed and then switching back to Bedrock would leave
+    // AI_PROVIDER=azure-managed on disk, unlocked, and the build would keep running on
+    // Azure while the UI said Bedrock. Stale-file-beats-live-UI is exactly the failure
+    // YTA_ENV_LOCK exists to stop (see the 2026-08-04 vision-backend incident).
+    own.AI_PROVIDER = options.aiProvider || 'bedrock';
+
+    // Azure Managed is a WHOLE-brain choice — one endpoint serving the reasoning model AND
+    // the footage judge — so picking it has to move the vision backend too.
+    //
+    // ui/js/app.js pairs the two dropdowns, but that only fires when a human changes a
+    // <select> in the Electron app. Builds launched headlessly never open the app, and a
+    // project whose settings predate the Vision Backend control has no visionBackend saved
+    // at all. Both cases land here with options.visionBackend undefined, VISION_BACKEND
+    // therefore unset and unlocked, and config.js falls through to whatever the repo .env
+    // still says. On 2026-08-29 that was `lightning`: a build ran its whole text surface on
+    // the Azure deployment while every frame was first offered to a Lightning pool whose
+    // accounts are exhausted, with the live judge demoted to a fallback slot.
+    //
+    // So derive it HERE, the one place both entry points pass through. An explicit choice
+    // always wins — this only fills a blank.
+    if (!options.visionBackend && own.AI_PROVIDER === 'azure-managed') {
+        own.VISION_BACKEND = 'azure-managed';
+    }
+
     const clipAnalyzerOn = options.clipAnalyzer !== false && options.clipAnalyzer !== 'false';
     own.CLIP_ANALYZER_ENABLED = clipAnalyzerOn ? 'true' : 'false';
 

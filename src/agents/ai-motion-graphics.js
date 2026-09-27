@@ -261,6 +261,35 @@ function _isDateOnlyStatText(value) {
     return false;
 }
 
+function _isYearRangeStatText(value) {
+    return /^\d{4}\s*[→\-–—to]+\s*\d{4}$/.test(String(value || '').trim());
+}
+
+function _hasNumericPayload(value) {
+    const s = String(value || '');
+    if (/\d/.test(s)) return true;
+    return /\b(?:no\.?|number|rank(?:ed)?|seed|place)\s+(?:one|two|three|four|five|six|seven|eight|nine|ten)\b/i.test(s);
+}
+
+// statCounter stays reserved for genuinely big numbers (100+ / % / scale words).
+// A hint that fails that bar is still a number, score or date the planner wanted on
+// screen — demote it to an overlay lowerThird instead of dropping the graphic.
+// Year ranges are excluded: multi-year spans belong to the timeline path.
+function _statHintDemotionTarget(hintContent, sceneText, allowedMGs) {
+    if (!Array.isArray(allowedMGs) || !allowedMGs.includes('lowerThird')) return null;
+    if (_isYearRangeStatText(hintContent)) return null;
+    if (!_hasNumericPayload(hintContent) && !_hasNumericPayload(sceneText)) return null;
+    return 'lowerThird';
+}
+
+// Mirrors the statCounter gate used by the VP direct-build path.
+function _statHintQualifiesAsStat(hintContent, sceneText) {
+    if (_isDateOnlyStatText(hintContent)) return false;
+    const hintStat = CONTENT_PATTERNS.statistic(String(hintContent || ''));
+    const sceneStat = CONTENT_PATTERNS.statistic(String(sceneText || ''));
+    return hintStat.score >= 3 || sceneStat.score >= 3;
+}
+
 function _typeCapReached(type, alreadyPlaced = placedTypes) {
     if (TYPE_CAPS[type] === undefined) return false;
     return alreadyPlaced.filter(t => t === type).length >= TYPE_CAPS[type];
@@ -738,6 +767,16 @@ function generateCandidates(scene, sceneIndex, totalScenes, allowedMGs, alreadyP
                     hintValid = false;
                     if (!typeReasons['_rejected']) typeReasons['_rejected'] = [];
                     typeReasons['_rejected'].push(`mgHint:statCounter rejected (year range, not a stat)`);
+                }
+            }
+            // Rejected ≠ no graphic: keep the number/score/date, demote the treatment.
+            if (!hintValid) {
+                const demoted = _statHintDemotionTarget(hint.content, text, allowedMGs);
+                if (demoted) {
+                    typeReasons['_rejected'].push(`mgHint:statCounter -> ${demoted} (number not statCounter-worthy)`);
+                    hint.type = demoted;
+                    hint.demotedFrom = 'statCounter';
+                    hintValid = true;
                 }
             }
         }
@@ -1226,9 +1265,14 @@ function buildMGFromHint(scene, sceneIndex, allowedMGs) {
     if (!allowedMGs.includes(hint.type)) return null;
     if (FULLSCREEN_MG_TYPES.has(hint.type)) return null; // fullscreens handled by VP fullscreen loop
 
-    const type = hint.type;
+    let type = hint.type;
     const raw = sanitizeMGText(hint.content);
     if (!raw) return null;
+
+    if (type === 'statCounter' && !_statHintQualifiesAsStat(raw, scene?.text)) {
+        type = _statHintDemotionTarget(raw, scene?.text, allowedMGs);
+        if (!type) return null;
+    }
 
     let displayText = '';
     let subtext = '';
@@ -1236,10 +1280,6 @@ function buildMGFromHint(scene, sceneIndex, allowedMGs) {
 
     switch (type) {
         case 'statCounter': {
-            if (_isDateOnlyStatText(raw)) return null;
-            const sceneStat = CONTENT_PATTERNS.statistic(scene?.text || '');
-            const hintStat = CONTENT_PATTERNS.statistic(raw);
-            if ((!hintStat || hintStat.score < 3) && (!sceneStat || sceneStat.score < 3)) return null;
             displayText = raw.split(/\s+/).slice(0, 6).join(' ');
             const numMatch = raw.match(/\d[\d,.]*/);
             triggerWord = numMatch ? numMatch[0].replace(/,/g, '') : raw.split(/\s+/)[0];
@@ -2589,4 +2629,5 @@ module.exports = {
     FULLSCREEN_MG_TYPES,
     generateCandidates,
     buildRuleMG,
+    buildMGFromHint,
 };

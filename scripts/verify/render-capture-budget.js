@@ -45,13 +45,21 @@ function check(label, condition, detail) {
 
 console.log('[verify] render capture stall budget');
 
-const main = fs.readFileSync(MAIN_PATH, 'utf8');
+// Read with LF endings no matter how git checked the file out. The extraction below
+// scans for a bare newline to find the end of the function, which never matches on a
+// CRLF working copy — so the gate reported "the budget function was removed or renamed"
+// about a function sitting right there in main.js, and the && chain in `npm run verify`
+// aborted before every check after it. A gate that cannot parse its subject is a gate
+// that is off. Found 2026-08-28.
+const main = fs.readFileSync(MAIN_PATH, 'utf8')
+    .split(String.fromCharCode(13)).join('');
 
 // --- the upstream contract the fix rides on ---------------------------------
 if (!fs.existsSync(CLI_PATH)) {
     console.log('  skip hyperframes not installed; cannot verify the CLI contract');
 } else {
-    const cli = fs.readFileSync(CLI_PATH, 'utf8');
+    const cli = fs.readFileSync(CLI_PATH, 'utf8')
+        .split(String.fromCharCode(13)).join('');  // same CRLF reason as above
 
     check(
         'the CLI still honours HF_DE_STALL_MS',

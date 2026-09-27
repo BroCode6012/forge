@@ -34,6 +34,14 @@ const os = require('os');
 const http = require('http');
 const path = require('path');
 
+// Pin the brain for this gate. `_getVisionChain()` inserts the azure-managed seat when
+// AI_PROVIDER=azure-managed, so on a machine actually configured that way this file was
+// asserting a chain shape the config never promised and failing for a reason that has
+// nothing to do with the code under test. It already pins VISION_BACKEND; a gate that
+// reads ambient config for the rest is testing the machine, not the software.
+// Found 2026-08-29.
+process.env.AI_PROVIDER = 'bedrock';
+
 const ROOT = path.resolve(__dirname, '..', '..');
 const SRC = path.join(ROOT, 'src', 'brain', 'ai-provider.js');
 
@@ -72,7 +80,11 @@ const TINY_JPEG_B64 =
 // ─────────────────────────────────────────────────────────────────────────────
 console.log('\n[gpu-bad-request] A. a 400 is classified as a request fault, not a quota fault');
 
-const src = fs.readFileSync(SRC, 'utf8');
+// Normalized to LF: the anchors below are bare newlines, which never match on a
+// CRLF working copy — the gate then reports its own subject as missing and the
+// `npm run verify` && chain aborts before every later check. Found 2026-08-28.
+const src = fs.readFileSync(SRC, 'utf8')
+    .split(String.fromCharCode(13)).join('');
 const quotaFn = src.slice(src.indexOf('function _isQuotaError'));
 const quotaBody = quotaFn.slice(0, quotaFn.indexOf('\n}\n') + 2);
 
@@ -204,15 +216,19 @@ server.listen(0, '127.0.0.1', async () => {
     const ai = require(SRC);
     const config = require(path.join(ROOT, 'src', 'settings', 'config.js'));
     if (config.qwen) { config.qwen.baseUrl = base; config.qwen.visionModel = 'qwen2.5-vl'; }
-    // Blank the Bedrock creds so the chain is qwen-only: no AWS call, no spend,
-    // and a qwen failure surfaces as a throw we can read.
+    // Blank every PAID fallback so the chain is qwen-only: no billed call, no spend,
+    // and a qwen failure surfaces as a throw we can read. Azure counts as well as
+    // Bedrock — it is a real vision seat, so leaving its creds in would let a 400
+    // fall through to a paid provider and this gate would measure the wrong thing.
     if (config.bedrock) { config.bedrock.accessKeyId = ''; config.bedrock.secretAccessKey = ''; }
+    if (config.azure) { config.azure.apiKey = ''; config.azure.baseUrl = ''; }
+    if (config.azureOpenAI) { config.azureOpenAI.apiKey = ''; config.azureOpenAI.baseUrl = ''; }
 
     console.log('\n[gpu-bad-request] C. behaviour against a one-key, one-model box');
 
     await checkAsync('the vision chain under test is the box alone (no paid fallback)', async () => {
         assert.deepStrictEqual(ai.getVisionProviderChain(), ['qwen'],
-            'this gate must exercise the box with no Bedrock behind it');
+            'this gate must exercise the box with no Bedrock/Azure behind it');
     });
 
     const score = () => ai.callVisionAI('score this frame', TINY_JPEG_B64, 'image/jpeg', { maxTokens: 40 });
@@ -316,7 +332,8 @@ server.listen(0, '127.0.0.1', async () => {
     // ─────────────────────────────────────────────────────────────────────────
     console.log('\n[gpu-bad-request] D. the box is configured to read what the app actually sends');
 
-    const serve = fs.readFileSync(path.join(ROOT, 'lightning', 'serve-vision.sh'), 'utf8');
+    const serve = fs.readFileSync(path.join(ROOT, 'lightning', 'serve-vision.sh'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
 
     check('the reading window is wide enough for a real scoring request', () => {
         const m = serve.match(/MAX_MODEL_LEN="\$\{MAX_MODEL_LEN:-(\d+)\}"/);
@@ -344,7 +361,8 @@ server.listen(0, '127.0.0.1', async () => {
 
     console.log('\n[gpu-bad-request] E. bytes no decoder can read are dropped, not paid for 3 times');
 
-    const aiv = fs.readFileSync(path.join(ROOT, 'src', 'vision', 'ai-vision.js'), 'utf8');
+    const aiv = fs.readFileSync(path.join(ROOT, 'src', 'vision', 'ai-vision.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
 
     check('an undecodable frame gets an ffmpeg rescue before being given up on', () => {
         assert.ok(src.includes('_ffmpegDecodeToJpeg'), 'the ffmpeg rescue is gone');
@@ -431,7 +449,8 @@ server.listen(0, '127.0.0.1', async () => {
             ['src', 'media', 'footage-manager.js'],
             ['src', 'vision', 'thumbnail-vision.js'],
         ]) {
-            const txt = fs.readFileSync(path.join(ROOT, ...rel), 'utf8');
+            const txt = fs.readFileSync(path.join(ROOT, ...rel), 'utf8')
+                .split(String.fromCharCode(13)).join('');
             assert.ok(/isCanvasSafeImage/.test(txt),
                 `${rel.join('/')} decodes arbitrary bytes with no pre-flight sniff — a TIFF there kills the build silently`);
         }

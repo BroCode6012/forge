@@ -104,6 +104,13 @@ function cutoutLooksUsable(pngPath) {
     let createCanvas, loadImageSync;
     try { ({ createCanvas, Image: loadImageSync } = require('@napi-rs/canvas')); } catch (_) { return true; } // fail open
     try {
+        // Sniff the bytes BEFORE handing them to the native decoder. @napi-rs/canvas
+        // segfaults the whole process on some malformed/exotic images (0xC0000005
+        // ACCESS_VIOLATION — no exception, no catch, the build just dies). The other
+        // canvas call sites already guard this way; this one did not. A crash here takes
+        // out an entire build, so failing open on an unreadable icon is the cheap side.
+        const { isCanvasSafeImage } = require('../../util/image-bytes');
+        if (!isCanvasSafeImage(pngPath)) return true;   // fail open, same as a missing module
         const img = new loadImageSync();
         img.src = fs.readFileSync(pngPath);
         const w = Math.max(1, img.width), h = Math.max(1, img.height);

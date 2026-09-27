@@ -15,6 +15,8 @@ const PROBES = {
     'qa-crop': 'runtime-qa-crop-probe.js',
     ui: 'runtime-ui-probe.js',
     clipboard: 'runtime-clipboard-probe.js',
+    remote: 'runtime-remote-probe.js',
+    'ai-connections': 'runtime-ai-connections-probe.js',
 };
 const probeName = process.argv[2];
 if (!PROBES[probeName]) {
@@ -332,6 +334,18 @@ function runProbe(scriptPath, endpoint, env, timeoutMs = 240_000) {
             writeSilentWav(path.join(fixtureRoot, 'input', plan.audio), plan.totalDuration);
         }
     }
+    // Agent remote control drives the app from outside, so it needs something to
+    // import (narration that is NOT already in the project) and something to
+    // download (a rendered file in output/), plus a decoy outside output/ that
+    // must stay unreachable.
+    let probeNarration = '';
+    if (probeName === 'remote') {
+        probeNarration = path.join(fixtureRoot, 'agent-source', 'agent-narration.wav');
+        writeSilentWav(probeNarration, 2);
+        fs.mkdirSync(path.join(fixtureRoot, 'output'), { recursive: true });
+        fs.writeFileSync(path.join(fixtureRoot, 'output', 'probe-render.mp4'), 'probe-mp4-bytes');
+        fs.writeFileSync(path.join(fixtureRoot, 'secret.mp4'), 'must-stay-private');
+    }
     writeJson(path.join(fixtureRoot, 'public', 'video-plan.json'), plan);
     writeJson(path.join(fixtureRoot, 'temp', 'video-plan.json'), plan);
     writeJson(path.join(fixtureRoot, `${path.basename(fixtureRoot)}.fvp`), {
@@ -351,6 +365,9 @@ function runProbe(scriptPath, endpoint, env, timeoutMs = 240_000) {
         YTA_RUNTIME_PROJECT_DIR: fixtureRoot,
         EXPORT_V2: '0',
         ...(agentTestMediaSource ? { YTA_AGENT_TEST_MEDIA_SOURCE: agentTestMediaSource } : {}),
+        ...(probeName === 'remote'
+            ? { FORGE_AGENT_SERVER: '1', FORGE_AGENT_PORT: String(await getFreePort()), YTA_PROBE_NARRATION: probeNarration }
+            : {}),
     };
     delete baseEnv.ELECTRON_RUN_AS_NODE;
 

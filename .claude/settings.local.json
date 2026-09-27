@@ -43,13 +43,13 @@
       "Bash(node scripts/storyblocks-subscribed-recon.js)",
       "Bash(node scripts/storyblocks-login-probe.js)",
       "Bash(node scripts/storyblocks-login-dump.js)",
-      "Bash(node -c \"d:/Youtube/YTA EMPIRE WEBGL/src/providers/storyblocks-video.js\")",
+      "Bash(node -c \"d:/Youtube/Forge/src/providers/storyblocks-video.js\")",
       "Bash(node --check src/build-video.js)",
       "Bash(node -c src/niches.js)",
       "Bash(node -c src/relevant-person-rules.js)",
       "Bash(node -c src/clip-analyzer.js)",
-      "Bash(node -c \"d:/Youtube/YTA EMPIRE WEBGL/src/map-assignment.js\")",
-      "Bash(node -c \"d:/Youtube/YTA EMPIRE WEBGL/src/niches.js\")",
+      "Bash(node -c \"d:/Youtube/Forge/src/map-assignment.js\")",
+      "Bash(node -c \"d:/Youtube/Forge/src/niches.js\")",
       "Bash(node -c src/topic-footage-scout.js)",
       "Bash(node -c src/providers/storyblocks-video.js)",
       "Bash(awk 'NR>0')",
@@ -61,10 +61,10 @@
       "Bash(node --check src/scout-lab.js)",
       "Bash(node -c src/ai-vision.js)",
       "Bash(node -c ui/js/scout-lab.js)",
-      "Bash(awk 'NR==1013' \"d:/Youtube/YTA EMPIRE WEBGL/src/ai-provider.js\")",
-      "Bash(awk 'NR==1014' \"d:/Youtube/YTA EMPIRE WEBGL/src/ai-provider.js\")",
-      "Bash(node --check \"d:/Youtube/YTA EMPIRE WEBGL/src/ai-provider.js\")",
-      "Bash(node --check \"d:/Youtube/YTA EMPIRE WEBGL/main.js\")"
+      "Bash(awk 'NR==1013' \"d:/Youtube/Forge/src/ai-provider.js\")",
+      "Bash(awk 'NR==1014' \"d:/Youtube/Forge/src/ai-provider.js\")",
+      "Bash(node --check \"d:/Youtube/Forge/src/ai-provider.js\")",
+      "Bash(node --check \"d:/Youtube/Forge/main.js\")"
     ]
   }
 }

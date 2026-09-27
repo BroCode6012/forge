@@ -21,6 +21,11 @@
  * delivers; a news build teaches it that stock delivers. Same code, different
  * conclusion, learned from data rather than declared in a table.
  *
+ * ONE THING IT DELIBERATELY DOES NOT COUNT: a race the clock ended before any
+ * judge scored anything. That is evidence about our own patience budget, not
+ * about the provider's footage, and counting it as a loss created a spiral the
+ * provider could never climb out of (see `recordNoContest`).
+ *
  * State is module-level, which means per build child-process — exactly the
  * lifetime we want. Nothing persists across builds on purpose: a scoreboard
  * learned on a nature documentary must not silently steer a crime video.
@@ -30,7 +35,7 @@
 
 /**
  * key = `${mediaType}:${providerKey}`
- * @type {Map<string, {opens:number, wins:number, losses:number, reasons:Map<string,number>}>}
+ * @type {Map<string, {opens:number, wins:number, losses:number, noContests:number, reasons:Map<string,number>}>}
  */
 const _stats = new Map();
 
@@ -42,7 +47,7 @@ function _slot(mediaType, providerKey) {
     const k = _key(mediaType, providerKey);
     let slot = _stats.get(k);
     if (!slot) {
-        slot = { opens: 0, wins: 0, losses: 0, reasons: new Map() };
+        slot = { opens: 0, wins: 0, losses: 0, noContests: 0, reasons: new Map() };
         _stats.set(k, slot);
     }
     return slot;
@@ -70,23 +75,64 @@ function recordLoss(mediaType, providerKey, reason) {
 }
 
 /**
+ * This provider was opened, but the scene never got to see what it found —
+ * every candidate was still downloading when its own clock ran out, so no
+ * judge ever scored anything. That is a fact about our budget, not about the
+ * provider's footage, and it must not be filed as a quality loss.
+ *
+ * THE AUG-5 DEATH SPIRAL. Before this existed, a timed-out pull was recorded
+ * with `recordLoss`. The record fell, the record multiplier in
+ * download-patience shrank the NEXT budget for the same provider, the shorter
+ * budget aborted sooner, and the record fell further. Self-reinforcing, with
+ * no way back up: on that build YouTube won 0 of 47 scenes in a topic whose
+ * own ranking put YouTube first, and its win rate slid 0.17 → 0.14 while it
+ * was never once allowed to finish a download.
+ *
+ * A no-contest is remembered (so the summary can show it, and so a provider
+ * that is systematically too slow for this machine is still visible) but it is
+ * excluded from the win rate and from the evidence count. A provider is judged
+ * only on races it was actually allowed to run.
+ */
+function recordNoContest(mediaType, providerKey, reason) {
+    if (!providerKey) return;
+    const slot = _slot(mediaType, providerKey);
+    slot.noContests += 1;
+    const r = `no contest: ${String(reason || 'ran out of time before any verdict')}`.slice(0, 60);
+    slot.reasons.set(r, (slot.reasons.get(r) || 0) + 1);
+}
+
+/**
+ * Openings that actually produced a contest — a real verdict, win or lose.
+ * Races the clock ended before any judge spoke are excluded: see
+ * `recordNoContest`.
+ */
+function _contestedOpens(slot) {
+    if (!slot) return 0;
+    return Math.max(0, (slot.opens || 0) - (slot.noContests || 0));
+}
+
+/**
  * Laplace-smoothed win rate. Smoothing matters: without it a provider that won
  * its only opening looks perfect (1.0) and a provider that lost its only
  * opening looks hopeless (0.0), and we would reorder the whole build off one
  * coin flip. With +1/+2 smoothing an unproven provider sits at 0.5 (neutral)
  * and only sustained evidence moves it.
  *
+ * Denominator is contested openings only, so a provider we never gave time to
+ * finish reads as unproven (0.5) rather than as bad.
+ *
  * @returns {number} 0..1
  */
 function winRate(mediaType, providerKey) {
     const slot = _stats.get(_key(mediaType, providerKey));
-    if (!slot || slot.opens <= 0) return 0.5;
-    return (slot.wins + 1) / (slot.opens + 2);
+    const contested = _contestedOpens(slot);
+    if (contested <= 0) return 0.5;
+    return (slot.wins + 1) / (contested + 2);
 }
 
-/** How much evidence do we have on this provider? */
+/** How much evidence do we have on this provider? Contested openings only. */
 function opens(mediaType, providerKey) {
-    return _stats.get(_key(mediaType, providerKey))?.opens || 0;
+    return _contestedOpens(_stats.get(_key(mediaType, providerKey)));
 }
 
 /**
@@ -182,13 +228,19 @@ function summary() {
     const rows = [];
     for (const [k, slot] of _stats.entries()) {
         const [mediaType, provider] = k.split(':');
+        const contested = _contestedOpens(slot);
         rows.push({
             mediaType,
             provider,
             opens: slot.opens,
             wins: slot.wins,
             losses: slot.losses,
-            winRate: slot.opens > 0 ? Number((slot.wins / slot.opens).toFixed(2)) : null,
+            // Openings that never reached a judge because the clock ended the
+            // race. Shown separately so a slow provider stays visible without
+            // being scored as a bad one.
+            noContests: slot.noContests || 0,
+            contestedOpens: contested,
+            winRate: contested > 0 ? Number((slot.wins / contested).toFixed(2)) : null,
             topReason: [...slot.reasons.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null,
         });
     }
@@ -201,10 +253,90 @@ function reset() {
     _stats.clear();
 }
 
+// ── LANE evidence ───────────────────────────────────────────────────────────
+//
+// Everything above scores a PROVIDER. This scores the LANE the scene was sent
+// to — stock vs youtube vs web-image — which is a different and earlier
+// decision, made once per scene by the Visual Planner before any evidence for
+// this video exists.
+//
+// That "before any evidence exists" is the whole problem. Measured 2026-09-02:
+// the planner sent 210 of 366 scenes to youtube, which found footage on 42% of
+// them, while web-image found footage on 84%. The build discovered this within
+// its first dozen scenes and then made the same call 200 more times, because
+// nothing carried the finding forward. 121 scenes ended up reusing another
+// scene's clip.
+//
+// Same philosophy as the provider half, for the same reasons: evidence only, a
+// real threshold before acting, a gap big enough not to chase noise, and it can
+// only ever suggest — it never bans a lane and never invents an order. The
+// planner reasons about what the scene MEANS and keeps that authority; this
+// only reports what has actually been working on THIS video.
+//
+// Lanes see far more traffic than any single provider, so the bar to act is
+// higher than MIN_EVIDENCE_OPENS: a lane needs a real sample before one bad
+// stretch is allowed to redirect the rest of the build.
+const MIN_LANE_OPENS = 8;
+const MIN_LANE_RATE_GAP = 0.15;
+
+const _laneKey = (lane) => `lane:${String(lane || '').toLowerCase()}`;
+
+/** A scene finished in this lane. `won` = it found its own footage. */
+function recordLaneOutcome(mediaType, lane, won) {
+    if (!lane) return;
+    const slot = _slot(mediaType, _laneKey(lane));
+    slot.opens += 1;
+    if (won) slot.wins += 1; else slot.losses += 1;
+}
+
+function laneWinRate(mediaType, lane) { return winRate(mediaType, _laneKey(lane)); }
+function laneOpens(mediaType, lane) { return opens(mediaType, _laneKey(lane)); }
+
+/**
+ * Is another lane doing clearly better than this one on THIS video?
+ *
+ * Returns null unless BOTH lanes have a real sample and the gap is wide enough
+ * to be a pattern rather than a run of luck. Null means "no opinion" — the
+ * caller keeps the planner's choice, which is the default and the safe answer.
+ *
+ * @returns {{lane:string, from:number, to:number, opens:number}|null}
+ */
+function betterLane(mediaType, currentLane, candidateLanes) {
+    if (!currentLane) return null;
+    const here = laneWinRate(mediaType, currentLane);
+    if (laneOpens(mediaType, currentLane) < MIN_LANE_OPENS) return null;
+
+    let best = null;
+    for (const lane of candidateLanes || []) {
+        if (!lane || lane === currentLane) continue;
+        if (laneOpens(mediaType, lane) < MIN_LANE_OPENS) continue;
+        const rate = laneWinRate(mediaType, lane);
+        if (rate - here < MIN_LANE_RATE_GAP) continue;
+        if (!best || rate > best.to) {
+            best = { lane, from: here, to: rate, opens: laneOpens(mediaType, lane) };
+        }
+    }
+    return best;
+}
+
+/** Lane records, for logging. */
+function laneSummary(mediaType) {
+    const out = [];
+    for (const [k, slot] of _stats.entries()) {
+        const [mt, provider] = [k.slice(0, k.indexOf(':')), k.slice(k.indexOf(':') + 1)];
+        if (mt !== String(mediaType || 'video') || !provider.startsWith('lane:')) continue;
+        const contested = _contestedOpens(slot);
+        if (contested <= 0) continue;
+        out.push({ lane: provider.slice(5), opens: contested, winRate: winRate(mt, provider) });
+    }
+    return out.sort((a, b) => b.winRate - a.winRate);
+}
+
 module.exports = {
     recordOpen,
     recordWin,
     recordLoss,
+    recordNoContest,
     winRate,
     opens,
     adjustOrder,
@@ -212,4 +344,10 @@ module.exports = {
     reset,
     MIN_EVIDENCE_OPENS,
     MAX_SHIFT,
+    recordLaneOutcome,
+    laneWinRate,
+    laneOpens,
+    betterLane,
+    laneSummary,
+    MIN_LANE_OPENS,
 };

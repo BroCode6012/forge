@@ -18,6 +18,11 @@ const path = require('path');
 const WebSocket = require('ws');
 const config = require('../settings/config');
 const { recordUsage } = require('./cost-tracker');
+// AI Connections — data-driven "where does each job's AI live" (see connections.js).
+// Consulted first by the text router and the vision chain; a job left on
+// "built-in" routes exactly as it did before connections existed.
+const aiConnections = require('./connections');
+const connectionTransport = require('./connection-transport');
 // nvidia-client require REMOVED in 2026-05-25 cleanup.
 
 const _qwenEnvPath = process.env.YTA_USER_ENV_PATH || path.join(__dirname, '..', '..', '.env');
@@ -1194,9 +1199,14 @@ const _TEXT_TASK_ALIASES = {
     keyword: 'utility',
     search: 'utility',
 };
+// `planner-source-audit` (ai-visual-planner.js) is a reasoning task, but until it
+// was listed here it fell through to the 'general' profile — which made it
+// unaddressable by a task gate, so it could not be routed to the thinking brain
+// separately from the cheap default tier. It is in _DIRECTIVE_TASKS below for the
+// same reason 'general' is, so promoting it does not change what the prompt carries.
 const _TEXT_TASK_PROFILES = new Set([
     'brain', 'classifier', 'planner-outline', 'planner-large', 'planner-small',
-    'utility', 'template', 'motion-graphics', 'review', 'general',
+    'planner-source-audit', 'utility', 'template', 'motion-graphics', 'review', 'general',
 ]);
 
 function _normalizeTextTaskType(taskType, { promptLength = 0, maxTokens = 800 } = {}) {
@@ -1217,7 +1227,7 @@ function _normalizeTextTaskType(taskType, { promptLength = 0, maxTokens = 800 } 
 // zero behaviour change. Disable entirely with AI_INSTRUCTIONS_GLOBAL=0.
 const _DIRECTIVE_TASKS = new Set([
     'brain', 'planner-outline', 'planner-large', 'planner-small',
-    'template', 'motion-graphics', 'review', 'general',
+    'planner-source-audit', 'template', 'motion-graphics', 'review', 'general',
 ]);
 function _productionDirectives(normalizedTask) {
     if (/^(0|false|off|no)$/i.test(String(process.env.AI_INSTRUCTIONS_GLOBAL || '').trim())) return '';
@@ -1241,6 +1251,7 @@ function _textRouteGlobalKey(entry) {
 
 function _textRouteLabel(entry) {
     if (typeof entry === 'string') return entry;
+    if (entry.label) return entry.label;
     return entry.model ? `${entry.provider}:${entry.model}` : entry.provider;
 }
 
@@ -1248,36 +1259,54 @@ function _csvList(value) {
     return String(value || '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
+// A task gate of `all` (or `*`) means the WHOLE text surface, not the Sonnet tier.
+// An explicit CSV list silently misses any profile added to _TEXT_TASK_PROFILES later,
+// which strands that task on the fallback provider. Empty still means "off" — the brain
+// dropdown clears the gate of the brains it did not select, so empty must not mean all.
+function _csvTaskGate(value) {
+    const list = _csvList(value);
+    if (list.some(t => t.toLowerCase() === 'all' || t === '*')) return [..._TEXT_TASK_PROFILES];
+    return list;
+}
+
 function _liveAilinkTaskTypes() {
     const al = config.ailink || {};
     if (process.env.AILINK_TASK_TYPES !== undefined) {
-        return _csvList(process.env.AILINK_TASK_TYPES);
+        return _csvTaskGate(process.env.AILINK_TASK_TYPES);
     }
-    return Array.isArray(al.allowedTasks) ? al.allowedTasks.map(t => String(t || '').trim()).filter(Boolean) : [];
+    return _csvTaskGate((Array.isArray(al.allowedTasks) ? al.allowedTasks : []).join(','));
 }
 
 function _liveAplinkTaskTypes() {
     const ap = config.aplink || {};
     if (process.env.APLINK_TASK_TYPES !== undefined) {
-        return _csvList(process.env.APLINK_TASK_TYPES);
+        return _csvTaskGate(process.env.APLINK_TASK_TYPES);
     }
-    return Array.isArray(ap.allowedTasks) ? ap.allowedTasks.map(t => String(t || '').trim()).filter(Boolean) : [];
+    return _csvTaskGate((Array.isArray(ap.allowedTasks) ? ap.allowedTasks : []).join(','));
 }
 
 function _liveAzureTaskTypes() {
     const az = config.azure || {};
     if (process.env.AZURE_TASK_TYPES !== undefined) {
-        return _csvList(process.env.AZURE_TASK_TYPES);
+        return _csvTaskGate(process.env.AZURE_TASK_TYPES);
     }
-    return Array.isArray(az.allowedTasks) ? az.allowedTasks.map(t => String(t || '').trim()).filter(Boolean) : [];
+    return _csvTaskGate((Array.isArray(az.allowedTasks) ? az.allowedTasks : []).join(','));
 }
 
 function _liveAzureOpenAITaskTypes() {
     const az = config.azureOpenAI || {};
     if (process.env.AZURE_OPENAI_TASK_TYPES !== undefined) {
-        return _csvList(process.env.AZURE_OPENAI_TASK_TYPES);
+        return _csvTaskGate(process.env.AZURE_OPENAI_TASK_TYPES);
     }
-    return Array.isArray(az.allowedTasks) ? az.allowedTasks.map(t => String(t || '').trim()).filter(Boolean) : [];
+    return _csvTaskGate((Array.isArray(az.allowedTasks) ? az.allowedTasks : []).join(','));
+}
+
+function _liveAzureManagedTaskTypes() {
+    const am = config.azureManaged || {};
+    if (process.env.AZURE_MANAGED_BRAIN_TASK_TYPES !== undefined) {
+        return _csvTaskGate(process.env.AZURE_MANAGED_BRAIN_TASK_TYPES);
+    }
+    return am.brainTaskTypes || [];
 }
 
 function _textTaskTier(task) {
@@ -1290,6 +1319,7 @@ function _textTaskTier(task) {
 function _textRouteMode(task, route, { providerOverride = false } = {}) {
     if (providerOverride) return 'forced-provider';
     const first = route?.[0] || {};
+    if (first.connectionId) return 'ai-connection';
     if (first.provider === 'ailink') return 'hybrid-ailink-primary';
     if (first.provider === 'aplink') return 'hybrid-aplink-primary';
     if (first.provider === 'azure-claude') return 'hybrid-azure-primary';
@@ -1325,6 +1355,48 @@ const TEXT_ROUTE_FAIL_THRESHOLD = Math.max(1, Math.min(5, parseInt(process.env.T
 // Floor for 'brain' (CEO/editor) max_tokens — those decisions were truncating (stop=length)
 // when a caller passed a low cap, cutting a decision off mid-thought. BRAIN_MIN_MAX_TOKENS=0 disables.
 const BRAIN_MIN_MAX_TOKENS = Math.max(0, parseInt(process.env.BRAIN_MIN_MAX_TOKENS || '5000', 10) || 5000);
+
+// The same truncation, one tier down. A GPT-5.x primary is a REASONING model: it spends
+// completion budget thinking before it emits one visible character, so the 200–800 cap
+// that suits a non-reasoning model is swallowed whole and the call returns "" with
+// finish=length. Measured on the 2026-08-15 build: 99 empty text responses, all on the
+// small tasks below, and each one also burns a fallback attempt on the dead Bedrock route.
+// This is the text twin of _visionCompletionBudget — a modest floor (these outputs are
+// short; the model only needs room to reason THEN write), applied ONLY when the primary is
+// a reasoning model, so every other model keeps its current cap byte-for-byte. 'brain' and
+// the planner-* tasks are excluded: they have their own, much larger floor above.
+// TEXT_MIN_MAX_TOKENS overrides; TEXT_MIN_MAX_TOKENS=0 disables.
+const TEXT_REASONING_MIN_TOKENS = 1200;
+const _TEXT_REASONING_FLOOR_TASKS = new Set(['utility', 'general', 'classifier', 'motion-graphics', 'template']);
+
+// The planner tier had NO floor at all. The note above used to say these tasks were
+// excluded because they "have their own, much larger floor" — but that floor
+// (BRAIN_MIN_MAX_TOKENS) only ever applied to task === 'brain'. Measured 2026-08-27:
+// planner-outline arrived with 8000 tokens against a 37k-char prompt and planner-large
+// with 3600 against 74k, and the reasoning primary spent every one of them thinking,
+// returning "" at finish=length. These outputs are big structured plans, so the floor
+// has to be big too. TEXT_PLANNER_MIN_MAX_TOKENS overrides; 0 disables.
+const TEXT_REASONING_PLANNER_MIN_TOKENS = 8000;
+const _TEXT_PLANNER_FLOOR_TASKS = new Set([
+    'planner-outline', 'planner-large', 'planner-small', 'planner-source-audit', 'review',
+]);
+
+function _textCompletionBudget(entry, task, maxTokens) {
+    const asked = Number(maxTokens) || 800;
+    const isPlanner = _TEXT_PLANNER_FLOOR_TASKS.has(task);
+    if (!isPlanner && !_TEXT_REASONING_FLOOR_TASKS.has(task)) return asked;
+    if (!_isReasoningModel(entry?.model) && entry?.reasoning !== true) return asked;
+    if (isPlanner) {
+        const rawP = process.env.TEXT_PLANNER_MIN_MAX_TOKENS;
+        const floorP = rawP === undefined || rawP === ''
+            ? TEXT_REASONING_PLANNER_MIN_TOKENS
+            : Math.max(0, parseInt(rawP, 10) || 0);
+        return Math.max(asked, floorP);
+    }
+    const raw = process.env.TEXT_MIN_MAX_TOKENS;
+    const floor = raw === undefined || raw === '' ? TEXT_REASONING_MIN_TOKENS : Math.max(0, parseInt(raw, 10) || 0);
+    return Math.max(asked, floor);
+}
 
 function _clearTextRouteFailures(entry, taskType) {
     _textRouteFailCounts.delete(_textRouteKey(entry, taskType));
@@ -1388,6 +1460,7 @@ function _hasProviderKey(provider) {
         case 'aplink': return !!config.aplink?.apiKey;
         case 'azure-claude': return !!(config.azure?.apiKey && config.azure?.baseUrl && config.azure?.model);
         case 'azure-openai': return !!(config.azureOpenAI?.apiKey && config.azureOpenAI?.baseUrl && config.azureOpenAI?.model);
+        case 'azure-managed': return !!(config.azureManaged?.apiKey && config.azureManaged?.baseUrl);
         case 'bedrock-nova':
         case 'bedrock-qwen-vl':
         case 'bedrock-claude':
@@ -1825,7 +1898,15 @@ function _recordQwenOmniTransient(reason) {
 // AWS box needs no cap). QWEN_VISION_MAX_CONCURRENCY is auto-set to a safe value for Lightning.
 let _visionInFlight = 0;
 const _visionWaiters = [];
-function _visionConfiguredConcurrency() { return parseInt(process.env.QWEN_VISION_MAX_CONCURRENCY || '0', 10) || 0; }
+// QWEN_VISION_MAX_CONCURRENCY named the limiter after the only lane that used it.
+// The cap itself is provider-neutral — it counts in-flight vision calls, and every
+// backend with ONE deployment behind it has the same problem the Qwen box had.
+// VISION_MAX_CONCURRENCY is the backend-agnostic spelling; the Qwen name still wins
+// when set, so the Lightning auto-config in config.js keeps working byte-for-byte.
+function _visionConfiguredConcurrency() {
+    const raw = process.env.QWEN_VISION_MAX_CONCURRENCY || process.env.VISION_MAX_CONCURRENCY || '0';
+    return parseInt(raw, 10) || 0;
+}
 
 // The configured cap is the box's ADVERTISED capacity (vLLM's MAX_NUM_SEQS),
 // not what it sustains for this build's prompt sizes on this GPU on this run.
@@ -2436,7 +2517,59 @@ async function _rescueVisionFrame(raw, maxSide, mimeType, reason) {
     };
 }
 
+// ── Native decode gate ────────────────────────────────────────────────────────
+//
+// Scene concurrency and NATIVE IMAGE concurrency are not the same number, and conflating
+// them is what broke the 2026-08-31 run: at MEDIA_SCENE_CONCURRENCY=32 the build had up
+// to ~160 vision calls in flight, each doing a full-size skia decode, a canvas
+// allocation and a JPEG encode. It died after 20 minutes with 0xC0000005
+// ACCESS_VIOLATION — a native crash, no exception, nothing to catch, whole build lost.
+//
+// The exact faulting call was never isolated. Tested and ruled out individually:
+// canvas at 256 concurrent, canvas under 6GB of memory pressure, 128 concurrent ffmpeg
+// spawns, the specific image it died on, and every image in temp. None reproduce it
+// alone, which points at an interaction under full load.
+//
+// So bound the surface instead of chasing the line. Scene concurrency stays high — that
+// is where the speed comes from, and it parallelises downloads, searches and agent calls
+// too — while the native decode stays at a level that has never crashed. Everything past
+// the gate queues rather than piling into skia at once.
+//
+// VISION_DECODE_CONCURRENCY tunes it; 0 disables the gate entirely.
+const _DECODE_LIMIT = (() => {
+    const raw = process.env.VISION_DECODE_CONCURRENCY;
+    if (raw !== undefined && String(raw).trim() === '0') return 0;
+    return Math.max(1, parseInt(raw, 10) || 8);
+})();
+let _decodeActive = 0;
+const _decodeQueue = [];
+function _acquireDecode() {
+    if (_DECODE_LIMIT === 0) return Promise.resolve(() => {});
+    return new Promise((resolve) => {
+        const grant = () => {
+            _decodeActive++;
+            resolve(() => {
+                _decodeActive--;
+                const next = _decodeQueue.shift();
+                if (next) next();
+            });
+        };
+        if (_decodeActive < _DECODE_LIMIT) grant();
+        else _decodeQueue.push(grant);
+    });
+}
+
 async function _normalizeVisionImage(base64Image, mimeType = 'image/jpeg', options = {}) {
+    // Serialise the native work behind the gate; release on every exit path.
+    const release = await _acquireDecode();
+    try {
+        return await _normalizeVisionImageInner(base64Image, mimeType, options);
+    } finally {
+        release();
+    }
+}
+
+async function _normalizeVisionImageInner(base64Image, mimeType = 'image/jpeg', options = {}) {
     const raw = _base64Bytes(base64Image);
     if (!raw.length) return { base64: '', mimeType: mimeType || 'image/jpeg', bytes: 0, changed: false };
 
@@ -2823,7 +2956,12 @@ function _azureLargePromptAplinkEntry(task, { promptLength = 0, maxTokens = 800 
     const disabled = /^(0|false|off|no)$/i.test(String(process.env.AZURE_LARGE_PROMPT_APLINK || 'on').trim());
     if (disabled) return null;
 
-    const taskList = _csvList(process.env.AZURE_LARGE_PROMPT_APLINK_TASKS || 'planner-large');
+    // `!== undefined`, not `||`: an explicitly emptied list means "no task-name trigger,
+    // size thresholds only". With `||` an empty value fell back to the default and the
+    // detour could not be narrowed at all without disabling it outright.
+    const taskList = _csvList(process.env.AZURE_LARGE_PROMPT_APLINK_TASKS !== undefined
+        ? process.env.AZURE_LARGE_PROMPT_APLINK_TASKS
+        : 'planner-large');
     const minChars = Math.max(0, parseInt(process.env.AZURE_LARGE_PROMPT_APLINK_MIN_CHARS || '20000', 10) || 0);
     const minMaxTokens = Math.max(0, parseInt(process.env.AZURE_LARGE_PROMPT_APLINK_MIN_MAX_TOKENS || '4800', 10) || 0);
     const isLarge = taskList.includes(task)
@@ -2835,10 +2973,66 @@ function _azureLargePromptAplinkEntry(task, { promptLength = 0, maxTokens = 800 
 
 // _nvidiaRouteEntriesForTask REMOVED in 2026-05-25 cleanup.
 
-function _getTextRoute(primary, { taskType, promptLength = 0, maxTokens = 800, providerOverride = false } = {}) {
+let _amUnconfiguredWarned = false;
+function _warnAzureManagedUnconfigured() {
+    if (_amUnconfiguredWarned) return;
+    _amUnconfiguredWarned = true;
+    const am = config.azureManaged || {};
+    const missing = [!am.apiKey && 'AZURE_MANAGED_API_KEY', !am.baseUrl && 'AZURE_MANAGED_ENDPOINT']
+        .filter(Boolean).join(' + ');
+    console.warn(`  [Text Router] AI_PROVIDER=azure-managed but it is NOT configured (missing ${missing}) — falling back to the Bedrock/hybrid routes.`);
+}
+
+// The text router's front door. A job pointed at an AI Connection is served by
+// that connection (then its backup, then — only if asked for — the built-in
+// setup). Everything else, and every forced-provider call, takes the built-in
+// route below byte-for-byte as before.
+function _getTextRoute(primary, opts = {}) {
+    const builtIn = _getBuiltInTextRoute(primary, opts);
+    if (opts.providerOverride) return builtIn;
+    const assigned = aiConnections.routeForJob(aiConnections.jobForTask(builtIn.task));
+    if (!assigned) return builtIn;
+    const entries = assigned.connections.map((conn) => ({
+        provider: `connection:${conn.id}`,
+        connectionId: conn.id,
+        model: aiConnections.modelFor(conn, 'text'),
+        label: `${conn.label} (${aiConnections.modelFor(conn, 'text')})`,
+        reasoning: conn.reasoning === true,
+    }));
+    if (assigned.builtInBackup) entries.push(...builtIn.entries);
+    return { task: builtIn.task, entries };
+}
+
+function _getBuiltInTextRoute(primary, { taskType, promptLength = 0, maxTokens = 800, providerOverride = false } = {}) {
     // Provider-aware text route. Bedrock is the base brain; AiLink can sit beside
     // it for Sonnet-tier tasks when AILINK_TASK_TYPES names the task.
     const task = _normalizeTextTaskType(taskType, { promptLength, maxTokens });
+
+    // ── Azure Managed Compute: single endpoint, two models, replaces Bedrock entirely.
+    // Brain-tier tasks → ornith (reasoning), everything else (default/utility/vision scoring) → qwen.
+    // No Bedrock fallback — this IS the brain when selected.
+    //
+    // This block MUST sit below `const task` above: it returns `task`, and when it
+    // stood before the declaration every azure-managed route hit the temporal dead
+    // zone instead of returning. The gate matches the NORMALIZED task (like every
+    // other *_TASK_TYPES gate in this function) and also the raw taskType, so a list
+    // written in either vocabulary works.
+    if (!providerOverride && primary === 'azure-managed') {
+        const am = config.azureManaged || {};
+        const amConfigured = Boolean(am.apiKey && am.baseUrl);
+        const brainTasks = _liveAzureManagedTaskTypes();
+        const isBrain = brainTasks.length > 0
+            && (brainTasks.includes(task) || brainTasks.includes(taskType));
+        const brainEntry = { provider: 'azure-managed', model: am.brainModel || 'deepreinforce-ai--ornith-10-397b' };
+        const defaultEntry = { provider: 'azure-managed', model: am.defaultModel || 'qwen--qwen38-27b' };
+        if (amConfigured && isBrain) return { task, entries: [brainEntry] };
+        if (amConfigured) return { task, entries: [defaultEntry] };
+        // Selected but not configured: say so ONCE rather than silently falling through
+        // to the hybrid Azure gates below, which point at a different endpoint and key
+        // and produce a baffling 401 against a deployment name that does exist.
+        _warnAzureManagedUnconfigured();
+    }
+
     const provider = 'bedrock';
     const cfg = config[provider] || {};
     const defaultModel = cfg.model || 'deepseek.v3.2';
@@ -2879,15 +3073,19 @@ function _getTextRoute(primary, { taskType, promptLength = 0, maxTokens = 800, p
     // ── Hybrid brain (Azure Foundry Claude Sonnet beside Bedrock): same pattern as AiLink/APlink.
     // When primary is bedrock, Azure has a key/base/model, and AZURE_TASK_TYPES names this task →
     // Azure Claude serves it FIRST with Bedrock as automatic fallback.
+    // SKIPPED when primary=azure-managed: that provider owns ALL tasks through its own endpoint.
     const az = config.azure || {};
     const azureConfigured = Boolean(az.apiKey && az.baseUrl && az.model);
     const azureTasks = _liveAzureTaskTypes();
-    if (!providerOverride && azureConfigured
+    if (!providerOverride && primary !== 'azure-managed' && azureConfigured
         && azureTasks.length > 0 && azureTasks.includes(task)) {
-        const aplinkLargeEntry = _azureLargePromptAplinkEntry(task, { promptLength, maxTokens });
-        if (aplinkLargeEntry) return { task, entries: [aplinkLargeEntry, entry] };
         const azPlanner = az.plannerModel && new Set(az.plannerTaskTypes || []).has(task);
         const azureEntry = { provider: 'azure-claude', model: azPlanner ? az.plannerModel : (az.model || 'claude-sonnet-4-6') };
+        // The large-prompt detour prefers APlink, but it must not skip Azure on the way
+        // down: relay channels drop, and landing straight on Bedrock strands the biggest
+        // call in the pipeline (Visual Planner) if Bedrock is unavailable.
+        const aplinkLargeEntry = _azureLargePromptAplinkEntry(task, { promptLength, maxTokens });
+        if (aplinkLargeEntry) return { task, entries: [aplinkLargeEntry, azureEntry, entry] };
         return { task, entries: [azureEntry, entry] };
     }
 
@@ -2899,10 +3097,10 @@ function _getTextRoute(primary, { taskType, promptLength = 0, maxTokens = 800, p
     const azureOpenAITasks = _liveAzureOpenAITaskTypes();
     if (!providerOverride && azureOpenAIConfigured
         && azureOpenAITasks.length > 0 && azureOpenAITasks.includes(task)) {
-        const aplinkLargeEntry = _azureLargePromptAplinkEntry(task, { promptLength, maxTokens });
-        if (aplinkLargeEntry) return { task, entries: [aplinkLargeEntry, entry] };
         const azPlanner = azOpenAI.plannerModel && new Set(azOpenAI.plannerTaskTypes || []).has(task);
         const azureOpenAIEntry = { provider: 'azure-openai', model: azPlanner ? azOpenAI.plannerModel : (azOpenAI.model || 'grok-4.3') };
+        const aplinkLargeEntry = _azureLargePromptAplinkEntry(task, { promptLength, maxTokens });
+        if (aplinkLargeEntry) return { task, entries: [aplinkLargeEntry, azureOpenAIEntry, entry] };
         return { task, entries: [azureOpenAIEntry, entry] };
     }
 
@@ -2927,6 +3125,14 @@ async function callAI(prompt, options = {}) {
     // it never changes which provider is chosen.
     if (routeInfo.task === 'brain' && BRAIN_MIN_MAX_TOKENS > 0 && maxTokens < BRAIN_MIN_MAX_TOKENS) {
         maxTokens = BRAIN_MIN_MAX_TOKENS;
+    }
+    // Same reason, small tasks: a reasoning primary needs headroom to think before it
+    // writes, or it answers "" at finish=length. Also applied after routing, so it can
+    // never change which provider is chosen.
+    const _reasoningFloor = _textCompletionBudget(routeInfo.entries[0], routeInfo.task, maxTokens);
+    if (_reasoningFloor > maxTokens) {
+        console.log(`  [Text Router] max_tokens ${maxTokens} → ${_reasoningFloor} (reasoning floor: ${_textRouteLabel(routeInfo.entries[0])} task=${routeInfo.task})`);
+        maxTokens = _reasoningFloor;
     }
     const route = routeInfo.entries;
     console.log(`  [Text Router] task=${routeInfo.task} prompt=${promptText.length} chars max_tokens=${maxTokens} route=${route.map(_textRouteLabel).join(' -> ')}`);
@@ -3010,12 +3216,65 @@ async function callAI(prompt, options = {}) {
     throw new Error(`No available text route for task=${routeInfo.task}`);
 }
 
+// ── AI Connection calls ─────────────────────────────────────────────────────
+// Thin adapters from the router's calling convention to connection-transport.
+// Timeouts follow the same size-scaled rule as the Azure paths: a big planner
+// answer is allowed to take minutes, a vision scorecard is not.
+function _connectionTimeoutMs(conn, maxTokens) {
+    return conn.timeoutMs || Math.max(120_000, Math.min(420_000, 90_000 + (Number(maxTokens) || 800) * 35));
+}
+
+async function _connectionText(entry, prompt, { maxTokens, temperature, systemPrompt, taskType, returnMeta = false }) {
+    const conn = aiConnections.getConnection(entry.connectionId);
+    if (!conn) throw new Error(`AI connection "${entry.connectionId}" no longer exists`);
+    const reply = await connectionTransport.chatText(conn, {
+        prompt,
+        systemPrompt,
+        maxTokens,
+        temperature,
+        taskType,
+        model: entry.model,
+        timeoutMs: _connectionTimeoutMs(conn, maxTokens),
+        recordUsage,
+        log: (line) => console.log(line),
+    });
+    // A server that returns a separate reasoning field is a reasoning model,
+    // whatever it is called: give it the reasoning floor from now on.
+    if (reply.hadReasoning && conn.reasoning !== true) conn.reasoning = true;
+    if (!reply.text) console.log(`  [AI:${conn.label}] ⚠️ EMPTY response (stop=${reply.finish})`);
+    if (returnMeta) {
+        return { text: reply.text, meta: { provider: 'connection', connectionId: conn.id, modelId: reply.model, stopReason: reply.finish, usage: reply.usage } };
+    }
+    return reply.text;
+}
+
+async function _connectionVision(connId, prompt, images, maxTokens) {
+    const conn = aiConnections.getConnection(connId);
+    if (!conn) throw new Error(`AI connection "${connId}" no longer exists`);
+    const model = aiConnections.modelFor(conn, 'vision');
+    const budget = _visionCompletionBudget(model, maxTokens);
+    const reply = await connectionTransport.chatVision(conn, {
+        prompt,
+        images,
+        maxTokens: conn.reasoning ? Math.max(budget, VISION_REASONING_MIN_TOKENS) : budget,
+        model,
+        timeoutMs: conn.timeoutMs || _azureVisionTimeout(budget),
+        recordUsage,
+        log: (line) => console.log(line),
+    });
+    if (!reply.text) console.log(`  [AI:${conn.label}] ⚠️ EMPTY vision response (stop=${reply.finish})`);
+    return reply.text;
+}
+
 async function _dispatchText(target, prompt, { maxTokens, temperature, systemPrompt, skipThinking, taskType, returnMeta = false }) {
     // Text is Bedrock-based after the 2026-05-25 cleanup, with optional AiLink
     // overlay for Sonnet-tier tasks. Bedrock owns DeepSeek/Sonnet/Haiku routing
     // internally via plannerTaskTypes / utilityTaskTypes.
     const entry = typeof target === 'string' ? { provider: target } : (target || {});
     const provider = entry.provider || target;
+    if (entry.connectionId) {
+        return await _connectionText(entry, prompt, { maxTokens, temperature, systemPrompt, taskType, returnMeta });
+    }
     if (provider === 'ailink') {
         return await _ailinkText(prompt, maxTokens, temperature, systemPrompt, { taskType, model: entry.model, returnMeta });
     }
@@ -3027,6 +3286,9 @@ async function _dispatchText(target, prompt, { maxTokens, temperature, systemPro
     }
     if (provider === 'azure-openai') {
         return await _azureOpenAIText(prompt, maxTokens, temperature, systemPrompt, { taskType, model: entry.model, returnMeta });
+    }
+    if (provider === 'azure-managed') {
+        return await _azureManagedText(prompt, maxTokens, temperature, systemPrompt, { taskType, model: entry.model, returnMeta });
     }
     if (provider !== 'bedrock') {
         throw new Error(`Text provider "${provider}" is not supported. Use AI_PROVIDER=bedrock with an optional hybrid brain gate (AILINK_TASK_TYPES, APLINK_TASK_TYPES, AZURE_TASK_TYPES, or AZURE_OPENAI_TASK_TYPES).`);
@@ -3045,8 +3307,8 @@ async function _ailinkText(prompt, maxTokens, temperature, systemPrompt, opts = 
     // Task allowlist gate (same protection pattern as Bedrock).
     const _liveGate = process.env.AILINK_TASK_TYPES;
     const _gateTasks = _liveGate !== undefined
-        ? String(_liveGate).split(',').map(t => t.trim()).filter(Boolean)
-        : (Array.isArray(al.allowedTasks) ? al.allowedTasks : []);
+        ? _csvTaskGate(_liveGate)
+        : _csvTaskGate((Array.isArray(al.allowedTasks) ? al.allowedTasks : []).join(','));
     if (_gateTasks.length > 0 && taskType && !_gateTasks.includes(taskType)) {
         throw new Error(`AiLink blocked: taskType=${taskType} not in AILINK_TASK_TYPES`);
     }
@@ -3109,8 +3371,8 @@ async function _aplinkText(prompt, maxTokens, temperature, systemPrompt, opts = 
     const ap = config.aplink || {};
     const _liveGate = process.env.APLINK_TASK_TYPES;
     const _gateTasks = _liveGate !== undefined
-        ? String(_liveGate).split(',').map(t => t.trim()).filter(Boolean)
-        : (Array.isArray(ap.allowedTasks) ? ap.allowedTasks : []);
+        ? _csvTaskGate(_liveGate)
+        : _csvTaskGate((Array.isArray(ap.allowedTasks) ? ap.allowedTasks : []).join(','));
     if (_gateTasks.length > 0 && taskType && !_gateTasks.includes(taskType)) {
         throw new Error(`APlink blocked: taskType=${taskType} not in APLINK_TASK_TYPES`);
     }
@@ -3162,6 +3424,50 @@ async function _aplinkText(prompt, maxTokens, temperature, systemPrompt, opts = 
     }
 }
 
+// Azure Foundry meters per DEPLOYMENT, not per account, and a trial-tier deployment can
+// sit as low as 3 requests / 2500 uncached input tokens per 60s. A build fires hundreds of
+// text calls, so 429s are routine rather than exceptional — and since Bedrock is the
+// fallback, a 429 that is not retried here silently demotes the call to whatever Bedrock
+// state the operator has. Honour the server's own retry-after instead of guessing.
+// AZURE_RATE_LIMIT_RETRIES=0 restores the old fail-fast behaviour.
+function _azureRetryAfterMs(err) {
+    const h = err?.response?.headers || {};
+    const ms = parseFloat(h['retry-after-ms']);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+    const secs = parseFloat(h['retry-after'] ?? h['x-ratelimit-timeremaining']);
+    if (Number.isFinite(secs) && secs > 0) return secs * 1000;
+    return 0;
+}
+
+async function _azureRetrying(label, model, taskType, fn) {
+    const maxRetries = Math.max(0, parseInt(process.env.AZURE_RATE_LIMIT_RETRIES || '4', 10) || 0);
+    const capMs = Math.max(1000, parseInt(process.env.AZURE_RATE_LIMIT_MAX_WAIT_MS || '75000', 10) || 75000);
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            const status = err?.response?.status;
+            // A dropped connection is the MOST retryable failure there is, and it was the
+            // only one not retried: this tested `status` alone, but a transport error has
+            // no HTTP response at all, so status is undefined, retryable was false, and the
+            // call was thrown on the first blip. Measured 2026-08-29: `connect ETIMEDOUT`
+            // and `read ECONNRESET` to the Azure endpoint sent 18 candidates down the
+            // fallback chain to "left unjudged" — footage accepted or dropped without ever
+            // being scored — while the vision model itself was perfectly healthy either
+            // side of the blip. Codes come from Node's net/dns layer; ECONNABORTED is what
+            // axios raises for its own timeout.
+            const code = String(err?.code || err?.cause?.code || '');
+            const transport = /^(ETIMEDOUT|ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN)$/.test(code);
+            const retryable = status === 429 || status === 503 || status === 529 || transport;
+            if (!retryable || attempt >= maxRetries) throw err;
+            const waitMs = Math.min(capMs, _azureRetryAfterMs(err) || Math.min(capMs, 2000 * Math.pow(2, attempt)));
+            const why = transport ? `network ${code}` : `HTTP ${status} rate-limited`;
+            console.log(`  [${label}] ${model} task=${taskType || '?'} ${why} — waiting ${(waitMs / 1000).toFixed(1)}s (retry ${attempt + 1}/${maxRetries})`);
+            await new Promise(r => setTimeout(r, waitMs));
+        }
+    }
+}
+
 function _azureAnthropicBaseUrl(value = '') {
     const raw = String(value || '').trim().replace(/\/+$/, '');
     if (!raw) return '';
@@ -3189,6 +3495,70 @@ function _azureOpenAIBaseUrl(value = '') {
     return raw;
 }
 
+// GPT-5.x deployments reject the legacy chat/completions knobs that every older
+// Azure deployment (grok-4.3, gpt-4o) requires. Measured against gpt-5.6-terra on
+// 2026-08-14: `max_tokens` → HTTP 400 "use 'max_completion_tokens' instead", and
+// any explicit temperature other than 1 → HTTP 400 "only the default (1) value is
+// supported". So the request shape has to be chosen per model, never swapped
+// globally, or fixing GPT-5 breaks grok.
+function _isGpt5Model(model) {
+    return /^gpt-5/i.test(String(model || '').trim());
+}
+
+// Does this model spend completion budget THINKING before it emits a visible character?
+//
+// The two budget floors above used to ask _isGpt5Model, i.e. they matched ONE VENDOR BY
+// NAME. That silently covered exactly the family it was written for. The moment a
+// different reasoning model was deployed — deepreinforce ornith, 2026-08-27 — it matched
+// nothing, got no headroom on any task, and returned "" at finish=length on every
+// planner call. Raising TEXT_MIN_MAX_TOKENS could not help, because the value is only
+// read AFTER the name check that already rejected it.
+//
+// So this is a PROPERTY of the model, declared, not a vendor prefix. Keep _isGpt5Model
+// for what it is genuinely about — the GPT-5 request dialect (max_completion_tokens,
+// temperature must be 1) — and ask this instead for anything about thinking budget.
+// REASONING_MODEL_PATTERN adds to the list without a code change.
+const _REASONING_MODEL_DEFAULT_RE =
+    /(^gpt-5)|(^o[1-9](-|$))|ornith|qwq|deepseek-r1|[-_.]thinking|[-_.]reasoning/i;
+function _isReasoningModel(model) {
+    const id = String(model || '').trim();
+    if (!id) return false;
+    const extra = String(process.env.REASONING_MODEL_PATTERN || '').trim();
+    if (extra) {
+        try { if (new RegExp(extra, 'i').test(id)) return true; } catch (_) { /* bad regex → ignore */ }
+    }
+    return _REASONING_MODEL_DEFAULT_RE.test(id);
+}
+
+function _azureOpenAITuning(model, maxTokens, temperature, defaultMaxTokens) {
+    const budget = maxTokens || defaultMaxTokens;
+    if (_isGpt5Model(model)) {
+        return {
+            max_completion_tokens: budget,
+            ...(temperature === 1 ? { temperature } : {}),
+        };
+    }
+    return {
+        max_tokens: budget,
+        ...(temperature !== undefined ? { temperature } : {}),
+    };
+}
+
+// The Anthropic surface has the same generational split. Measured on 2026-08-14:
+// claude-opus-4-8 400s on any explicit temperature other than 1 ("`temperature` is
+// deprecated for this model"), while claude-sonnet-4-6 on the same endpoint accepts
+// 0.7 happily. Callers pass a temperature on most planner/director calls, so without
+// this the whole thinking tier would 400 straight through to dead Bedrock.
+function _anthropicDeprecatesTemperature(model) {
+    return /^claude-opus-4-8/i.test(String(model || '').trim());
+}
+
+function _azureAnthropicTuning(model, temperature) {
+    if (temperature === undefined) return {};
+    if (_anthropicDeprecatesTemperature(model) && temperature !== 1) return {};
+    return { temperature };
+}
+
 function _anthropicMessageText(data) {
     const parts = Array.isArray(data?.content) ? data.content : [];
     const text = parts
@@ -3213,8 +3583,8 @@ async function _azureClaudeText(prompt, maxTokens, temperature, systemPrompt, op
     const az = config.azure || {};
     const _liveGate = process.env.AZURE_TASK_TYPES;
     const _gateTasks = _liveGate !== undefined
-        ? String(_liveGate).split(',').map(t => t.trim()).filter(Boolean)
-        : (Array.isArray(az.allowedTasks) ? az.allowedTasks : []);
+        ? _csvTaskGate(_liveGate)
+        : _csvTaskGate((Array.isArray(az.allowedTasks) ? az.allowedTasks : []).join(','));
     if (_gateTasks.length > 0 && taskType && !_gateTasks.includes(taskType)) {
         throw new Error(`Azure Claude blocked: taskType=${taskType} not in AZURE_TASK_TYPES`);
     }
@@ -3231,7 +3601,7 @@ async function _azureClaudeText(prompt, maxTokens, temperature, systemPrompt, op
         messages,
         max_tokens: maxTokens || 800,
         ...(systemPrompt ? { system: String(systemPrompt) } : {}),
-        ...(temperature !== undefined ? { temperature } : {}),
+        ..._azureAnthropicTuning(model, temperature),
         stream: false,
     };
     const headers = {
@@ -3244,7 +3614,8 @@ async function _azureClaudeText(prompt, maxTokens, temperature, systemPrompt, op
 
     const started = Date.now();
     try {
-        const resp = await axios({ url, method: 'POST', data: body, headers, timeout: _azureTimeout, adapter: 'http' });
+        const resp = await _azureRetrying('Azure Claude', model, taskType, () =>
+            axios({ url, method: 'POST', data: body, headers, timeout: _azureTimeout, adapter: 'http' }));
         const elapsed = ((Date.now() - started) / 1000).toFixed(1);
         const text = _anthropicMessageText(resp.data);
         const usage = {
@@ -3280,8 +3651,8 @@ async function _azureOpenAIText(prompt, maxTokens, temperature, systemPrompt, op
     const az = config.azureOpenAI || {};
     const _liveGate = process.env.AZURE_OPENAI_TASK_TYPES;
     const _gateTasks = _liveGate !== undefined
-        ? String(_liveGate).split(',').map(t => t.trim()).filter(Boolean)
-        : (Array.isArray(az.allowedTasks) ? az.allowedTasks : []);
+        ? _csvTaskGate(_liveGate)
+        : _csvTaskGate((Array.isArray(az.allowedTasks) ? az.allowedTasks : []).join(','));
     if (_gateTasks.length > 0 && taskType && !_gateTasks.includes(taskType)) {
         throw new Error(`Azure OpenAI blocked: taskType=${taskType} not in AZURE_OPENAI_TASK_TYPES`);
     }
@@ -3298,8 +3669,7 @@ async function _azureOpenAIText(prompt, maxTokens, temperature, systemPrompt, op
     const body = {
         model,
         messages,
-        max_tokens: maxTokens || 800,
-        ...(temperature !== undefined ? { temperature } : {}),
+        ..._azureOpenAITuning(model, maxTokens, temperature, 800),
     };
     const headers = {
         'Content-Type': 'application/json',
@@ -3311,7 +3681,8 @@ async function _azureOpenAIText(prompt, maxTokens, temperature, systemPrompt, op
 
     const started = Date.now();
     try {
-        const resp = await axios({ url, method: 'POST', data: body, headers, timeout: _azureTimeout, adapter: 'http' });
+        const resp = await _azureRetrying('Azure OpenAI', model, taskType, () =>
+            axios({ url, method: 'POST', data: body, headers, timeout: _azureTimeout, adapter: 'http' }));
         const elapsed = ((Date.now() - started) / 1000).toFixed(1);
         const choice = resp.data?.choices?.[0] || {};
         const content = choice?.message?.content ?? choice?.text ?? '';
@@ -3333,6 +3704,76 @@ async function _azureOpenAIText(prompt, maxTokens, temperature, systemPrompt, op
         const data = err?.response?.data;
         const detail = typeof data === 'string' ? data.slice(0, 200) : JSON.stringify(data || {}).slice(0, 200);
         console.log(`  [Azure OpenAI] ✗ ${model} ${elapsed}s HTTP ${status || '?'} ${detail}`);
+        throw err;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Azure Managed Compute — single endpoint, two models.
+// Brain-tier tasks → AZURE_MANAGED_BRAIN_MODEL (ornith), everything else
+// (default, utility, vision, scoring) → AZURE_MANAGED_DEFAULT_MODEL (qwen).
+// The dropdown option "Azure Managed" sets AZURE_MANAGED_TASK_TYPES to gate
+// which tasks go to the brain model; all other text + all vision uses qwen.
+// ──────────────────────────────────────────────────────────────────────────
+async function _azureManagedText(prompt, maxTokens, temperature, systemPrompt, opts = {}) {
+    const { taskType, returnMeta = false } = opts;
+    const am = config.azureManaged || {};
+    if (!am.apiKey) throw new Error('Azure Managed not configured: set AZURE_MANAGED_API_KEY');
+    if (!am.baseUrl) throw new Error('Azure Managed not configured: set AZURE_MANAGED_ENDPOINT');
+
+    const axios = require('axios');
+    // Brain model for gated tasks, default model for everything else.
+    const brainTasks = am.brainTaskTypes.length > 0
+        ? am.brainTaskTypes
+        : _csvTaskGate((process.env.AZURE_MANAGED_BRAIN_TASK_TYPES || '').length
+            ? process.env.AZURE_MANAGED_BRAIN_TASK_TYPES : 'brain,planner-outline,planner-large,planner-small');
+    const isBrain = brainTasks.includes(taskType);
+    const model = isBrain ? (am.brainModel || 'deepreinforce-ai--ornith-10-397b')
+                          : (am.defaultModel || 'qwen--qwen38-27b');
+    const baseUrl = _azureOpenAIBaseUrl(am.baseUrl);
+    const url = `${baseUrl}/chat/completions`;
+    const messages = [];
+    if (systemPrompt) messages.push({ role: 'system', content: String(systemPrompt) });
+    messages.push({ role: 'user', content: String(prompt || '') });
+    const body = {
+        model,
+        messages,
+        ..._azureOpenAITuning(model, maxTokens, temperature, 800),
+    };
+    const headers = {
+        'Content-Type': 'application/json',
+        'api-key': am.apiKey,
+    };
+    const _amTimeout = parseInt(process.env.AZURE_MANAGED_TIMEOUT_MS, 10)
+        || parseInt(process.env.AZURE_TIMEOUT_MS, 10)
+        || Math.max(120_000, Math.min(420_000, 90_000 + (Number(maxTokens) || 800) * 35));
+
+    const started = Date.now();
+    try {
+        const resp = await _azureRetrying('Azure Managed', model, taskType, () =>
+            axios({ url, method: 'POST', data: body, headers, timeout: _amTimeout, adapter: 'http' }));
+        const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+        const choice = resp.data?.choices?.[0] || {};
+        const content = choice?.message?.content ?? choice?.text ?? '';
+        const text = Array.isArray(content)
+            ? content.map(part => typeof part === 'string' ? part : (part?.text || part?.content || '')).join('\n').trim()
+            : String(content || '').trim();
+        const usage = resp.data?.usage || {};
+        const finish = choice?.finish_reason || 'unknown';
+        const label = isBrain ? 'brain' : 'default';
+        console.log(`  [Azure Managed] ${model} (${label}) task=${taskType || '?'} ${elapsed}s in=${usage.prompt_tokens || 0} out=${usage.completion_tokens || 0} stop=${finish}`);
+        recordUsage({ provider: 'azure-managed', model, taskType, kind: 'text', usage });
+        if (!text) console.log(`  [Azure Managed] ⚠️ EMPTY response (finish=${finish})`);
+        if (returnMeta) {
+            return { text, meta: { provider: 'azure-managed', modelId: model, stopReason: finish, usage } };
+        }
+        return text;
+    } catch (err) {
+        const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+        const status = err?.response?.status;
+        const data = err?.response?.data;
+        const detail = typeof data === 'string' ? data.slice(0, 200) : JSON.stringify(data || {}).slice(0, 200);
+        console.log(`  [Azure Managed] ✗ ${model} ${elapsed}s HTTP ${status || '?'} ${detail}`);
         throw err;
     }
 }
@@ -3384,7 +3825,14 @@ async function callVisionAI(prompt, base64Image, mimeType = 'image/jpeg', option
     if (_vdir) prompt = _vdir + String(prompt || '');
 
     // Vision chain: direct DashScope Qwen primary, then configured fallbacks.
-    const chain = _getVisionChain();
+    // …unless the caller pinned one specific judge (options.visionProvider), in
+    // which case the chain is exactly that one seat, with NO failover. That is
+    // deliberate: the judge panel needs each seat to be a known model, because a
+    // seat that silently falls back to its neighbour would make the panel two
+    // votes from the SAME model — i.e. one judge wearing two hats — and destroy
+    // the whole point of averaging two models that fail in opposite directions.
+    // A pinned seat that dies throws; the panel drops that seat and uses the rest.
+    const chain = _visionChainFor(options);
 
     for (let i = 0; i < chain.length; i++) {
         const provider = chain[i];
@@ -3448,20 +3896,40 @@ function _isQwenVisionUsable() {
     return _getBestKeyAndModel(QWEN_IMAGE_POOL, config.qwen?.visionModel, 'image') !== null;
 }
 
-const VISION_PROVIDER_ORDER = ['qwen', 'bedrock-qwen-vl', 'bedrock-claude', 'bedrock-nova'];
+// The automatic failover chain. `bedrock-nova-pro` is deliberately ABSENT: it is
+// a valid, callable judge (see _bedrockVisionOptions) but it is over-literal —
+// it rejects good footage — so it must never drift into the chain by default.
+// It is reachable only when something names it explicitly (VISION_FALLBACK_ORDER,
+// VISION_PROVIDER, or a panel seat).
+const VISION_PROVIDER_ORDER = ['qwen', 'azure-openai', 'bedrock-qwen-vl', 'bedrock-claude', 'bedrock-nova'];
 const VISION_PROVIDER_ALIASES = {
     bedrock: 'bedrock-qwen-vl',
     'bedrock-qwen': 'bedrock-qwen-vl',
     'qwen-vl': 'bedrock-qwen-vl',
     'qwen-bedrock': 'bedrock-qwen-vl',
     nova: 'bedrock-nova',
+    'nova-lite': 'bedrock-nova',
+    'bedrock-nova-lite': 'bedrock-nova',
+    'nova-pro': 'bedrock-nova-pro',
     claude: 'bedrock-claude',
     dashscope: 'qwen',
     alibaba: 'qwen',
+    azure: 'azure-openai',
+    'azure-vision': 'azure-openai',
+    'azure-grok': 'azure-openai',
+    grok: 'azure-openai',
+    'azure-sonnet': 'azure-claude',
 };
 
 function _hasBedrockVision() {
     return !!(config.bedrock?.accessKeyId && config.bedrock?.secretAccessKey);
+}
+
+function _hasAzureVision(provider) {
+    const az = _normalizeVisionProviderName(provider) === 'azure-claude'
+        ? config.azure
+        : config.azureOpenAI;
+    return !!(az?.apiKey && az?.baseUrl && az?.model);
 }
 
 function _normalizeVisionProviderName(value) {
@@ -3475,11 +3943,21 @@ function _visionProviderAvailable(provider) {
         case 'bedrock-qwen-vl':
         case 'bedrock-claude':
         case 'bedrock-nova':
+        case 'bedrock-nova-pro':
             return _hasBedrockVision();
+        case 'azure-openai':
+        case 'azure-claude':
+            return _hasAzureVision(provider);
+        case 'azure-managed':
+            return !!(config.azureManaged?.apiKey && config.azureManaged?.baseUrl);
         case 'qwen':
             return _getQwenKeys('image').length > 0 && _isQwenVisionUsable();
-        default:
-            return false;
+        default: {
+            const id = String(provider || '');
+            if (!id.startsWith('connection:')) return false;
+            const conn = aiConnections.getConnection(id.slice('connection:'.length));
+            return !!(conn && aiConnections.modelFor(conn, 'vision'));
+        }
     }
 }
 
@@ -3500,7 +3978,35 @@ function _configuredVisionOrder() {
     // Per-scene Retry routes vision straight to Bedrock (the GPU box is slow to boot and
     // not worth waking for one scene). VISION_EXCLUDE_QWEN=1 drops the box from the chain.
     if (process.env.VISION_EXCLUDE_QWEN === '1') chain = chain.filter(p => p !== 'qwen');
-    return chain;
+    // Only a primary that SURVIVED that filter is a real pin. When Retry drops the
+    // box, the old head ('qwen') is gone and whatever VISION_FALLBACK_ORDER lists
+    // first simply slides into seat 0 — that is an accident, not a choice, and it
+    // must not be protected from the hoist below.
+    const pinnedFirst = !!overridePrimary && chain[0] === overridePrimary;
+    return _hoistAzureAboveBedrock(chain, pinnedFirst);
+}
+
+// Azure outranks Bedrock in the FALLBACK tail, wherever that tail came from.
+// VISION_FALLBACK_ORDER is spliced in AHEAD of VISION_PROVIDER_ORDER and ships as
+// `bedrock-qwen-vl,bedrock-claude,bedrock-nova`, so adding Azure to the constant
+// alone would still leave it stranded behind three Bedrock seats.
+//
+// That ordering is the whole bug (2026-08-14). With the AWS account dead, every
+// Bedrock seat is a guaranteed UnrecognizedClientException per frame. When the
+// self-hosted Qwen box went down mid-build the chain had no live provider left:
+// each candidate scored 1/10, was rejected, and re-entered the race — 25k vision
+// errors, a 142k-line log, and 2h20m of build producing only generic footage.
+//
+// A surviving explicit VISION_PROVIDER pin keeps seat 0 — per-scene Retry
+// deliberately routes to Bedrock, and that choice is honoured.
+function _hoistAzureAboveBedrock(chain, pinnedFirst) {
+    const from = pinnedFirst ? 1 : 0;
+    const firstBedrock = chain.findIndex((p, i) => i >= from && _isBedrockVisionProvider(p));
+    if (firstBedrock < 0) return chain;
+    const azure = chain.filter((p, i) => i > firstBedrock && _isAzureVisionProvider(p));
+    if (azure.length === 0) return chain;
+    const rest = chain.filter(p => !azure.includes(p));
+    return [...rest.slice(0, firstBedrock), ...azure, ...rest.slice(firstBedrock)];
 }
 
 // ── Permanently-dead vision providers ───────────────────────────────────────
@@ -3525,12 +4031,30 @@ function _configuredVisionOrder() {
 const _visionDead = new Map(); // normalized provider -> reason
 
 function _permanentVisionFailure(error) {
-    const msg = `${(error && error.name) || ''} ${(error && error.message) || ''}`;
+    // The AWS SDK puts the reason in .message; an axios error says only "Request
+    // failed with status code 404" and keeps the reason in the response body. Read
+    // both, or the Azure seats can never be diagnosed as permanently dead and a
+    // typo'd deployment costs one doomed roundtrip on every remaining frame.
+    const body = error?.response?.data;
+    const bodyText = typeof body === 'string' ? body : (() => {
+        try { return JSON.stringify(body || ''); } catch (_) { return ''; }
+    })();
+    const msg = `${(error && error.name) || ''} ${(error && error.message) || ''} ${bodyText}`;
     if (/AccessDenied|not available for this account|\bhttp=403\b|don'?t have access to the model/i.test(msg)) {
         return 'this AWS account is not entitled to that model';
     }
     if (/model identifier is invalid|invalid model|ResourceNotFound|NOT IN REGION/i.test(msg)) {
         return 'that model id does not exist in this region';
+    }
+    if (/DeploymentNotFound/i.test(msg)) {
+        return 'that Azure deployment does not exist on this endpoint';
+    }
+    // Dead/rotated AWS keys. Every Bedrock seat 403s identically and forever, so
+    // reading this as transient means re-paying a doomed roundtrip on every frame
+    // for every seat — which is exactly how one build logged 25k vision errors
+    // (2026-08-14). Say it once, drop the seat, let the chain move on.
+    if (/UnrecognizedClientException|security token included in the request is invalid|InvalidSignatureException|ExpiredToken/i.test(msg)) {
+        return 'these AWS credentials are invalid or expired';
     }
     if (/on-demand throughput isn.?t supported|inference profile/i.test(msg)) {
         return "that model needs its cross-region 'us.*' inference-profile id, not the bare model id";
@@ -3539,7 +4063,7 @@ function _permanentVisionFailure(error) {
 }
 
 function _visionProviderModelLabel(provider) {
-    const opts = _bedrockVisionOptions(provider);
+    const opts = _bedrockVisionOptions(provider) || _azureVisionOptions(provider);
     if (!opts) return '';
     return process.env[opts.modelEnv] || opts.defaultModel || '';
 }
@@ -3558,9 +4082,14 @@ function _markVisionProviderDead(provider, reason, isPrimary) {
         console.error('   A backup judge is not tuned for this job and tends to reject good');
         console.error('   footage, which is what produces "no footage — placeholder" scenes.');
     }
-    console.error('   fix:   node scripts/bedrock-vision-probe.js     (what can this account call?)');
-    console.error('          node scripts/vision-judge-bench.js       (which of those judges well?)');
-    console.error('          then set VISION_BEDROCK_PRIMARY_MODEL=<id> in the user .env');
+    if (_isAzureVisionProvider(provider)) {
+        console.error('   fix:   check the deployment exists on AZURE_OPENAI_ENDPOINT / AZURE_ANTHROPIC_BASE_URL,');
+        console.error('          then set AZURE_OPENAI_VISION_MODEL=<deployment> in the user .env');
+    } else {
+        console.error('   fix:   node scripts/bedrock-vision-probe.js     (what can this account call?)');
+        console.error('          node scripts/vision-judge-bench.js       (which of those judges well?)');
+        console.error('          then set VISION_BEDROCK_PRIMARY_MODEL=<id> in the user .env');
+    }
     console.error('   Dropping it from the vision chain for the rest of this run.');
     console.error(`${bar}\n`);
 }
@@ -3571,13 +4100,41 @@ function getDeadVisionProviders() {
     }));
 }
 
+// The vision chain's front door. When the Eyes job points at AI Connections,
+// they are the chain (then the built-in chain only if chosen as the backup).
+// Otherwise the built-in chain below is returned exactly as before.
 function _getVisionChain() {
+    const eyes = aiConnections.routeForJob('eyes');
+    if (!eyes) return _getBuiltInVisionChain();
+    const seats = eyes.connections.map((conn) => `connection:${conn.id}`);
+    const live = seats.filter((seat) => !_visionDead.has(seat));
+    if (!eyes.builtInBackup) return live.length ? live : seats;
+    let builtIn = [];
+    try { builtIn = _getBuiltInVisionChain(); } catch (_) { builtIn = []; }
+    const chain = [...(live.length ? live : seats), ...builtIn.filter((seat) => !seats.includes(seat))];
+    return chain;
+}
+
+function _getBuiltInVisionChain() {
     // Default cost-safe route:
     //   1. qwen            — direct DashScope Qwen free-quota pool
-    //   2. bedrock-qwen-vl — Qwen3 VL 235B on AWS Bedrock fallback
-    //   3. bedrock-claude  — Claude Haiku 4.5 on Bedrock fallback
-    //   4. bedrock-nova    — Amazon Nova Lite emergency fallback
+    //   2. azure-managed   — Azure Managed Compute (Qwen model) when configured
+    //   3. bedrock-qwen-vl — Qwen3 VL 235B on AWS Bedrock fallback
+    //   4. bedrock-claude  — Claude Haiku 4.5 on Bedrock fallback
+    //   5. bedrock-nova    — Amazon Nova Lite emergency fallback
     const chain = _configuredVisionOrder().filter(_visionProviderAvailable);
+    // Insert azure-managed after qwen when it's configured (single-endpoint brain+vision).
+    const am = config.azureManaged || {};
+    const amConfigured = Boolean(am.apiKey && am.baseUrl);
+    const primary = process.env.AI_PROVIDER || config.aiProvider || 'bedrock';
+    if (amConfigured && primary === 'azure-managed' && !chain.includes('azure-managed')) {
+        const qwenIdx = chain.indexOf('qwen');
+        if (qwenIdx >= 0) {
+            chain.splice(qwenIdx + 1, 0, 'azure-managed');
+        } else {
+            chain.unshift('azure-managed');
+        }
+    }
     // Skip providers this run has already proven unusable. If that would empty the
     // chain, keep the full one: a real error from a real call is far more useful
     // than a synthetic "nothing available" thrown from a bookkeeping map.
@@ -3592,6 +4149,38 @@ function getVisionProviderChain() {
     return _getVisionChain().slice();
 }
 
+/**
+ * Resolve the chain for ONE callVisionAI call.
+ *
+ * Normal calls get the configured failover chain. A caller that passes
+ * `options.visionProvider` gets a one-seat chain instead — that exact judge, no
+ * failover, throw on failure. See the comment at the call site for why a panel
+ * seat must never silently become a different model.
+ */
+function _visionChainFor(options) {
+    const pinned = _normalizeVisionProviderName(options && options.visionProvider);
+    if (!pinned) return _getVisionChain();
+
+    if (!_visionProviderAvailable(pinned)) {
+        const err = new Error(`vision provider "${pinned}" is not available (missing credentials, or its key pool is exhausted)`);
+        err.visionProviderUnavailable = true;
+        throw err;
+    }
+    if (_visionDead.has(pinned)) {
+        const err = new Error(`vision provider "${pinned}" is unusable this run: ${_visionDead.get(pinned)}`);
+        err.visionProviderUnavailable = true;
+        throw err;
+    }
+    return [pinned];
+}
+
+/** Is this judge callable right now? Used to size a panel before paying for it. */
+function isVisionProviderUsable(provider) {
+    const id = _normalizeVisionProviderName(provider);
+    if (!id) return false;
+    return _visionProviderAvailable(id) && !_visionDead.has(id);
+}
+
 function isVisionAIAvailable() {
     try {
         return _getVisionChain().length > 0;
@@ -3601,7 +4190,34 @@ function isVisionAIAvailable() {
 }
 
 function _isBedrockVisionProvider(provider) {
-    return ['bedrock-qwen-vl', 'bedrock-claude', 'bedrock-nova'].includes(_normalizeVisionProviderName(provider));
+    return ['bedrock-qwen-vl', 'bedrock-claude', 'bedrock-nova', 'bedrock-nova-pro']
+        .includes(_normalizeVisionProviderName(provider));
+}
+
+function _isAzureVisionProvider(provider) {
+    return ['azure-openai', 'azure-claude', 'azure-managed'].includes(_normalizeVisionProviderName(provider));
+}
+
+// Vision deployment is configured separately from the text one: the same Azure
+// resource can host a strong text model and a different vision-capable one, and
+// moving text must not silently move the footage judge. Unset → the text model.
+function _azureVisionOptions(provider) {
+    switch (_normalizeVisionProviderName(provider)) {
+        case 'azure-openai':
+            return {
+                modelEnv: 'AZURE_OPENAI_VISION_MODEL',
+                defaultModel: config.azureOpenAI?.model || 'grok-4.3',
+                tag: 'azure-openai',
+            };
+        case 'azure-claude':
+            return {
+                modelEnv: 'AZURE_CLAUDE_VISION_MODEL',
+                defaultModel: config.azure?.model || 'claude-sonnet-4-6',
+                tag: 'azure-claude',
+            };
+        default:
+            return null;
+    }
 }
 
 function _bedrockVisionOptions(provider, kind = 'image') {
@@ -3625,26 +4241,277 @@ function _bedrockVisionOptions(provider, kind = 'image') {
                 defaultModel: 'us.amazon.nova-lite-v1:0',
                 tag: `bedrock-nova${suffix}`,
             };
+        case 'bedrock-nova-pro':
+            // Separate seat from bedrock-nova ON PURPOSE. They are different
+            // models with different quotas and OPPOSITE biases (Lite is lenient,
+            // Pro is literal), and Bedrock meters RPM per model — so sharing one
+            // provider id would have meant sharing one pacer between two limits,
+            // which is the exact bug the per-model pacer was written to kill.
+            return {
+                modelEnv: 'BEDROCK_VISION_NOVA_PRO_MODEL',
+                defaultModel: 'us.amazon.nova-pro-v1:0',
+                tag: `bedrock-nova-pro${suffix}`,
+            };
         default:
             return null;
     }
 }
 
 async function _dispatchVision(provider, prompt, base64Image, mimeType, maxTokens) {
+    if (String(provider).startsWith('connection:')) {
+        return await _connectionVision(String(provider).slice('connection:'.length), prompt, [{ base64: base64Image, mimeType }], maxTokens);
+    }
     // Active vision providers:
     //   qwen            — direct DashScope free-quota pool
+    //   azure-openai    — Azure Foundry chat/completions, first fallback off the box
+    //   azure-claude    — Azure Foundry Anthropic messages, named-only (see below)
     //   bedrock-qwen-vl — paid quality fallback
     //   bedrock-claude  — instruction fallback
     //   bedrock-nova    — cheap/emergency fallback
     switch (provider) {
         case 'qwen':
             return await _qwenVision(prompt, base64Image, mimeType, maxTokens);
+        case 'azure-openai':
+            return await _azureOpenAIVision(prompt, base64Image, mimeType, maxTokens, _azureVisionOptions(provider));
+        case 'azure-managed':
+            return await _azureManagedVision(prompt, base64Image, mimeType, maxTokens, _azureVisionOptions(provider));
+        case 'azure-claude':
+            return await _azureClaudeVision(prompt, base64Image, mimeType, maxTokens, _azureVisionOptions(provider));
         case 'bedrock-nova':
+        case 'bedrock-nova-pro':
         case 'bedrock-qwen-vl':
         case 'bedrock-claude':
             return await _bedrockVision(prompt, base64Image, mimeType, maxTokens, _bedrockVisionOptions(provider));
         default:
-            throw new Error(`Vision provider "${provider}" was removed in 2026-05-25 cleanup. Use qwen / bedrock-nova / bedrock-qwen-vl / bedrock-claude.`);
+            throw new Error(`Vision provider "${provider}" was removed in 2026-05-25 cleanup. Use qwen / azure-openai / azure-claude / bedrock-nova / bedrock-nova-pro / bedrock-qwen-vl / bedrock-claude.`);
+    }
+}
+
+// ── Azure vision ────────────────────────────────────────────────────────────
+// The same two Azure surfaces the text brain already routes through, handed an
+// image. Both were measured on this account (2026-08-14, 5 concurrent 72KB PNG
+// frames), and the numbers decide which one the chain gets:
+//
+//   azure-openai / grok-4.3      50 req/min, 50k tok/min   5/5 ok   ~6s
+//   azure-claude / sonnet-4-6     3 req/min,  2.5k tok/min  4/5 ok   ~2s
+//
+// Only azure-openai sits in VISION_PROVIDER_ORDER. Sonnet is the better judge —
+// it is the single clean sweep in the bench recorded in config.js — but 3 req/min
+// cannot carry a build that scores thousands of frames, and this file already has
+// the scar tissue from trying: Bedrock Sonnet's quota produced 800 rate-limit
+// waits and ~2 hours of dead time in one run. A judge that is right and never
+// arrives loses to a judge that is nearly right and does. So azure-claude stays a
+// named-only seat — reachable via VISION_PROVIDER, VISION_FALLBACK_ORDER or a
+// panel seat — exactly like bedrock-nova-pro above it.
+// GPT-5.x is a REASONING model: `max_completion_tokens` budgets the private
+// reasoning pass AND the visible answer out of one pool, and the reasoning is
+// spent FIRST. The scorecard the vision prompts ask for is short — measured on
+// gpt-5.6-terra across 3702 successful calls: p50 90, p90 171, p99 561, max 774
+// completion tokens — but the 200-token default that suits the non-reasoning Qwen
+// judge is swallowed whole by the thinking before one visible character is
+// emitted, and the call returns "" with finish_reason=length. Measured on the
+// 2026-08-15 build: 442 of 4144 vision calls came back empty exactly that way,
+// and every one of them costs a same-provider retry plus a walk down the fallback
+// chain — so the low cap was more expensive than the headroom it saved.
+// Non-reasoning judges keep the old budget byte-for-byte.
+const VISION_REASONING_MIN_TOKENS = 1500;
+
+// A NON-reasoning judge needs room to answer too. Measured 2026-08-28 against
+// qwen--qwen38-27b using ai-vision.js's real detectSubjectFocus prompt: at the 60 the
+// app passes it returned "" with finish=length; at 120 (the overlay check's budget) the
+// same; only at 400 did it answer, using 354 completion tokens. Both call sites fail
+// SILENTLY BY DESIGN — detectSubjectFocus returns a centre crop, the overlay check
+// returns null — so face anchoring and burned-in-text rejection were quietly dead with
+// nothing in any log. Gating the floor on a model NAME left every non-gpt-5 judge here.
+// VISION_MIN_MAX_TOKENS overrides.
+const VISION_MIN_TOKENS = 400;
+
+function _visionCompletionBudget(model, maxTokens) {
+    const asked = Number(maxTokens) || 200;
+    const floor = _isReasoningModel(model)
+        ? (parseInt(process.env.VISION_MAX_TOKENS, 10) || VISION_REASONING_MIN_TOKENS)
+        : (parseInt(process.env.VISION_MIN_MAX_TOKENS, 10) || VISION_MIN_TOKENS);
+    return Math.max(asked, floor);
+}
+
+function _azureVisionTimeout(maxTokens) {
+    return parseInt(process.env.AZURE_VISION_TIMEOUT_MS, 10)
+        || parseInt(process.env.AZURE_TIMEOUT_MS, 10)
+        || Math.max(120_000, Math.min(420_000, 90_000 + (Number(maxTokens) || 200) * 35));
+}
+
+function _azureVisionLog(tag, model, started, usage, stop, text, budget) {
+    const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+    console.log(`  [${tag}] ${model} ${elapsed}s in=${usage.prompt_tokens || 0} out=${usage.completion_tokens || 0} stop=${stop}`);
+    if (!text) {
+        console.log(`  [${tag}] ⚠️ EMPTY response (stop=${stop})`);
+        // Naming the cap makes the "judge said nothing" case self-diagnosing: an
+        // empty answer that stopped at exactly its budget is a truncation, not a
+        // refusal, and the fix is VISION_MAX_TOKENS — not a different judge.
+        if (stop === 'length' && budget) {
+            const reasoning = usage.completion_tokens_details?.reasoning_tokens;
+            console.log(`  [${tag}] ⚠️ truncated at the completion cap (${budget} tokens`
+                + `${Number.isFinite(reasoning) ? `, ${reasoning} spent reasoning` : ''})`
+                + ' — raise VISION_MAX_TOKENS');
+        }
+    }
+}
+
+async function _azureOpenAIVision(prompt, base64Image, mimeType, maxTokens, opts) {
+    const az = config.azureOpenAI || {};
+    if (!az.apiKey) throw new Error('Azure OpenAI vision not configured: set AZURE_OPENAI_API_KEY or AZURE_API_KEY');
+    if (!az.baseUrl) throw new Error('Azure OpenAI vision not configured: set AZURE_OPENAI_ENDPOINT');
+
+    const axios = require('axios');
+    const model = process.env[opts.modelEnv] || opts.defaultModel;
+    const url = `${_azureOpenAIBaseUrl(az.baseUrl)}/chat/completions`;
+    const budget = _visionCompletionBudget(model, maxTokens);
+    const body = {
+        model,
+        ..._azureOpenAITuning(model, budget, undefined, 200),
+        messages: [{
+            role: 'user',
+            content: [
+                { type: 'text', text: String(prompt || '') },
+                { type: 'image_url', image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${base64Image}` } },
+            ],
+        }],
+    };
+
+    const started = Date.now();
+    try {
+        const resp = await _azureRetrying(opts.tag, model, 'vision', () => axios({
+            url, method: 'POST', data: body, adapter: 'http',
+            headers: { 'Content-Type': 'application/json', 'api-key': az.apiKey },
+            timeout: _azureVisionTimeout(budget),
+        }));
+        const choice = resp.data?.choices?.[0] || {};
+        const content = choice?.message?.content ?? choice?.text ?? '';
+        const text = Array.isArray(content)
+            ? content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('\n').trim()
+            : String(content || '').trim();
+        const usage = resp.data?.usage || {};
+        recordUsage({ provider: opts.tag, model, taskType: 'vision', kind: 'vision', usage });
+        _azureVisionLog(opts.tag, model, started, usage, choice?.finish_reason || 'unknown', text, budget);
+        return text;
+    } catch (err) {
+        const status = err?.response?.status;
+        const data = err?.response?.data;
+        const detail = typeof data === 'string' ? data.slice(0, 200) : JSON.stringify(data || {}).slice(0, 200);
+        console.log(`  [${opts.tag}] ❌ ${model} http=${status || '?'} ${detail}`);
+        throw err;
+    }
+}
+
+// Wrapped by the SAME in-flight limiter as the Qwen lanes. Azure Managed Compute is a
+// hosted API, but "hosted" here means one deployment on a fixed number of accelerators —
+// it has exactly the finite queue a rented box has, not an elastic multi-tenant pool.
+// The number of instances is chosen at deploy time and Azure's H100 pool is often short:
+// on 2026-09-01 only 1 accelerator was free where the run wanted 8. At
+// MEDIA_SCENE_CONCURRENCY=32 that is ~160 scoring calls aimed at a single GPU, which
+// does not fail cleanly — it stretches latency until calls time out, and a timed-out
+// judge reads downstream as `unjudged`, i.e. silently worse footage rather than a visible
+// error. Cap is opt-in: unset/0 keeps the previous unlimited behaviour exactly.
+async function _azureManagedVision(prompt, base64Image, mimeType, maxTokens, opts) {
+    const release = await _acquireVisionSlot();
+    try { return await _azureManagedVisionInner(prompt, base64Image, mimeType, maxTokens, opts); }
+    finally { release(); }
+}
+
+async function _azureManagedVisionInner(prompt, base64Image, mimeType, maxTokens, opts) {
+    const am = config.azureManaged || {};
+    if (!am.apiKey) throw new Error('Azure Managed vision not configured: set AZURE_MANAGED_API_KEY');
+    if (!am.baseUrl) throw new Error('Azure Managed vision not configured: set AZURE_MANAGED_ENDPOINT');
+
+    const axios = require('axios');
+    // Vision uses the vision deployment when one is named, else the default (qwen)
+    // deployment — the brain model is text-only either way.
+    const model = am.visionModel || am.defaultModel || 'qwen--qwen38-27b';
+    const url = `${_azureOpenAIBaseUrl(am.baseUrl)}/chat/completions`;
+    const budget = _visionCompletionBudget(model, maxTokens);
+    const body = {
+        model,
+        ..._azureOpenAITuning(model, budget, undefined, 200),
+        messages: [{
+            role: 'user',
+            content: [
+                { type: 'text', text: String(prompt || '') },
+                { type: 'image_url', image_url: { url: `data:${mimeType || 'image/jpeg'};base64,${base64Image}` } },
+            ],
+        }],
+    };
+
+    const started = Date.now();
+    try {
+        const resp = await _azureRetrying('Azure Managed', model, 'vision', () => axios({
+            url, method: 'POST', data: body, adapter: 'http',
+            headers: { 'Content-Type': 'application/json', 'api-key': am.apiKey },
+            timeout: _azureVisionTimeout(budget),
+        }));
+        const choice = resp.data?.choices?.[0] || {};
+        const content = choice?.message?.content ?? choice?.text ?? '';
+        const text = Array.isArray(content)
+            ? content.map(p => (typeof p === 'string' ? p : p?.text || '')).join('\n').trim()
+            : String(content || '').trim();
+        const usage = resp.data?.usage || {};
+        recordUsage({ provider: 'azure-managed', model, taskType: 'vision', kind: 'vision', usage });
+        _azureVisionLog('Azure Managed', model, started, usage, choice?.finish_reason || 'unknown', text, budget);
+        return text;
+    } catch (err) {
+        const status = err?.response?.status;
+        const data = err?.response?.data;
+        const detail = typeof data === 'string' ? data.slice(0, 200) : JSON.stringify(data || {}).slice(0, 200);
+        console.log(`  [Azure Managed] ❌ ${model} http=${status || '?'} ${detail}`);
+        throw err;
+    }
+}
+
+async function _azureClaudeVision(prompt, base64Image, mimeType, maxTokens, opts) {
+    const az = config.azure || {};
+    if (!az.apiKey) throw new Error('Azure Claude vision not configured: set AZURE_API_KEY or AZURE_OPENAI_API_KEY');
+    if (!az.baseUrl) throw new Error('Azure Claude vision not configured: set AZURE_ANTHROPIC_BASE_URL or AZURE_OPENAI_ENDPOINT');
+
+    const axios = require('axios');
+    const model = process.env[opts.modelEnv] || opts.defaultModel;
+    const url = `${_azureAnthropicBaseUrl(az.baseUrl)}/v1/messages`;
+    const body = {
+        model,
+        max_tokens: maxTokens || 200,
+        messages: [{
+            role: 'user',
+            content: [
+                { type: 'image', source: { type: 'base64', media_type: mimeType || 'image/jpeg', data: base64Image } },
+                { type: 'text', text: String(prompt || '') },
+            ],
+        }],
+        stream: false,
+    };
+
+    const started = Date.now();
+    try {
+        const resp = await _azureRetrying(opts.tag, model, 'vision', () => axios({
+            url, method: 'POST', data: body, adapter: 'http',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': az.apiKey,
+                'anthropic-version': az.apiVersion || '2023-06-01',
+            },
+            timeout: _azureVisionTimeout(maxTokens),
+        }));
+        const text = _anthropicMessageText(resp.data);
+        const usage = {
+            prompt_tokens: resp.data?.usage?.input_tokens || 0,
+            completion_tokens: resp.data?.usage?.output_tokens || 0,
+        };
+        recordUsage({ provider: opts.tag, model, taskType: 'vision', kind: 'vision', usage });
+        _azureVisionLog(opts.tag, model, started, usage, resp.data?.stop_reason || 'unknown', text);
+        return text;
+    } catch (err) {
+        const status = err?.response?.status;
+        const data = err?.response?.data;
+        const detail = typeof data === 'string' ? data.slice(0, 200) : JSON.stringify(data || {}).slice(0, 200);
+        console.log(`  [${opts.tag}] ❌ ${model} http=${status || '?'} ${detail}`);
+        throw err;
     }
 }
 
@@ -4261,6 +5128,21 @@ async function callVideoAI(prompt, frames, options = {}) {
         });
     }
 
+    // Eyes on an AI Connection: every frame goes in ONE request, the way the
+    // OpenAI-compatible API carries several images.
+    const eyes = aiConnections.routeForJob('eyes');
+    if (eyes) {
+        for (const conn of eyes.connections) {
+            try {
+                const text = await _connectionVision(conn.id, prompt, frames.map((frame) => ({ base64: frame.base64, mimeType: frame.mimeType || 'image/jpeg' })), maxTokens);
+                if (text && text.trim()) return text;
+            } catch (err) {
+                console.log(`  [AI:${conn.label}] multi-frame look failed: ${err.message}`);
+            }
+        }
+        if (!eyes.builtInBackup) return '';
+    }
+
     const visionChain = _getVisionChain();
 
     const tryBedrockVideoChain = async () => {
@@ -4390,6 +5272,7 @@ module.exports = {
     revalidateExhaustedVisionModels,
     isVisionAIAvailable,
     getVisionProviderChain,
+    isVisionProviderUsable,
     // Vision providers this run has proven permanently unusable (403 / bad model
     // id). Lets a caller surface "your judge is dead" instead of quietly scoring
     // with a backup.
@@ -4399,6 +5282,13 @@ module.exports = {
     // and the "null for transient" half is the important half: an over-eager
     // classifier would retire a healthy judge over one timeout.
     classifyVisionFailure: _permanentVisionFailure,
+    // Effective completion cap for a text call, after the reasoning-model floor.
+    // Exported so the floor can be proven without spending a call: (routeEntry, task,
+    // askedMaxTokens) → the number that actually reaches max_completion_tokens.
+    textCompletionBudget: _textCompletionBudget,
+    // Which route a task would take right now, without sending anything — the
+    // AI Connections gate proves "built-in stays built-in" with this.
+    textRouteFor: (taskType) => _getTextRoute(config.aiProvider || 'bedrock', { taskType }),
     setAIThinking,
     setGeminiThinking,
     getAIThinking,

@@ -19,6 +19,24 @@
 
 const fs = require('fs');
 const path = require('path');
+const { AsyncLocalStorage } = require('async_hooks');
+
+// WHY a call was made, for the report only. A caller wraps its work in
+// withCostPurpose('race-candidate', () => ...) and every AI call made inside it —
+// however deep, across awaits — is also counted under `byPurpose` as
+// "<task>:<purpose>". It never touches routing, the taskType, or the byTask
+// numbers: "vision" stays one line in byTask exactly as before, and byPurpose
+// says which part of the build those vision calls were spent on. The innermost
+// label wins, so a stage can refine the label its caller set.
+const _purposeStore = new AsyncLocalStorage();
+function withCostPurpose(purpose, fn) {
+    const label = String(purpose || '').trim();
+    if (!label || typeof fn !== 'function') return fn();
+    return _purposeStore.run(label, fn);
+}
+function currentCostPurpose() {
+    return _purposeStore.getStore() || '';
+}
 
 // USD per 1M tokens. cachedIn = rate for cached input tokens (defaults to in if unset).
 // These are starting estimates — set your real rates via COST_PRICES / cost-prices.json.
@@ -95,6 +113,7 @@ let _run = {
     byProvider: {},   // "ailink" -> bucket
     byModel: {},      // "ailink:gpt-5.5" -> bucket
     byTask: {},       // "planner-large" -> bucket
+    byPurpose: {},    // "vision:race-candidate" -> bucket (only calls made inside withCostPurpose)
     unpriced: {},     // "model" -> { calls, inTokens, outTokens }
 };
 
@@ -105,7 +124,7 @@ function _add(b, inTok, outTok, cachedIn, reasoning, usd) {
 }
 
 function resetCosts() {
-    _run = { startedAt: Date.now(), total: _fresh(), byProvider: {}, byModel: {}, byTask: {}, unpriced: {} };
+    _run = { startedAt: Date.now(), total: _fresh(), byProvider: {}, byModel: {}, byTask: {}, byPurpose: {}, unpriced: {} };
     reloadPrices();
 }
 
@@ -142,6 +161,8 @@ function recordUsage(entry = {}) {
     _add(_bucket(_run.byProvider, provider), inTok, outTok, cachedIn, reasoning, usd);
     _add(_bucket(_run.byModel, `${provider}:${model}`), inTok, outTok, cachedIn, reasoning, usd);
     _add(_bucket(_run.byTask, task), inTok, outTok, cachedIn, reasoning, usd);
+    const purpose = currentCostPurpose();
+    _add(_bucket(_run.byPurpose, `${task}:${purpose || 'unlabelled'}`), inTok, outTok, cachedIn, reasoning, usd);
 }
 
 function getCostReport() {
@@ -167,6 +188,11 @@ function logCostReport(log = console.log) {
         log(`   By task:`);
         for (const [name, b] of tasks) log(`     ${name.padEnd(22)} ${_usd(b.usd).padStart(11)}  (${b.calls})`);
     }
+    const purposes = Object.entries(r.byPurpose || {}).sort((a, b) => b[1].calls - a[1].calls);
+    if (purposes.some(([name]) => !name.endsWith(':unlabelled'))) {
+        log(`   By purpose (what the calls were for):`);
+        for (const [name, b] of purposes) log(`     ${name.padEnd(34)} ${_usd(b.usd).padStart(11)}  (${b.calls})`);
+    }
     const unpriced = Object.entries(r.unpriced);
     if (unpriced.length) {
         log(`   ⚠️  No price set (tokens counted, $ not — add to COST_PRICES / cost-prices.json):`);
@@ -182,4 +208,4 @@ function writeCostReport(filePath) {
     } catch (e) { console.warn(`[Cost] could not write report: ${e.message}`); return false; }
 }
 
-module.exports = { recordUsage, resetCosts, getCostReport, logCostReport, writeCostReport, reloadPrices, DEFAULT_PRICES };
+module.exports = { recordUsage, resetCosts, getCostReport, logCostReport, writeCostReport, reloadPrices, withCostPurpose, currentCostPurpose, DEFAULT_PRICES };

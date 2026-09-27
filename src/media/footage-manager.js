@@ -61,6 +61,7 @@ const {
     rankCandidateFinalists,
 } = require('./candidate-finalist-scout');
 const { runCandidateRace, getProviderConcurrency } = require('./candidate-race');
+const { withCostPurpose } = require('../brain/cost-tracker');
 const providerScoreboard = require('./provider-scoreboard');
 const downloadPatience = require('./download-patience');
 const {
@@ -5260,7 +5261,15 @@ function reorderProviders(allProviders, priorityOrder, sourceMap, excludedKeys =
     return ordered;
 }
 
-async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 10, sourceHint = '', nicheId = '', scene = null, options = {}) {
+// Every AI look taken while fetching a scene's media is counted under the
+// "footage" purpose in the cost report; the race, the preview grid and the
+// storyboard refine that label for their own calls. Report-only — see
+// withCostPurpose() in brain/cost-tracker.js.
+function downloadMedia(...args) {
+    return withCostPurpose('footage', () => _downloadMediaUnlabelled(...args));
+}
+
+async function _downloadMediaUnlabelled(keyword, mediaType, filenameBase, sceneDuration = 10, sourceHint = '', nicheId = '', scene = null, options = {}) {
     if (filenameBase && options.cleanupRaceScratch !== false) {
         const removedRaceScratch = cleanupSceneRaceTempMedia(filenameBase);
         if (removedRaceScratch > 0) {
@@ -6084,6 +6093,11 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
             // to learn the same thing twice. A future provider that grows its
             // own look just sets this flag.
             let preDownloadLookApplied = false;
+            // What the Thumbnail Screen said about each candidate of THIS search
+            // (keyed by the result object, so a later search's results can never
+            // inherit it). The race uses it to keep declined candidates out of the
+            // first batches — see candidate-race.js "Screen-aware racing".
+            let thumbnailScreenVerdicts = null;
             if (mediaType === 'video' && visualContract?.enabled) {
                 let storyblocksThumbnailVisionApplied = false;
 
@@ -6470,6 +6484,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                         getThumbUrl: (result) => result?._thumbUrl || result?.thumbUrl || '',
                     });
                     if (screen.log) console.log(screen.log);
+                    thumbnailScreenVerdicts = screen.verdicts instanceof Map && screen.verdicts.size ? screen.verdicts : null;
                     if (screen.saw > 0) {
                         // Same meaning as every other pre-download look in this
                         // file — a cheap glance confirmed the subject — so it
@@ -6504,13 +6519,13 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                 && visualContract?.enabled
                 && hasSceneBudget(FINALIST_SCOUT_MIN_BUDGET_MS, `${provider.name} finalist scout`)) {
                 try {
-                    const finalistScout = await rankCandidateFinalists(results, scene, visualContract, {
+                    const finalistScout = await withCostPurpose('finalist-scout', () => rankCandidateFinalists(results, scene, visualContract, {
                         providerKey,
                         providerName: provider.name,
                         query: searchQuery,
                         mediaAgent: mediaAgentPlan,
                         hunterProfile,
-                    });
+                    }));
                     if (finalistScout.log) {
                         console.log(`  ${finalistScout.log}`);
                         _recordMediaProvider(scene, {
@@ -7395,7 +7410,9 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                 }
                 const raceWinner = await runCandidateRace({
                     candidates: racePool,
-                    processOne: raceProcessOne,
+                    // Labelled so the cost report can say how many vision calls
+                    // went into judging downloaded race candidates.
+                    processOne: (candidate, attempt, control) => withCostPurpose('race-candidate', () => raceProcessOne(candidate, attempt, control)),
                     providerKey,
                     concurrency: raceConcurrency,
                     maxBatches: raceMaxBatches,
@@ -7429,6 +7446,7 @@ async function downloadMedia(keyword, mediaType, filenameBase, sceneDuration = 1
                         visualContract,
                     },
                     shouldStop: () => isAborted(),
+                    screenVerdicts: thumbnailScreenVerdicts,
                 });
 
                 if (raceWinner && raceWinner.accepted) {

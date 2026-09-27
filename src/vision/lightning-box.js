@@ -54,6 +54,12 @@ function _accountEnv(acct) {
     };
 }
 
+// How long a caller is willing to sit waiting for a cooling account. Anything longer and
+// falling back to Bedrock now beats a GPU that arrives after the media phase is over.
+function _poolWaitBudgetMs() {
+    return Math.max(0, Number(process.env.LIGHTNING_POOL_WAIT_BUDGET_MS || 60000));
+}
+
 function isConfigured() {
     if (String(process.env.VISION_BACKEND || '').toLowerCase() !== 'lightning') return false;
     // Pooled: configured if the pool has at least one account.
@@ -277,6 +283,20 @@ async function _startWith(env, log) {
  */
 async function ensureReady({ onProgress } = {}) {
     const log = onProgress || (() => {});
+    // Belt and braces: isConfigured() already requires VISION_BACKEND=lightning, and
+    // vision-gpu only ever loads this module for that backend. Assert it here anyway,
+    // because the cost of a caller reaching this function by another route is minutes of
+    // a build spent booting a GPU nobody asked for — the exact failure of 2026-08-27,
+    // where the brain was switched to Azure Managed and Lightning woke up regardless.
+    // A start is expensive and billable; the guard belongs at the thing that spends.
+    const backend = String(process.env.VISION_BACKEND || '').toLowerCase();
+    if (backend !== 'lightning') {
+        return {
+            ok: false,
+            retryable: false,
+            reason: `Lightning is not the selected vision backend (VISION_BACKEND=${backend || 'unset'}) — refusing to start a Studio`,
+        };
+    }
     if (!isConfigured()) {
         return { ok: false, reason: 'Lightning not configured (need an account pool or LIGHTNING_API_KEY/USER_ID/STUDIO_NAME)' };
     }
@@ -286,7 +306,23 @@ async function ensureReady({ onProgress } = {}) {
         const tried = new Set();
         const failures = [];
         let acct = rotation.pickAccount();
-        if (!acct) return { ok: false, reason: 'all Lightning accounts are exhausted or cooling down' };
+        if (!acct) {
+            // Nothing to hand out. Whether waiting could ever help is arithmetic, not a
+            // guess: report it so the caller stops instead of retrying a pool that cannot
+            // change. Retrying only ever pays off for the 45s env-error cooldown — the
+            // 15-minute failure cooldown outlives the whole retry budget, and `exhausted`
+            // outlives the build. See rotation.nextViableAt().
+            const next = rotation.nextViableAt();
+            const retryable = next.soonestMs !== null && next.soonestMs <= _poolWaitBudgetMs();
+            return {
+                ok: false,
+                reason: `all Lightning accounts are exhausted or cooling down (${next.detail}`
+                    + (next.soonestMs === null ? ', none recover this cycle)'
+                        : `, soonest in ${Math.ceil(next.soonestMs / 1000)}s)`),
+                retryable,
+                retryAfterMs: retryable ? next.soonestMs : undefined,
+            };
+        }
         while (acct && !tried.has(acct.id)) {
             tried.add(acct.id);
             const st = rotation.status().find((s) => s.id === acct.id);

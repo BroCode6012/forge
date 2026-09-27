@@ -3015,6 +3015,12 @@ async function buildVideo() {
         ? await require('../media/fast-stock-media').fastTestMedia(mediaDownloadScenes, { log: (m) => log.info(m), tempDir: config.paths.temp })
         : await downloadAllMedia(mediaDownloadScenes, scriptContext, { label: 'scene media' });
     let scenesWithMedia = downloadResult.scenes;
+    // How the footage races spent their downloads and vision calls — the numbers
+    // that say whether screen-aware racing is paying for itself on this build.
+    try {
+        const raceEconomy = require('../media/candidate-race').describeRaceEconomy();
+        if (raceEconomy) raceEconomy.split(/\r?\n/).forEach((line) => log.info(line));
+    } catch (_) { /* observability only */ }
 
     // Talking-head: presenter-anchor HOLD scenes were filtered out of the download set
     // above (download:'skip', no keyword, no fullscreenMG) — but they ARE base V1 scenes
@@ -4997,6 +5003,12 @@ async function buildVideo() {
     log.timing('Total time', elapsed);
     logCostReport(console.log);
     writeCostReport(path.join(PROJECT_DIR, 'cost-report.json'));
+    try {
+        const raceEconomy = require('../media/candidate-race').getRaceEconomy();
+        if (raceEconomy.races) {
+            fs.writeFileSync(path.join(PROJECT_DIR, 'race-economy.json'), JSON.stringify(raceEconomy, null, 2), 'utf8');
+        }
+    } catch (_) { /* observability only */ }
     log.kv('Audio', audioFile);
     log.kv('Duration', `${videoPlan.totalDuration.toFixed(2)} seconds`);
     log.kv('Scenes', `${scenesWithMedia.length} footage + ${mgScenes.length} full-screen MG + ${v2ScenesForPlan.length} V2 overlays`);

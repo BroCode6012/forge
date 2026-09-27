@@ -8,6 +8,7 @@
  *   2. text collisions — text elements overlapping each other
  *   3. invisible text  — elements still at ~0 opacity at the hero frame
  *   4. title-safe area — text sitting where YouTube's own chrome will cover it
+ *   5. text contrast   — the composited colour behind each word vs the word
  * Violations come back as lint errors with the offending text + numbers, so
  * the author's repair round gets concrete, fixable feedback.
  *
@@ -18,6 +19,12 @@
 'use strict';
 
 const fs = require('fs');
+// Thresholds belong to the checker that owns them. hf-slop-lint has no
+// requires of its own, so this cannot cycle.
+const { VIDEO } = require('./hf-slop-lint');
+
+let getThemeTokens = null;
+try { ({ getThemeTokens } = require('../data/themes')); } catch (_) { getThemeTokens = null; }
 
 const CHROME_CANDIDATES = [
     process.env.CHROME_PATH,
@@ -60,6 +67,112 @@ const TITLE_SAFE = {
     edgePx: 40,
 };
 
+/**
+ * Contrast — why this has to be measured here and cannot live in the CSS.
+ *
+ * The textual checker owns a `low-contrast-on-video` rule, and it can only see
+ * a colour and a background that are written in the SAME CSS block. Real
+ * compositions almost never do that: the card declares the background, a child
+ * declares the text, and a wrapper somewhere in between declares a translucent
+ * wash that changes both. Nothing in the stylesheet says what colour actually
+ * ends up behind a word — only the rendered page knows.
+ *
+ * That gap shipped. The 2026-08-05 build put cream text (#f7f1e5) on a cream
+ * card (#ece0c8) and nothing objected, because the two values lived in
+ * different blocks. Composited, that is a contrast ratio of 1.16 against a
+ * floor of 3.0 — the words were there and could not be read.
+ *
+ * WHAT IS AND IS NOT JUDGED
+ *
+ * Only a stack that is opaque enough to be knowable. Every background layer
+ * from the composition root down to the element is composited, and the element
+ * is judged only if the result is at least MIN_BACKDROP_ALPHA opaque. Below
+ * that, live footage is showing through and the true backdrop is whatever the
+ * editor's clip happens to be — unknowable at author time, so no accusation is
+ * made. The harness's own stage colour is deliberately excluded from the
+ * accumulation for the same reason: it is scaffolding, not a design decision.
+ *
+ * A stack containing a background-image is skipped outright. A gradient or a
+ * photo has no single colour, and picking one would be inventing evidence.
+ *
+ * Only ANCESTORS are composited, never siblings. A full-bleed plate painted as
+ * a sibling underneath the text is not counted, so that shape can still slip
+ * through. Resolving it properly would mean hit-testing the paint order, and
+ * the one tool for that (`elementsFromPoint`) silently skips anything with
+ * `pointer-events: none` — which is exactly what the render page sets on every
+ * graphic. A checker that quietly drops layers would accuse compositions that
+ * render fine, so the rule stays narrower and honest: it under-reports rather
+ * than invent. Every failure it does report is real.
+ *
+ * The floors are the checker's, split at the checker's own display size. No
+ * text-shadow allowance: a glow can rescue a word on a still and still smear
+ * into mush once the encoder has finished with it.
+ */
+const MIN_BACKDROP_ALPHA = 0.85;
+
+/** Everything the in-page contrast pass needs, so no number is restated there. */
+const CONTRAST = {
+    minBackdropAlpha: MIN_BACKDROP_ALPHA,
+    minBody: VIDEO.CONTRAST_MIN_BODY,
+    minDisplay: VIDEO.CONTRAST_MIN_DISPLAY,
+    displayPx: VIDEO.DISPLAY_SIZE_PX,
+    maxReports: 2,
+};
+
+/**
+ * The theme's CSS variables, exactly as the real render page defines them.
+ *
+ * WITHOUT THIS THE HARNESS IS COLOUR-BLIND. Authored compositions are told to
+ * paint from `var(--hf-text)` / `var(--hf-surface)` / `var(--hf-primary)`, and
+ * the render page declares those on its root. This page did not, so every
+ * theme-driven colour resolved to nothing: text fell back to the browser
+ * default black and surfaces came out fully transparent. The geometry checks
+ * survived that because they only read boxes — a contrast check cannot, and
+ * neither could the perfectionist vision review, which has been grading a
+ * screenshot of the composition painted in the wrong colours.
+ *
+ * The wiring is NOT the theme's own key names. The render page points
+ * `--hf-primary` at `mgPrimary || primary`, and on some themes those sit 150°
+ * apart on the colour wheel. `hf-author-repair.js:_themeVarPalette` documents
+ * that trap in full and carries the same table; `scripts/verify/author-rescue.js`
+ * fails the build if the two ever drift apart.
+ */
+function _themeVarBlock(themeId) {
+    let theme = null;
+    try { theme = (getThemeTokens && themeId) ? getThemeTokens(themeId) : null; } catch (_) { theme = null; }
+    if (!theme) return '';
+    const c = theme.colors || {};
+    const ty = theme.typography || {};
+    const ch = theme.chrome || {};
+    const shadow = c.shadow || 'rgba(0,0,0,0.4)';
+    const decls = [
+        ['--hf-primary', c.mgPrimary || c.primary],
+        ['--hf-accent', c.mgAccent || c.accent],
+        ['--hf-text', c.textPrimary],
+        ['--hf-muted', c.textSecondary],
+        ['--hf-surface', c.surface],
+        ['--hf-bg', ch.bg || c.background],
+        ['--hf-shadow-color', shadow],
+        ['--hf-shadow', `0 ${ch.shadowOffsetY || 4}px ${ch.shadowBlur || 18}px ${shadow}`],
+        ['--hf-radius', `${ch.borderRadius == null ? 12 : ch.borderRadius}px`],
+        ['--hf-stroke', `${ch.strokeWidth == null ? 2 : ch.strokeWidth}px`],
+        ['--hf-heading-font', ty.headingFont],
+        ['--hf-body-font', ty.bodyFont],
+        ['--hf-caption-font', ty.captionFont || ty.bodyFont],
+        // The render page wraps every authored composition in `.hf-mg`, which
+        // declares these two. A composition that never states a colour inherits
+        // the theme's ink there — so it must inherit it here too, or the
+        // contrast pass would measure the browser's default black and accuse a
+        // composition that renders perfectly well.
+        ['color', 'var(--hf-text)'],
+        ['font-family', 'var(--hf-body-font)'],
+    ];
+    return decls
+        .filter(([, v]) => v != null && String(v).trim())
+        .map(([k, v]) => `${k}: ${String(v).replace(/[;{}]/g, '')};`)
+        .join(' ');
+}
+
 let _browserPromise = null;
 
 async function _getBrowser() {
@@ -98,10 +211,10 @@ function _loadGsap() {
     return _gsapSrc;
 }
 
-function _page(html, css, timeline) {
+function _page(html, css, timeline, themeVars) {
     return `<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
 html,body{margin:0;padding:0;background:#05080f;}
-#stage{position:relative;width:1920px;height:1080px;overflow:visible;}
+#stage{position:relative;width:1920px;height:1080px;overflow:visible;${themeVars || ''}}
 ${css}
 </style></head><body><div id="stage">${html}</div>
 <script>${_loadGsap()}</script>
@@ -127,7 +240,10 @@ async function visualLint(comp, ns, duration, opts = {}) {
     let page;
     try {
         page = await browser.newPage();
-        await page.setContent(_page(comp.html, comp.css, comp.timeline), { waitUntil: 'load', timeout: 15000 });
+        await page.setContent(
+            _page(comp.html, comp.css, comp.timeline, _themeVarBlock(opts.themeId)),
+            { waitUntil: 'load', timeout: 15000 },
+        );
 
         // ── Entrance check: at t≈0 the comp must NOT already show its
         // finished layout. With the timeline primed, a comp whose every text
@@ -163,9 +279,64 @@ async function visualLint(comp, ns, duration, opts = {}) {
 
         await page.evaluate((t) => { if (window.__tl) window.__tl.time(t); }, Math.max(0.1, duration * 0.45));
         await new Promise(r => setTimeout(r, 250));
-        const errors = await page.evaluate((SAFE) => {
+        const errors = await page.evaluate((SAFE, CT) => {
             const out = [];
             const stage = document.getElementById('stage');
+
+            // ── Contrast helpers. Straight (non-premultiplied) rgba throughout.
+            const rgba = (v) => {
+                const m = String(v || '').match(/rgba?\(([^)]+)\)/i);
+                if (!m) return null;
+                const p = m[1].split(',').map(s => parseFloat(s));
+                if (p.length < 3 || p.slice(0, 3).some(n => !isFinite(n))) return null;
+                const a = p.length > 3 && isFinite(p[3]) ? p[3] : 1;
+                return { r: p[0], g: p[1], b: p[2], a };
+            };
+            // `top` painted over `base` — plain source-over.
+            const over = (top, base) => {
+                const a = top.a + base.a * (1 - top.a);
+                if (a <= 0) return { r: 0, g: 0, b: 0, a: 0 };
+                const mix = (t, b) => (t * top.a + b * base.a * (1 - top.a)) / a;
+                return { r: mix(top.r, base.r), g: mix(top.g, base.g), b: mix(top.b, base.b), a };
+            };
+            const lum = (c) => {
+                const ch = (v) => { const s = Math.max(0, Math.min(255, v)) / 255; return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4); };
+                return 0.2126 * ch(c.r) + 0.7152 * ch(c.g) + 0.0722 * ch(c.b);
+            };
+            const ratio = (a, b) => {
+                const x = lum(a), y = lum(b);
+                return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+            };
+            const hex = (c) => '#' + [c.r, c.g, c.b]
+                .map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
+            /**
+             * Everything painted behind this element's own text, composited
+             * bottom-first. Starts at #stage and walks down to the element, so
+             * a card's background and any wrapper wash are both counted. Stops
+             * at #stage on purpose: body carries the harness's own colour,
+             * which is scaffolding, not a design decision.
+             */
+            const backdropOf = (el) => {
+                const chain = [];
+                for (let n = el; n && n !== document.body; n = n.parentElement) chain.push(n);
+                chain.reverse();
+                let bg = { r: 0, g: 0, b: 0, a: 0 };
+                let cum = 1;
+                for (const n of chain) {
+                    const cs = getComputedStyle(n);
+                    const o = parseFloat(cs.opacity);
+                    cum *= isFinite(o) ? o : 1;
+                    // A gradient or a photo has no single colour. Guessing one
+                    // would be inventing the evidence, so the stack is dropped.
+                    if (cs.backgroundImage && cs.backgroundImage !== 'none') return null;
+                    const c = rgba(cs.backgroundColor);
+                    if (!c || c.a <= 0) continue;
+                    bg = over({ r: c.r, g: c.g, b: c.b, a: c.a * cum }, bg);
+                }
+                return bg;
+            };
+            let contrastReports = 0;
+
             const els = [...stage.querySelectorAll('*')].filter(el => {
                 if (el.tagName === 'STYLE' || el.tagName === 'SCRIPT') return false;
                 const direct = [...el.childNodes].some(n => n.nodeType === 3 && n.textContent.trim().length > 1);
@@ -207,6 +378,31 @@ async function visualLint(comp, ns, duration, opts = {}) {
                         out.push(`text "${label}" runs to within ${Math.round(Math.min(r.left, 1920 - r.right))}px of the frame edge — keep a ${SAFE.edgePx}px margin so it survives rounded corners and safe-area cut-ins`);
                     }
                 }
+                // 5. contrast against what is ACTUALLY behind the word.
+                if (contrastReports < CT.maxReports) {
+                    const bg = backdropOf(el);
+                    // Below the alpha floor the footage is showing through and
+                    // the true backdrop is the editor's clip — unknowable here,
+                    // so nothing is claimed.
+                    if (bg && bg.a >= CT.minBackdropAlpha) {
+                        const cs = getComputedStyle(el);
+                        // A transparent fill is gradient type; the textual
+                        // gradient-text rule owns that and there is no colour
+                        // here to measure.
+                        const fill = rgba(cs.webkitTextFillColor) || rgba(cs.color);
+                        if (fill && fill.a > 0.02) {
+                            const solid = { r: bg.r, g: bg.g, b: bg.b, a: 1 };
+                            const ink = over(fill, solid);
+                            const size = parseFloat(cs.fontSize) || 0;
+                            const floor = size >= CT.displayPx ? CT.minDisplay : CT.minBody;
+                            const cr = ratio(ink, solid);
+                            if (cr < floor) {
+                                contrastReports++;
+                                out.push(`text "${label}" is unreadable: ${hex(ink)} on ${hex(solid)} measures ${cr.toFixed(2)}:1, under the ${floor}:1 floor for ${size >= CT.displayPx ? 'display' : 'body'} type — this is measured from the rendered pixels, not the stylesheet, so a near-identical pair like cream-on-cream is caught even when the two colours live in different rules. Darken the surface or lighten the type until they separate.`);
+                            }
+                        }
+                    }
+                }
             }
             // 2. text-on-text collisions (skip ancestor/descendant pairs)
             for (let i = 0; i < visible.length; i++) for (let j = i + 1; j < visible.length; j++) {
@@ -222,7 +418,7 @@ async function visualLint(comp, ns, duration, opts = {}) {
             }
             if (window.__tlErr) out.push(`timeline threw at runtime: ${window.__tlErr}`);
             return out.slice(0, 6);
-        }, TITLE_SAFE);
+        }, TITLE_SAFE, CONTRAST);
 
         // ── Overlay coverage (OVERLAY MODE): the comp floats on live footage.
         // Measured at the hero frame: union of painted/text element rects on
@@ -287,18 +483,26 @@ async function visualLint(comp, ns, duration, opts = {}) {
 }
 
 /**
- * captureHeroFrame(comp, ns, duration) → base64 JPEG of the rendered hero
+ * captureHeroFrame(comp, ns, duration, opts) → base64 JPEG of the rendered hero
  * frame (timeline primed + seeked to 45%), or null if Chrome is unavailable.
  * Used by the author's perfectionist pass: the vision model reviews the
  * ACTUAL rendered pixels like an art director.
+ *
+ * opts.themeId matters more here than anywhere else. Without it every
+ * theme-driven colour resolves to nothing and the art director is handed a
+ * screenshot in the wrong palette — it would praise or condemn colours the
+ * viewer will never see.
  */
-async function captureHeroFrame(comp, ns, duration) {
+async function captureHeroFrame(comp, ns, duration, opts = {}) {
     const browser = await _getBrowser();
     if (!browser) return null;
     let page;
     try {
         page = await browser.newPage();
-        await page.setContent(_page(comp.html, comp.css, comp.timeline), { waitUntil: 'load', timeout: 15000 });
+        await page.setContent(
+            _page(comp.html, comp.css, comp.timeline, _themeVarBlock(opts.themeId)),
+            { waitUntil: 'load', timeout: 15000 },
+        );
         await page.evaluate((t) => { if (window.__tl) window.__tl.time(t); }, Math.max(0.1, duration * 0.45));
         await new Promise(r => setTimeout(r, 250));
         const buf = await page.screenshot({ type: 'jpeg', quality: 80, clip: { x: 0, y: 0, width: 1920, height: 1080 } });
@@ -310,4 +514,10 @@ async function captureHeroFrame(comp, ns, duration) {
     }
 }
 
-module.exports = { visualLint, captureHeroFrame, closeVisualLint, TITLE_SAFE };
+module.exports = {
+    visualLint, captureHeroFrame, closeVisualLint,
+    TITLE_SAFE, CONTRAST,
+    // Exported so a verify gate can prove this wiring still matches the one the
+    // repair pass substitutes from. They must never disagree.
+    themeCssVars: _themeVarBlock,
+};

@@ -14,13 +14,18 @@
 //   1. decision agreement — the build accepts at >=6, so what matters is not
 //      the exact number but whether the model lands on the same side of that
 //      line a careful human does.
-//   2. rule compliance    — three cases are traps: images that LOOK like a
-//      perfect topical match but must be rejected on a rule (illustration,
-//      supplier watermark, editorial caption). A judge that only does topic
+//   2. rule compliance    — several cases are traps: images that LOOK like a
+//      perfect topical match but must be rejected on a rule (illustration or
+//      text slide, supplier watermark, AI render). A judge that only does topic
 //      matching passes them and poisons the video.
 //   3. brief reading      — one image appears twice against two different
 //      scenes. Same pixels, opposite correct answers. A model that scores
 //      generic image quality gets exactly one of them right.
+//   3b. over-literalism   — two PASS cases are deliberately imperfect matches
+//      (a phone whose screen is not visible; a brick suburban house that is not
+//      literally 1970s). This is the axis that failed in production: a judge
+//      demanding every noun of the brief appear in the pixels rejects everything
+//      and every scene falls back to a placeholder card.
 //   4. latency            — median ms per scored frame.
 //   5. contract cost      — parseError (broke the 2-line reply contract) and
 //      scoreRetried (needed a second paid call), both from the real parser.
@@ -46,49 +51,62 @@ const { spawnSync } = require('child_process');
 
 const PROJECT = process.env.BENCH_PROJECT_DIR
     || path.join(process.env.USERPROFILE || process.env.HOME || '', 'Downloads', '300$ Test');
-const FRAMES = path.join(PROJECT, 'temp');
+// The first labelled set lived in <project>/temp and was wiped by the next
+// build's Step 0 temp clean, which silently disarmed this bench. The set now
+// lives in a sibling folder no build step touches; temp is only a fallback for
+// a project where the frames have not been promoted yet.
+const FRAMES_DIR_CANDIDATES = [
+    path.join(PROJECT, '.bench-frames'),
+    path.join(PROJECT, 'temp'),
+];
+const FRAMES = FRAMES_DIR_CANDIDATES.find((d) => fs.existsSync(d)) || FRAMES_DIR_CANDIDATES[0];
 
 // ── the models worth deciding between ──
 // `via` selects which provider branch shapes the request; all three model envs
 // get pinned regardless, so a fallback hop can only re-call the same model.
+//
+// Round 2 (2026-08-05). Dropped: Haiku 4.5 and Pixtral Large — round 1 proved
+// both degenerate (0/3 good kept, Pixtral also errored on 7/9). Not available
+// on this account at all, despite appearing in the AWS quota tables: Gemma 3
+// and Nemotron Nano 2 VL (absent from ListFoundationModels).
+// Qwen3-VL is kept deliberately as a CONTROL: it was degenerate on the round-1
+// frames, so if it suddenly aces this set the new labels are wrong, not the model.
 const CANDIDATES = [
-    { id: 'us.anthropic.claude-haiku-4-5-20251001-v1:0', via: 'bedrock-claude', label: 'Haiku 4.5' },
-    { id: 'us.anthropic.claude-sonnet-4-6', via: 'bedrock-claude', label: 'Sonnet 4.6' },
-    { id: 'qwen.qwen3-vl-235b-a22b', via: 'bedrock-qwen-vl', label: 'Qwen3-VL 235B (incumbent)' },
-    { id: 'us.amazon.nova-lite-v1:0', via: 'bedrock-nova', label: 'Nova Lite (cheap floor)' },
-    { id: 'us.mistral.pixtral-large-2502-v1:0', via: 'bedrock-claude', label: 'Pixtral Large' },
+    { id: 'us.anthropic.claude-sonnet-4-6', via: 'bedrock-claude', label: 'Sonnet 4.6 (quality ref)' },
+    { id: 'qwen.qwen3-vl-235b-a22b', via: 'bedrock-qwen-vl', label: 'Qwen3-VL 235B (control)' },
+    { id: 'us.amazon.nova-lite-v1:0', via: 'bedrock-nova', label: 'Nova Lite' },
+    { id: 'us.amazon.nova-pro-v1:0', via: 'bedrock-nova', label: 'Nova Pro' },
+    { id: 'us.amazon.nova-premier-v1:0', via: 'bedrock-nova', label: 'Nova Premier' },
+    { id: 'amazon.nova-2-lite-v1:0', via: 'bedrock-nova', label: 'Nova 2 Lite' },
 ];
 
 // ── real scene briefs, copied verbatim out of the build's own plan ──
+// Source: <project>/.build-checkpoint.json, scenes 0 / 1 / 5 / 7 of the
+// 2026-08-05 build. Not paraphrased — the judge must be tested against the
+// exact wording the pipeline actually hands it, including its awkward bits.
 const SCENES = {
     amishFarmhouse: {
-        keyword: 'Amish farmhouse Holmes County Ohio tunnel foundation',
-        visualIntent: 'Wide establishing shot of a rustic Amish farmhouse in Holmes County Ohio, dark earthy tones, low angle showing the foundation base suggesting underground structure, moody pre-dawn light',
+        keyword: 'Holmes County Ohio Amish farmhouse aerial',
+        visualIntent: 'Wide establishing shot of a traditional Amish farmhouse in Holmes County Ohio, green rolling hills, stone or earthen foundation visible, mysterious and documentary tone',
         sceneText: "You're standing at the mouth of a tunnel that runs underneath an Amish farmhouse in Holmes County Ohio.",
         sourceHint: 'web-image',
     },
-    earthTube: {
-        keyword: 'earth tube cooling air temperature',
-        visualIntent: 'Close-up of air flowing from a pipe embedded in a wall or ground, thermometer visible reading near 55F, no mechanical equipment in frame, clean documentary shot',
+    tunnelWalls: {
+        keyword: 'earth tube geothermal tunnel walls',
+        visualIntent: 'Close-up of bare earthen or concrete tunnel walls with no wiring, no compressor, no thermostat visible — pure raw underground passage with cool dark atmosphere',
         sceneText: 'No wires, no compressor, no thermostat, and the air coming out of it is 55 degrees in the middle of August.',
-        sourceHint: 'youtube',
-    },
-    amishFarmstead: {
-        keyword: 'Amish farmstead hand-built Holmes County',
-        visualIntent: 'Archival-style wide shot of a traditional Amish wooden farmstead in Holmes County, warm sepia tones, hand-crafted wooden structures, fields in background, timeless pastoral atmosphere',
-        sceneText: 'The Amish have been building it for 200 years.',
         sourceHint: 'web-image',
     },
-    vintageAc: {
-        keyword: '1930s air conditioning unit vintage',
-        visualIntent: 'Vintage 1930s era industrial cooling or air conditioning unit photograph, heavy mechanical equipment, factory setting, sepia or desaturated tone suggesting historical era',
-        sceneText: 'The cooling industry has known about it since 1930.',
+    commentScreen: {
+        keyword: 'person scrolling smartphone screen',
+        visualIntent: 'Close-up of a phone or desktop screen showing a YouTube comment asking about summer cooling, conversational and relatable documentary reset beat',
+        sceneText: 'After the last video, many of you asked the same thing, what about summer? What about keeping a home cool?',
         sourceHint: 'web-image',
     },
-    boardroom: {
-        keyword: 'corporate boardroom shadowed documents',
-        visualIntent: 'Dark moody image of shadowed hands over corporate documents or patent files, dramatic low-key lighting, sinister atmosphere suggesting concealment, vintage industrial aesthetic',
-        sceneText: 'And in 1930, they made sure you would never find out.',
+    suburbanHome: {
+        keyword: '1970s suburban American home exterior',
+        visualIntent: 'Classic 1970s American suburban single-family home exterior, brick or siding, modest front yard, daylight shot conveying the relatable existing-home viewer context',
+        sceneText: 'And yes, this works even if your house was built 50 years ago.',
         sourceHint: 'web-image',
     },
 };
@@ -100,71 +118,89 @@ const VIDEO_TOPIC = 'The underground earth-tube cooling system the air condition
 // accepts at >=6, so PASS means "should score >=6" and REJECT "should score <=5".
 // `trap` marks a case where topic-matching alone gives the wrong answer.
 const CASES = [
+    // ── frames a human editor would happily cut into the video ──
     {
-        id: 'amish-family/farmstead',
-        file: 'scene-0.race-7-msewmu5n.jpg',
-        scene: 'amishFarmstead',
+        id: 'farmland-aerial/farmhouse',
+        file: 'scene-0.race-5-msg4sjou.jpg',
+        scene: 'amishFarmhouse',
         band: 'PASS',
-        truth: 'Real, clean, unwatermarked photo of an Amish family walking through green countryside by a river — correct culture and pastoral setting, no defects.',
+        truth: 'Real, clean, unwatermarked aerial photograph of Ohio Amish farmland — white farmhouses, a red barn with silo, mown green fields and a country road. The build itself accepted this exact frame at 8/10.',
     },
     {
-        id: 'amish-family/boardroom',
-        file: 'scene-0.race-7-msewmu5n.jpg',
-        scene: 'boardroom',
+        id: 'amish-buggy/farmhouse',
+        file: 'scene-5.race-4-msg4yvpu.jpg',
+        scene: 'amishFarmhouse',
+        band: 'PASS',
+        truth: 'Real, clean, unwatermarked photo of an Amish horse-and-buggy on a country road, with red barns, a silo, a windmill and green rolling hills behind. Correct culture, correct county, no defects.',
+    },
+    {
+        id: 'tunnel-wall-closeup/tunnel-walls',
+        file: 'scene-1.race-5-msg4v3xu.jpg',
+        scene: 'tunnelWalls',
+        band: 'PASS',
+        truth: 'Real, clean, unwatermarked shallow-depth close-up of a bare concrete tunnel wall with the passage receding into distant lights. Exactly the brief, no equipment in frame.',
+    },
+    {
+        id: 'hand-on-phone/comment-screen',
+        file: 'scene-5.race-1-msg4w8f2.jpg',
+        scene: 'commentScreen',
+        band: 'PASS',
+        truth: 'Real, clean, unwatermarked photo of a person in a sweater about to tap a phone. The screen contents are not visible — no stock photo can show one specific YouTube comment — but this is the shot an editor cuts to on a "you asked in the comments" beat. Rejecting it for the missing screen is the over-literal failure that leaves scenes with no footage.',
+    },
+    {
+        id: 'brick-suburban-home/suburban-home',
+        file: 'scene-7.race-1-msg4xgrp.jpg',
+        scene: 'suburbanHome',
+        band: 'PASS',
+        truth: 'Real, clean, unwatermarked photo of a red-brick American suburban single-family house: garage, mown front lawn, blue sky, daylight. Newer than 1970s, but it is the relatable existing-home establishing shot the brief describes. Rejecting it on the decade alone is over-literal.',
+    },
+
+    // ── frames a human editor would not use ──
+    {
+        id: 'amish-buggy/comment-screen',
+        file: 'scene-5.race-4-msg4yvpu.jpg',
+        scene: 'commentScreen',
         band: 'REJECT',
         trap: 'brief-reading',
-        truth: 'Same pixels as the case above, judged against a completely different brief (shadowed hands over patent files). A judge rating generic image quality scores this the same as the case above; a judge reading the brief does not.',
+        truth: 'The same pixels as amish-buggy/farmhouse, judged against a completely different brief (a phone or desktop screen showing a viewer comment). A judge scoring generic quality — or just "is this on topic for the video" — gives both the same number. A judge reading the brief does not.',
     },
     {
-        id: 'archival-trencher/vintage-ac',
-        file: 'scene-4.race-6-msewoksa.jpg',
-        scene: 'vintageAc',
-        band: 'PASS',
-        truth: 'Genuine archival black-and-white photograph of a steam-powered trenching machine with clay pipes beside the trench — real, correct era, correct heavy machinery, desaturated historical tone.',
-    },
-    {
-        id: 'thermometer/earth-tube',
-        file: 'scene-4.race-3-msewnwmc.jpg',
-        scene: 'earthTube',
-        band: 'PASS',
-        truth: 'Real, clean, unwatermarked close-up of a dual-scale wall thermometer. The brief explicitly asks for a visible thermometer.',
-    },
-    {
-        id: 'earth-cutaway/earth-tube',
-        file: 'scene-1.race-4-msewodaj.jpg',
-        scene: 'earthTube',
-        band: 'REJECT',
-        truth: '3D CGI cutaway of the planet Earth (crust/mantle/core) on white. Illustration where real footage is required, and the wrong subject entirely.',
-    },
-    {
-        id: 'adobe-stock-loop/earth-tube',
-        file: 'scene-1.race-9-msewmu08.jpg',
-        scene: 'earthTube',
-        band: 'REJECT',
-        trap: 'watermark+illustration',
-        truth: 'Stock cross-section diagram of an underground geothermal pipe loop — topically almost perfect, but it is an illustration AND carries tiled "Adobe Stock" watermarks with a stock ID.',
-    },
-    {
-        id: 'earth-tubes-caption/earth-tube',
-        file: 'scene-2.race-5-msewo9po.jpg',
-        scene: 'earthTube',
+        id: 'teri-slide/tunnel-walls',
+        file: 'scene-1.race-7-msg4tco9.jpg',
+        scene: 'tunnelWalls',
         band: 'REJECT',
         trap: 'editorial-overlay',
-        truth: 'Real construction photo of earth tubes being installed — on-topic and real footage, but carries a large editorial caption block, a corporate logo and a site watermark.',
+        truth: 'A PowerPoint slide: half a page of body copy about earth air tunnels beside a labelled cutaway diagram carrying a "teri" corporate logo. Topically a near-perfect match for the video — which is exactly why it is the trap. It is a text slide and an illustration, not footage.',
     },
     {
-        id: 'foundation-lineart/amish-farmhouse',
-        file: 'scene-2.race-9-msewm9u2.jpg',
-        scene: 'amishFarmhouse',
+        id: 'magnific-render/tunnel-walls',
+        file: 'scene-1.race-9-msg4tcot.jpg',
+        scene: 'tunnelWalls',
         band: 'REJECT',
-        truth: 'Vendor line-art diagram of a house foundation with callout labels and a brand name. Illustration plus overlaid text, and not an Amish farmhouse.',
+        trap: 'watermark+ai-render',
+        truth: 'AI-generated fantasy render of a vast underground industrial tunnel complex, tiled "Magnific" watermarks across the whole frame plus a logo bottom-right. Two disqualifiers at once: supplier watermark and synthetic imagery.',
     },
     {
-        id: 'tropical-hut/amish-farmhouse',
-        file: 'scene-0.race-9-msewoksi.jpg',
-        scene: 'amishFarmhouse',
+        id: 'neon-rail-tunnel/tunnel-walls',
+        file: 'scene-1.race-2-msg4uaij.jpg',
+        scene: 'tunnelWalls',
         band: 'REJECT',
-        truth: 'Real, clean photo of a tropical stilt hut in a dry harvested field with palms on the horizon. No rule violation at all — it is simply the wrong subject and wrong part of the world.',
+        trap: 'ai-render',
+        truth: 'Stylised AI render of a railway tunnel lit with impossible cyan and orange glow along the rock. Wrong subject (rail tunnel, tracks in frame) and obviously synthetic — the "looks amazing, is fake" case that makes a finished video read as AI-made.',
+    },
+    {
+        id: 'wall-thermometer/tunnel-walls',
+        file: 'scene-1.race-1-msg4u9ue.jpg',
+        scene: 'tunnelWalls',
+        band: 'REJECT',
+        truth: 'Real, clean, unwatermarked close-up of a dual-scale wall thermometer on wood. No rule violation at all — simply the wrong subject for a brief asking for bare tunnel walls, and that brief explicitly excludes a visible thermostat.',
+    },
+    {
+        id: 'designer-brick-house/suburban-home',
+        file: 'scene-7.race-1-msg4z5k4.jpg',
+        scene: 'suburbanHome',
+        band: 'REJECT',
+        truth: 'Real, clean photo — but a tall portrait-crop architectural detail of a contemporary designer home: rear timber deck, potted olive tree, golden-hour styling. Not an American suburban front-yard establishing shot, and portrait framing cannot fill a 16:9 scene.',
     },
 ];
 
@@ -229,7 +265,9 @@ function runParent() {
     if (missing.length) {
         console.log(`\nMissing benchmark frames in ${FRAMES}:`);
         missing.forEach((m) => console.log(`   ${m}`));
-        console.log('\nThese are real race frames from the build. Point BENCH_PROJECT_DIR at a project that has them.');
+        console.log('\nThese are real race frames from a real build, promoted out of temp/ into');
+        console.log('.bench-frames/ so a later build\'s Step 0 clean cannot delete the labelled set.');
+        console.log('Point BENCH_PROJECT_DIR at a project that has them.');
         process.exit(1);
     }
 

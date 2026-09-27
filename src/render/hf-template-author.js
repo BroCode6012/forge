@@ -61,9 +61,22 @@ const GSAP_TRANSFORM_PROPS = new Set([
     'skewX', 'skewY', 'transform',
 ]);
 
+// GSAP resolves targets through querySelectorAll, which cannot address a CSS
+// pseudo-element, and a blank string addresses nothing at all. Either way the
+// tween is dead on arrival and only ever shows up as "GSAP target ... not
+// found". Treated as "not a target" here so the audit below neither reports
+// nor re-emits one.
+const DEAD_TWEEN_TARGET = /::|:(?:before|after|first-line|first-letter|selection|placeholder|backdrop|marker)\b/i;
+
+function isDeadTweenTarget(value) {
+    if (typeof value !== 'string') return true;
+    if (!value.trim()) return true;
+    return DEAD_TWEEN_TARGET.test(value);
+}
+
 function timelineTargets(target) {
-    if (typeof target === 'string') return [target];
-    if (Array.isArray(target)) return target.filter(value => typeof value === 'string');
+    if (typeof target === 'string') return isDeadTweenTarget(target) ? [] : [target];
+    if (Array.isArray(target)) return target.filter(value => !isDeadTweenTarget(value));
     return [];
 }
 
@@ -383,7 +396,12 @@ function rescueComposition(parsed, brief) {
             { html: String(parsed.html || ''), css, timeline },
             { theme, themeId: brief.themeId, kind: brief.kind }
         );
-        if (styled && styled.fixes.length) { css = styled.css; fixes.push(...styled.fixes); }
+        if (styled && styled.fixes.length) {
+            css = styled.css;
+            // Easing lives in the timeline, so the repair returns both halves.
+            if (typeof styled.timeline === 'string') timeline = styled.timeline;
+            fixes.push(...styled.fixes);
+        }
     } catch (_) { /* a failed repair is the same as no repair */ }
 
     try {
@@ -406,6 +424,69 @@ function rescueComposition(parsed, brief) {
 
     if (!fixes.length) return null;
     return { parsed: { ...parsed, css, timeline }, fixes };
+}
+
+// ── Spoken numbers → digits ────────────────────────────────────────────────
+// The numeric whitelist below compares what is drawn on screen against what
+// the brief contains. The brief's biggest field is NARRATION, which is a
+// spoken script: it says "three and a half", never "3.5". Comparing digits to
+// digits therefore rejected the exact facts the rule exists to protect — on
+// the 2026-08-05 build "3.5", "60" and "40" were all narration facts thrown
+// out as model invention, and each rejection cost a whole bespoke design.
+// This expands spelled forms to their digit value so a legitimate fact can be
+// typeset as a numeral. It only ever ADDS to the allow-list.
+const _NUM_WORDS = {
+    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
+    ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
+    seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40, fourty: 40,
+    fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+};
+const _NUM_SCALES = { thousand: 1e3, million: 1e6, billion: 1e9, trillion: 1e12 };
+const _NUM_FRACTIONS = { half: 0.5, halves: 0.5, quarter: 0.25, quarters: 0.25, third: 1 / 3, thirds: 1 / 3 };
+const _NUM_FILLER = new Set(['and', 'a', 'an']);
+
+function spelledNumbersIn(text) {
+    const out = new Set();
+    const toks = String(text || '').toLowerCase().match(/[a-z]+/g) || [];
+    let scaled = 0, group = 0, frac = 0, decimals = '', active = false, inDecimal = false;
+    const flush = () => {
+        if (active) {
+            let total = scaled + group + frac;
+            if (decimals) total = Number(`${Math.trunc(total)}.${decimals}`);
+            if (Number.isFinite(total) && total > 0) {
+                // 3.5 stays "3.5"; 2500 stays "2500" (the caller strips commas
+                // on both sides, so no comma variant is needed).
+                out.add(String(Number(total.toFixed(4))));
+            }
+        }
+        scaled = 0; group = 0; frac = 0; decimals = ''; active = false; inDecimal = false;
+    };
+    for (const t of toks) {
+        if (active && _NUM_FILLER.has(t)) continue;
+        if (active && t === 'point') { inDecimal = true; continue; }
+        if (_NUM_WORDS[t] != null) {
+            if (inDecimal) decimals += String(_NUM_WORDS[t]);
+            else group += _NUM_WORDS[t];
+            active = true;
+            continue;
+        }
+        if (t === 'hundred') { group = (group || 1) * 100; active = true; inDecimal = false; continue; }
+        if (_NUM_SCALES[t]) {
+            // The fraction belongs to the mantissa: "three and a half million"
+            // is 3.5 million, not three million and a half.
+            const mantissa = (group + frac) || 1;
+            // A big number is as legitimately typeset "3.5M" as "3,500,000",
+            // so both readings go on the allow-list.
+            if (group + frac > 0) out.add(String(Number((group + frac).toFixed(4))));
+            scaled += mantissa * _NUM_SCALES[t];
+            group = 0; frac = 0; active = true; inDecimal = false;
+            continue;
+        }
+        if (_NUM_FRACTIONS[t] != null && active) { frac += _NUM_FRACTIONS[t]; continue; }
+        flush();
+    }
+    flush();
+    return out;
 }
 
 function validateComposition(raw, ns, duration, assets = [], brief = null) {
@@ -535,6 +616,8 @@ function validateComposition(raw, ns, duration, assets = [], brief = null) {
         const allowedPool = [brief.text, brief.subtext, brief.narration,
             ...(brief.items || []).map(i => `${i.label || ''} ${i.value || ''}`)].join(' ');
         const allowedNums = new Set((allowedPool.match(/\d[\d,.]*/g) || []).map(n => n.replace(/[,.]+$/, '')));
+        // The narration is spoken, so its numbers arrive as words.
+        for (const n of spelledNumbersIn(allowedPool)) allowedNums.add(n);
         const htmlText = html.replace(/<[^>]+>/g, ' ');
         for (const m of (htmlText.match(/\d[\d,.]*/g) || [])) {
             const num = m.replace(/[,.]+$/, '');
@@ -721,7 +804,30 @@ function parseAuthorResponse(text) {
 // would appear to do nothing on the next real build. That is the opposite of
 // the v5 case, which was left unbumped precisely because it could not change
 // a passing composition.
-const AUTHOR_VERSION = 'v18-measured-motion';
+// v19: convergence. Two things were costing whole designs for reasons that had
+// nothing to do with design quality. (1) The gates ran in sequence and stopped
+// at the first one that fired, so a round taught the author about exactly one
+// rule; with two rounds, a composition that broke two rules was mathematically
+// unable to survive. (2) The numeric guard compared on-screen digits against a
+// SPOKEN narration, so "3.5" was rejected as invention when the script said
+// "three and a half". Both are fixed here, the deterministic repair list grew
+// from 4 fixes to cover every mechanically-correctable rule, and the rendered
+// frame is now measured for real contrast. The version bumps because the whole
+// point is to change the output: 8 of 18 fullscreen graphics on the 2026-08-05
+// build were binned, and leaving the salt alone would serve those same failures
+// from cache on the next build.
+const AUTHOR_VERSION = 'v19-convergent-rounds';
+
+// Repair rounds. Raise for a stubborn project; 1 disables repair entirely.
+const MAX_AUTHOR_ROUNDS = (() => {
+    const n = parseInt(String(process.env.HF_AUTHOR_ROUNDS || '').trim(), 10);
+    return Number.isFinite(n) && n >= 1 && n <= 8 ? n : 4;
+})();
+
+// Kill switch for the retry-a-failed-brief behaviour below. Default OFF (i.e.
+// retries ARE on) — it exists so a build can be made cheap and reproducible on
+// demand, not because caching a failure forever was ever the right default.
+const RETRY_FAILED_OFF = /^(0|false|off|no)$/i.test(String(process.env.HF_AUTHOR_RETRY_FAILED || '').trim());
 
 function briefHash(brief, design) {
     const key = JSON.stringify({
@@ -764,7 +870,8 @@ async function authorComposition(brief, opts = {}) {
     let prompt = buildPrompt(brief, design, null, null, ledger);
     let parsed = null;
     let result = null;
-    for (let round = 0; round < 2; round++) {
+    let unresolved = [];
+    for (let round = 0; round < MAX_AUTHOR_ROUNDS; round++) {
         let text;
         try {
             text = await callAI(prompt, { maxTokens: 8000, temperature: 0.5, taskType });
@@ -775,7 +882,8 @@ async function authorComposition(brief, opts = {}) {
         parsed = parseAuthorResponse(text);
         if (!parsed) {
             log(`  ⚠️ [Author] unparseable response (${brief.ns}, round ${round + 1})`);
-            prompt = buildPrompt(brief, design, ['response was not in the required ===SECTION=== format'], null, ledger);
+            unresolved = ['response was not in the required ===SECTION=== format'];
+            prompt = buildPrompt(brief, design, unresolved, null, ledger);
             continue;
         }
         // ── Deterministic rescue ──
@@ -795,66 +903,76 @@ async function authorComposition(brief, opts = {}) {
             log(`  🔧 [Author] auto-fixed ${brief.ns} (round ${round + 1}): ${rescue.fixes.join('; ')}`);
         }
 
+        // ── EVERY GATE, ONE ROUND ──
+        // The gates used to run in sequence and bail on the first one that
+        // fired, so a round only ever taught the author about a single rule.
+        // With two rounds that is a coin flip the author loses: round 1
+        // rejected a colour, round 2 fixed the colour and was rejected for an
+        // easing curve, and the design was thrown away. Measured on the
+        // 2026-08-05 build — 8 of 18 fullscreen graphics died exactly that
+        // way, every one of them on a DIFFERENT rule the second time.
+        //
+        // Now all three run every round and their findings are merged into one
+        // repair brief, so the author fixes the whole composition at once
+        // instead of trading one violation for the next.
         result = validateComposition(parsed, brief.ns, brief.duration, brief.assets || [], brief);
-        if (result.ok) {
-            result.timeline = normalizeAuthoredTimeline(result.timeline, brief.duration);
+        const roundErrors = [];
+        if (result.ok) result.timeline = normalizeAuthoredTimeline(result.timeline, brief.duration);
+        else roundErrors.push(...result.errors.slice(0, 8));
 
-            // ── Slop + theme contract ──
-            // Deterministic, free, and textual, so it runs BEFORE the browser
-            // lint: no point paying to render a frame we already know uses a
-            // face this video never uses. The contract half asks the question
-            // the universal rules cannot — not "is this a cliché?" but "does
-            // this belong to THIS video?" — and it is inert without a theme,
-            // so a brief with no themeId degrades to the universal rules
-            // rather than failing.
-            if (!/^(0|false|off|no)$/i.test(String(process.env.HF_THEME_CONTRACT || '').trim())) {
-                try {
-                    const { slopLint } = require('./hf-slop-lint');
-                    const { getThemeTokens } = require('../data/themes');
-                    const theme = brief.themeId ? getThemeTokens(brief.themeId) : null;
-                    const slop = slopLint(
-                        { html: result.html, css: result.css, timeline: result.timeline },
-                        { theme, kind: brief.kind, source: 'composition' }
-                    );
-                    if (!slop.ok) {
-                        log(`  🎨 [Author] slop/contract rejected ${brief.ns} (round ${round + 1}): ${slop.errors[0]}`);
-                        prompt = buildPrompt(brief, design, slop.errors.slice(0, 6), parsed, ledger);
-                        result = null;
-                        continue;
-                    }
-                } catch (sErr) {
-                    log(`  🎨 [Author] slop lint unavailable (${String(sErr.message).slice(0, 60)}) — skipped`);
-                }
+        // ── Slop + theme contract ──
+        // Deterministic, free and textual, so it runs whatever the structural
+        // verdict was. The contract half asks the question the universal rules
+        // cannot — not "is this a cliché?" but "does this belong to THIS
+        // video?" — and it is inert without a theme, so a brief with no
+        // themeId degrades to the universal rules rather than failing.
+        if (!/^(0|false|off|no)$/i.test(String(process.env.HF_THEME_CONTRACT || '').trim())) {
+            try {
+                const { slopLint } = require('./hf-slop-lint');
+                const { getThemeTokens } = require('../data/themes');
+                const theme = brief.themeId ? getThemeTokens(brief.themeId) : null;
+                const slop = slopLint(
+                    { html: result.html, css: result.css, timeline: result.timeline },
+                    { theme, kind: brief.kind, source: 'composition' }
+                );
+                if (!slop.ok) roundErrors.push(...slop.errors.slice(0, 6));
+            } catch (sErr) {
+                log(`  🎨 [Author] slop lint unavailable (${String(sErr.message).slice(0, 60)}) — skipped`);
             }
+        }
 
-            // Textual lint passed — now MEASURE the rendered pixels. Frame
-            // overflow, text collisions, and invisible-at-hero-frame elements
-            // come back as concrete errors the repair round can act on.
+        // MEASURE the rendered pixels. Frame overflow, text collisions,
+        // unreadable contrast and invisible-at-hero-frame elements come back
+        // as concrete errors the repair round can act on. Only worth doing
+        // when the structure parses — a timeline with a syntax error renders
+        // nothing, and its complaints would just echo the errors above.
+        if (result.ok) {
             try {
                 const { visualLint } = require('./hf-visual-lint');
-                const vis = await visualLint({ html: result.html, css: result.css, timeline: result.timeline }, brief.ns, brief.duration, { kind: brief.kind });
-                if (!vis.ok) {
-                    log(`  📐 [Author] visual lint rejected ${brief.ns} (round ${round + 1}): ${vis.errors[0]}`);
-                    prompt = buildPrompt(brief, design, vis.errors, parsed, ledger);
-                    result = null;
-                    continue;
-                }
+                const vis = await visualLint({ html: result.html, css: result.css, timeline: result.timeline }, brief.ns, brief.duration, { kind: brief.kind, themeId: brief.themeId });
+                if (!vis.ok) roundErrors.push(...vis.errors.slice(0, 6));
             } catch (vErr) {
                 log(`  📐 [Author] visual lint unavailable (${String(vErr.message).slice(0, 60)}) — textual lint only`);
             }
-            break;
         }
-        log(`  🛠️ [Author] lint rejected ${brief.ns} (round ${round + 1}): ${result.errors.slice(0, 3).join(' | ')}`);
-        prompt = buildPrompt(brief, design, result.errors.slice(0, 8), parsed, ledger);
+
+        if (result.ok && !roundErrors.length) break;
+
+        unresolved = roundErrors.length ? roundErrors : (result.errors || []);
+        log(`  🛠️ [Author] round ${round + 1}/${MAX_AUTHOR_ROUNDS} rejected ${brief.ns} (${unresolved.length} issue${unresolved.length === 1 ? '' : 's'}): ${unresolved.slice(0, 3).join(' | ')}`);
+        prompt = buildPrompt(brief, design, unresolved.slice(0, 12), parsed, ledger);
         result = null;
     }
-    // Lint-rejected after the repair round = deterministic failure for this
-    // brief — return a marker the batch layer CACHES, so reopening the project
-    // doesn't re-burn AI calls on a scene that will fail the same way again.
-    // (AI-call errors return null above and are NOT cached — those are
-    // transient.) Cache invalidates via AUTHOR_VERSION when the linter/prompt
-    // changes.
-    if (!result || !result.ok) return { failed: true };
+    // Still rejected after every round. The marker is returned so the batch
+    // layer can record it, but it means "this sample failed", not "this brief
+    // is impossible": see authorCompositions, where a build always retries a
+    // previously-failed brief and only the zero-AI open mode honours the
+    // marker. Logging every unresolved rule (not just the first) is what makes
+    // a failure diagnosable from the build log alone.
+    if (!result || !result.ok) {
+        log(`  ❌ [Author] ${brief.ns} unresolved after ${MAX_AUTHOR_ROUNDS} rounds: ${unresolved.slice(0, 6).join(' | ')}`);
+        return { failed: true, reason: unresolved.slice(0, 6) };
+    }
 
     // ── Perfectionist pass (HF_AUTHOR_PERFECTIONIST=0 disables) ──
     // Lints catch violations; they can't catch "passes every rule but looks
@@ -865,7 +983,7 @@ async function authorComposition(brief, opts = {}) {
     if (!/^(0|false|off|no)$/i.test(String(process.env.HF_AUTHOR_PERFECTIONIST || '').trim())) {
         try {
             const { captureHeroFrame, visualLint } = require('./hf-visual-lint');
-            const frame = await captureHeroFrame(result, brief.ns, brief.duration);
+            const frame = await captureHeroFrame(result, brief.ns, brief.duration, { themeId: brief.themeId });
             if (!frame) {
                 log(`  🎭 [Author] perfectionist pass skipped for ${brief.ns} — hero frame capture unavailable`);
                 result._review = 'skipped';
@@ -915,7 +1033,7 @@ async function authorComposition(brief, opts = {}) {
                                     } catch (_) { slop2 = { ok: true }; }
                                 }
                                 const vis2 = slop2.ok
-                                    ? await visualLint({ html: refined.html, css: refined.css, timeline: refined.timeline }, brief.ns, brief.duration, { kind: brief.kind })
+                                    ? await visualLint({ html: refined.html, css: refined.css, timeline: refined.timeline }, brief.ns, brief.duration, { kind: brief.kind, themeId: brief.themeId })
                                     : { ok: false };
                                 if (vis2.ok) {
                                     log(`  🎭 [Author] ${brief.ns} refined per art-director notes`);
@@ -987,21 +1105,53 @@ async function authorCompositions(briefs, { projectDir, log, openMode = false } 
         const design = generateDesignDoc({ themeId: brief.themeId, styleProfile: brief.styleProfile, nicheId: brief.nicheId });
         const hash = briefHash(brief, design);
         if (cache[hash]) {
-            // Cached failure marker → known-bad brief, skip silently (fixed
-            // template renders). Cached composition → reuse.
             const cachedComp = safeCachedComposition(brief, cache[hash]);
-            if (cache[hash].failed || cachedComp) {
+            if (cachedComp) {
                 out[i] = { brief, composition: cachedComp, cached: true };
-                if (cachedComp) {
-                    cache[hash] = { ...cachedComp, ns: brief.ns };
-                    ledger.push(fingerprint(brief, cachedComp));
-                }
+                cache[hash] = { ...cachedComp, ns: brief.ns };
+                ledger.push(fingerprint(brief, cachedComp));
                 return;
             }
-            // A cache hit authored under an older/unsafe contract must not be
-            // allowed back into the render path. Re-author during builds; in
-            // open mode, try another valid stale entry for the same namespace.
-            delete cache[hash];
+            if (cache[hash].failed) {
+                // A FAILURE IS NOT A VERDICT ON THE BRIEF — it is one bad
+                // sample. The author is a language model at non-zero
+                // temperature: the same brief that lost four rounds can be
+                // authored cleanly on the next attempt, and the deterministic
+                // repair pass in front of it keeps improving underneath a
+                // marker that never expires. Honouring the marker on a build
+                // meant a graphic that failed once fell back to the generic
+                // hardcoded card in EVERY later build of that video — the user
+                // rebuilds, sees the same ugly card, and nothing they or we fix
+                // can dislodge it.
+                //
+                // So the marker now means exactly one thing: "do not spend AI
+                // on this in open mode". A build always tries again.
+                if (!openMode && !RETRY_FAILED_OFF) {
+                    // Left in place rather than deleted: if this build crashes
+                    // before the runner writes a new entry, the attempt history
+                    // survives instead of resetting to zero.
+                    pending.push({ brief, hash, i, attempts: Number(cache[hash].attempts) || 1 });
+                    return;
+                }
+                if (RETRY_FAILED_OFF) {
+                    out[i] = { brief, composition: null, cached: true };
+                    return;
+                }
+                // Open mode falls THROUGH to the stale lookup below instead of
+                // giving up here. A composition authored for this same slot
+                // under an earlier version still beats the generic card, and
+                // safeCachedComposition re-validates it against today's brief
+                // before it is allowed anywhere near the render — so this
+                // cannot resurrect something unsafe, and it costs no AI. The
+                // marker itself is left alone — deleting it here would erase
+                // the attempt history that the next build reports.
+            } else {
+                // A cache hit authored under an older/unsafe contract must not
+                // be allowed back into the render path. Re-author during
+                // builds; in open mode, try another valid stale entry for the
+                // same namespace.
+                delete cache[hash];
+            }
         }
         if (openMode) {
             // OPEN MODE (project open / refresh): NEVER author — opening a
@@ -1033,14 +1183,22 @@ async function authorCompositions(briefs, { projectDir, log, openMode = false } 
     async function runner() {
         while (cursor < pending.length) {
             const job = pending[cursor++];
+            const retry = Number(job.attempts) || 0;
+            if (retry) logFn(`  🔁 [Author] retrying ${job.brief.ns} — it failed on ${retry} earlier build${retry === 1 ? '' : 's'}, and a failure is one bad sample, not a permanent verdict`);
             const comp = await authorComposition(job.brief, { log: logFn, ledger: ledger.slice() });
             aiCalls++;
             done++;
-            if (comp) cache[job.hash] = { ...comp, ns: job.brief.ns }; // ns enables open-mode stale reuse
+            // ns enables open-mode stale reuse; attempts is how many builds this
+            // brief has now lost, so the log can name a chronically hard one.
+            if (comp) {
+                cache[job.hash] = comp.failed
+                    ? { ...comp, ns: job.brief.ns, attempts: retry + 1 }
+                    : { ...comp, ns: job.brief.ns };
+            }
             const usable = comp && !comp.failed ? comp : null;
             if (usable) ledger.push(fingerprint(job.brief, usable));
             out[job.i] = { brief: job.brief, composition: usable, cached: false };
-            logFn(`  🎨 [Author] ${done}/${pending.length} authored (${job.brief.ns}${usable ? '' : ' — FELL BACK'})`);
+            logFn(`  🎨 [Author] ${done}/${pending.length} authored (${job.brief.ns}${usable ? (retry ? ' — RECOVERED' : '') : ' — FELL BACK'})`);
         }
     }
     await Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, runner));
@@ -1073,5 +1231,9 @@ module.exports = {
     // full validator accepts comes out. A repair proved only against its own
     // rule is a repair proved against half the contract.
     rescueComposition,
+    // Exported so the verify gate can prove a spoken narration number reaches
+    // the allow-list — the guard that used to reject the facts it protects.
+    spelledNumbersIn,
     validateComposition,
+    MAX_AUTHOR_ROUNDS,
 };

@@ -186,6 +186,24 @@ function _scaledTimeout(timeout, file = '') {
 // Skips injection when the args ALREADY contain --cookies/--cookies-from-browser
 // (some callers may pass their own) and when the file isn't yt-dlp (defensive —
 // these utils are sometimes given ffmpeg/ffprobe paths in other code paths).
+// Returns a human reason the cookie file cannot be used, or '' when it is fine.
+// Mirrors yt-dlp's own acceptance rule: a Netscape header, or at least one data line
+// of 7 tab-separated fields.
+function _cookieFileProblem(file) {
+    let st;
+    try { st = fs.statSync(file); } catch (_) { return 'missing'; }
+    if (!st.isFile()) return 'not a file';
+    if (st.size === 0) return 'empty';
+    let raw;
+    try { raw = fs.readFileSync(file, 'utf8'); } catch (e) { return `unreadable: ${e.code || e.message}`; }
+    if (!raw.trim()) return 'blank';
+    if (/^#\s*(Netscape )?HTTP Cookie File/i.test(raw)) return '';
+    const dataLine = raw.split(/\r?\n/).find(l => l && !l.startsWith('#'));
+    if (!dataLine) return 'no cookie entries';
+    if (dataLine.split('\t').length < 7) return 'not Netscape format (expects 7 tab-separated fields)';
+    return '';
+}
+
 let _ytdlpCookieArgsCache = null;
 let _ytdlpCookieArgsLogged = false;
 function _getYtdlpCookieArgs() {
@@ -194,9 +212,19 @@ function _getYtdlpCookieArgs() {
     const cookiesFile = String(cfg.cookiesFile || '').trim();
     const cookiesFromBrowser = String(cfg.cookiesFromBrowser || '').trim();
     if (cookiesFile) {
-        if (!fs.existsSync(cookiesFile)) {
+        // existsSync is NOT enough. An empty or non-Netscape file passes it, reaches
+        // yt-dlp, and yt-dlp ABORTS the whole invocation with
+        //   ERROR: '<path>' does not look like a Netscape format cookies file
+        // — so a broken cookie jar is strictly WORSE than none at all: it turns calls
+        // that would have worked unauthenticated into hard failures. Measured
+        // 2026-08-30: the configured file was 0 bytes, every YouTube call errored on it,
+        // and 30% of downloads hit the 403 wall that cookies exist to avoid.
+        // Validate here and degrade to unauthenticated instead.
+        const bad = _cookieFileProblem(cookiesFile);
+        if (bad) {
             if (!_ytdlpCookieArgsLogged) {
-                console.log(`  [yt-dlp] WARNING: YTDLP_COOKIES_FILE points to missing file: ${cookiesFile}`);
+                console.log(`  [yt-dlp] WARNING: cookie file unusable (${bad}): ${cookiesFile}`);
+                console.log('  [yt-dlp] continuing WITHOUT cookies — expect more YouTube 403s until it is re-exported');
                 _ytdlpCookieArgsLogged = true;
             }
             _ytdlpCookieArgsCache = [];
@@ -214,6 +242,56 @@ function _getYtdlpCookieArgs() {
         _ytdlpCookieArgsLogged = true;
     }
     return _ytdlpCookieArgsCache;
+}
+
+// ── JavaScript runtime: the real cause of YouTube 403s ───────────────────────
+//
+// Modern yt-dlp needs a JS runtime to solve YouTube's signature and `n` challenges.
+// Without one it warns
+//   "No supported JavaScript runtime could be found ... some formats may be missing"
+//   "Signature solving failed" / "n challenge solving failed"
+// and hands ffmpeg a media URL whose signature was never solved — which arrives as
+//   ERROR: ffmpeg exited with code ... HTTP error 403 Forbidden
+//
+// That is not a cookie problem and not a network problem, which is why the client
+// ladder only rescued 21% of them: every rung was requesting an unsigned URL.
+// Measured 2026-08-30 on a 356-scene build: 355 of 1189 download attempts (30%) hit
+// that 403. Only `deno` is enabled by default and this machine has none — but Node is
+// right here, and yt-dlp accepts it via `--js-runtimes node:<path>`. With it, the same
+// video resolves format 401+251 and emits no warnings at all.
+//
+// YTDLP_JS_RUNTIME overrides (e.g. "deno" or "node:/usr/bin/node"); set it to an empty
+// string to disable the injection entirely.
+let _ytdlpJsRuntimeCache = null;
+let _ytdlpJsRuntimeLogged = false;
+function _getYtdlpJsRuntimeArgs() {
+    if (_ytdlpJsRuntimeCache !== null) return _ytdlpJsRuntimeCache;
+    const raw = process.env.YTDLP_JS_RUNTIME;
+    if (raw !== undefined && String(raw).trim() === '') {   // explicitly disabled
+        _ytdlpJsRuntimeCache = [];
+        return _ytdlpJsRuntimeCache;
+    }
+    let spec = String(raw || '').trim();
+    if (!spec) {
+        // Default to the Node already running this process — no install, always present.
+        const exe = process.execPath;
+        spec = exe ? `node:${exe}` : '';
+    }
+    _ytdlpJsRuntimeCache = spec ? ['--js-runtimes', spec] : [];
+    if (!_ytdlpJsRuntimeLogged && _ytdlpJsRuntimeCache.length) {
+        console.log(`  [yt-dlp] JS runtime: ${spec.split(':')[0]} (solves YouTube signature/n challenges)`);
+        _ytdlpJsRuntimeLogged = true;
+    }
+    return _ytdlpJsRuntimeCache;
+}
+
+function _injectJsRuntimeArgs(file, args) {
+    if (!Array.isArray(args)) return args;
+    if (file && !/yt-dlp(?:\.exe)?$/i.test(path.basename(String(file)))) return args;
+    if (args.map(a => String(a || '').toLowerCase()).includes('--js-runtimes')) return args;
+    const rt = _getYtdlpJsRuntimeArgs();
+    if (rt.length === 0) return args;
+    return [...rt, ...args];
 }
 
 function _injectCookieArgs(file, args) {
@@ -292,7 +370,7 @@ function _createYtdlpTempEnv(file, baseEnv = process.env) {
 
 function execFileCapture(file, args, options = {}) {
     return new Promise((resolve, reject) => {
-        const finalArgs = _injectResilienceArgs(file, _injectCookieArgs(file, args));
+        const finalArgs = _injectResilienceArgs(file, _injectJsRuntimeArgs(file, _injectCookieArgs(file, args)));
         const temp = _createYtdlpTempEnv(file, options.env || process.env);
         const execOptions = {
             maxBuffer: 10 * 1024 * 1024,
@@ -404,4 +482,5 @@ module.exports = {
     buildBestVideoOnlyFormat,
     describeMaxHeight,
     getYtdlpCookieArgs: _getYtdlpCookieArgs,
+    getYtdlpJsRuntimeArgs: _getYtdlpJsRuntimeArgs,
 };

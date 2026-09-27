@@ -1,5 +1,5 @@
 /**
- * YTA Empire WEBGL - sandboxed Electron preload.
+ * Forge - sandboxed Electron preload.
  *
  * No application modules are loaded here. Renderers receive a role-scoped,
  * structured-clone-safe IPC surface through contextBridge.
@@ -176,6 +176,16 @@ const fullApi = {
     onQAReplaceProgress: subscribe('qa-replacer-progress', { replace: true }),
     qaChatGetNicheList: invoke('qa-chat-niches'),
     qaChatSend: invoke('qa-chat-send'),
+    // Agent remote control (MCP / REST). The main process forwards an outside
+    // agent's request here; ui/js/remote-control.js answers on the same id.
+    onRemoteCommand: subscribe('remote-command', { replace: true }),
+    remoteCommandResult: (payload) => ipcRenderer.invoke('remote-command-result', payload || {}),
+    remoteAccessStatus: invoke('remote-access-status'),
+    remoteAccessSet: (payload) => ipcRenderer.invoke('remote-access-set', payload || {}),
+    // AI Connections: keys go in, never come back out.
+    aiConnectionsGet: invoke('ai-connections-get'),
+    aiConnectionsSave: (payload) => ipcRenderer.invoke('ai-connections-save', payload || {}),
+    aiConnectionsTest: (payload) => ipcRenderer.invoke('ai-connections-test', payload || {}),
 };
 
 const ROLE_METHODS = Object.freeze({

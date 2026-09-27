@@ -15,6 +15,9 @@ const {
 const {
     detectRequestedPackaging,
 } = require('./packaging-intent');
+const {
+    detectPersonSubject,
+} = require('./person-subject');
 
 const STOCK_PROVIDER_KEYS = new Set(['pexels', 'pixabay', 'storyblocks']);
 
@@ -324,6 +327,20 @@ function buildMediaHunterProfile(scene, scriptContext = {}, opts = {}) {
         agentPlan,
         mediaHunter: { prefer, mandatoryVisible },
     });
+    // Is this scene about a person the whole video is about? Free stock has no
+    // footage of a specific athlete, so the exact-moment bar guarantees an empty
+    // scene. Kept separate from `allowRelevantPeople` on purpose: that flag asks
+    // "does a person belong in frame at all" from a role vocabulary, while this
+    // asks "is THIS scene about THE main character" from the Director's typed
+    // entities. strictRaw stays ON either way — anchors and tickers are still
+    // rejected; only "right person, wrong day" stops being a failure.
+    const personSubject = detectPersonSubject({
+        scene,
+        scriptContext,
+        keyword,
+        agentPlan,
+        allowGraphics,
+    });
     const avoid = _dedupe([
         ...(agentPlan?.mustAvoid || []),
         ...(agentPlan?.rejectIf || []),
@@ -354,6 +371,7 @@ function buildMediaHunterProfile(scene, scriptContext = {}, opts = {}) {
         strictRaw,
         allowGraphics,
         requestedPackaging,
+        personSubject,
         allowScreen,
         allowRelevantPeople,
         allowEditorialText,
@@ -616,6 +634,7 @@ function summarizeMediaHunter(profile) {
         domain: profile.domain,
         strictRaw: profile.strictRaw,
         allowRelevantPeople: profile.allowRelevantPeople,
+        personSubject: profile.personSubject?.active ? profile.personSubject.people : [],
         target: profile.targetDescription,
         prefer: profile.prefer?.slice(0, 8) || [],
         avoid: profile.avoid?.slice(0, 8) || [],

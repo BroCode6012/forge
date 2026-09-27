@@ -18,6 +18,7 @@ const {
 const {
     harmonizeVisualPalette,
 } = require('./hf-palette-coherence');
+const { substituteRenderFonts } = require('./hf-font-substitution');
 const {
     videoLint,
     motionFamily: videoLintMotionFamily,
@@ -1203,6 +1204,23 @@ function safeLayoutRequested(mg) {
     );
 }
 
+/**
+ * Two real sides, or none.
+ *
+ * A comparison only exists if the copy actually names two things — either the
+ * headline splits on "vs"/"versus", or the graphic carries at least two items.
+ * When neither is true this used to fill the frame with the literal words
+ * "Option A" / VS / "Option B": a full-screen structure holding no information
+ * whatsoever, invented by the renderer rather than by anything upstream. It is
+ * the single most machine-made artefact the engine could emit, and it shipped
+ * whenever the author's own composition was rejected on a comparison brief.
+ *
+ * So the placeholders are gone and `ok` is the honest answer. Callers must
+ * treat `ok === false` as "this is not a comparison" and fall through to a
+ * layout that shows only what the graphic really has (headline, note, items).
+ * Degrading the STRUCTURE is right; inventing CONTENT to justify the structure
+ * never was.
+ */
 function comparisonContent(mg, text, subtext, items = []) {
     const parts = String(text || '')
         .split(/\s+(?:vs\.?|versus)\s+/i)
@@ -1214,10 +1232,13 @@ function comparisonContent(mg, text, subtext, items = []) {
         .filter(Boolean);
     const sides = parts.length >= 2 ? [parts[0], parts.slice(1).join(' vs ')] : itemLabels;
     const note = conciseVisualText(subtext, { maxChars: 96, maxWords: 14 });
+    const left = sides[0] || '';
+    const right = sides[1] || '';
     return {
-        left: sides[0] || 'Option A',
-        right: sides[1] || 'Option B',
+        left,
+        right,
         note,
+        ok: Boolean(left && right),
     };
 }
 
@@ -1231,7 +1252,11 @@ function normalizeItem(item, index) {
     const value = displayValue(item.value, item.number, item.stat, item.rank, item.year, item.prefix);
     const subtext = displayValue(item.subtext, item.subtitle, item.description, item.note);
     if (!label && !value && !subtext) return null;
-    return { label: label || subtext || `Item ${index + 1}`, value: value || String(index + 1), subtext };
+    // No fabricated "Item 3" label. An entry that only carries a value (a year,
+    // a figure) shows that value alone — renderItemList already tolerates an
+    // empty label. The positional `value` fallback stays: in a ranking or
+    // timeline the number IS the structure, not invented content.
+    return { label: label || subtext || '', value: value || String(index + 1), subtext };
 }
 
 function parseItemsFromText(value) {
@@ -1325,6 +1350,99 @@ function semanticallyRepeatsDisplay(a, b) {
     return [...leftWords].some(word => rightWords.has(word))
         || leftWords.size === 0
         || rightWords.size === 0;
+}
+
+// Grammatical glue only — no topic, niche or content words may ever be added
+// here. A note lifted mid-sentence out of the narration keeps the conjunction
+// that joined it to the previous clause ("and in Holmes County, Ohio right
+// where those Amish farms sit, …"), which is the clearest possible tell that
+// nobody wrote the line for the screen. A human editor drops that word.
+// English-only by design: on another language the list simply never matches,
+// so the note is left exactly as it arrived — it can under-fire, never misfire.
+const NOTE_LEAD_CONNECTIVES = new Set([
+    'and', 'but', 'so', 'or', 'yet', 'plus', 'then', 'because', 'since',
+    'which', 'that', 'while', 'though', 'although', 'whereas',
+]);
+
+// Words that carry no information of their own. Used only to decide whether a
+// note says anything the headline did not already say.
+const NOTE_FUNCTION_WORDS = new Set([
+    ...NOTE_LEAD_CONNECTIVES,
+    'a', 'an', 'the', 'of', 'to', 'in', 'on', 'at', 'by', 'for', 'from',
+    'with', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'it', 'its',
+    'this', 'these', 'those', 'vs', 'versus', 'than', 'compared', 'v',
+]);
+
+/**
+ * The note under a headline has to earn its place.
+ *
+ * Shipped in a real video: the headline read "Earth Tube COP 28 vs
+ * Conventional AC COP 3" and the note under it read "28 versus 3." — the same
+ * two numbers, the same comparison, second-hand. It is the graphic talking to
+ * itself, and it is exactly the "repeated card with no review" the whole
+ * fullscreen redesign is against. Two deterministic rules, both content-blind:
+ *
+ *   1. Strip a leading conjunction, so a clause pulled out of the narration
+ *      reads as a written line instead of a fragment of a sentence that the
+ *      viewer never heard the start of.
+ *   2. Drop the note entirely when it introduces no number and no word the
+ *      headline did not already carry. Not "is similar" — adds NOTHING. A note
+ *      with one new figure, one new place, one new name survives untouched.
+ *
+ * Rule 2 is deliberately strict about what counts as new: a note is only
+ * silenced when every number in it and every content word in it is already on
+ * screen. That keeps it safe for every language and every topic, because it
+ * never asks what the words MEAN — only whether the viewer is being shown them
+ * twice.
+ *
+ * Structural callers must keep the raw string: item lists and fallback
+ * background labels are parsed out of subtext, and those are not display copy.
+ */
+function visualNote(subtext, headline) {
+    const raw = String(subtext || '').replace(/\s+/g, ' ').trim();
+    if (!raw) return '';
+
+    let note = raw;
+    const lead = note.match(/^([A-Za-z]+)[,\s]+/);
+    if (lead && NOTE_LEAD_CONNECTIVES.has(lead[1].toLowerCase())) {
+        const rest = note.slice(lead[0].length).trim();
+        // Only if something survives the strip — "And." must not become "".
+        if (rest) note = rest.charAt(0).toUpperCase() + rest.slice(1);
+    }
+
+    const title = String(headline || '').trim();
+    if (!title) return note;
+
+    const titleNorm = normalizeDisplaySemantics(title);
+    const noteNorm = normalizeDisplaySemantics(note);
+    if (!noteNorm) return '';
+    if (noteNorm === titleNorm) return '';
+
+    const titleNumbers = new Set(displayNumbers(titleNorm));
+    const newNumber = displayNumbers(noteNorm).some(value => !titleNumbers.has(value));
+    if (newNumber) return note;
+
+    const contentWords = value => value
+        .split(' ')
+        .filter(word => word.length > 1 && !/^[\d$€£¥]/.test(word) && !NOTE_FUNCTION_WORDS.has(word));
+    const titleWords = new Set(contentWords(titleNorm));
+    const newWord = contentWords(noteNorm).some(word => !titleWords.has(word));
+    return newWord ? note : '';
+}
+
+/**
+ * A one-entry "list" parsed out of a prose line is not structure — it is the
+ * same sentence wearing a list's clothes.
+ *
+ * These fallback lists are only reached when the graphic carried no real items,
+ * so by construction a subtext-derived one is a single entry: the whole note,
+ * re-printed under the headline as a numbered row. When that entry adds nothing
+ * the headline already said, it is the restatement defect again, and it goes
+ * for the same reason. Genuine multi-entry lists are returned untouched.
+ */
+function prosaicItems(items, headline) {
+    if (!Array.isArray(items) || items.length !== 1) return items || [];
+    return visualNote(items[0]?.label, headline) ? items : [];
 }
 
 function templateKicker(_type, mg = null) {
@@ -2171,8 +2289,11 @@ function buildSafeLayoutMarkup({
         { maxChars: 160, maxWords: 24 }
     );
 
-    if (type === 'comparison-card') {
-        const comparison = comparisonContent(mg, text, subtext, items);
+    // No two real sides ⇒ not a comparison. Falls through to the generic safe
+    // card below, which shows the headline/subtitle/items this graphic actually
+    // has instead of a VS split holding invented labels. See comparisonContent.
+    const comparison = type === 'comparison-card' ? comparisonContent(mg, text, subtext, items) : null;
+    if (comparison && comparison.ok) {
         return `
     ${renderAssetFill(asset, id, start, duration, track, {
         template: kind === 'template',
@@ -2234,12 +2355,14 @@ function buildSafeLayoutMarkup({
 function buildFallbackMap(labels, mg, dirs) {
     const countryMap = buildCountryBorderMap(mg, labels, dirs);
     if (countryMap) return countryMap;
-    const chips = labels.length ? labels : ['Map data'];
+    // No place names ⇒ no label row. The grid and route still draw a real map
+    // graphic; a chip reading "Map data" was the renderer narrating its own
+    // emptiness, which is the same tell as the VS card with no sides.
     return `
       <div class="hf-fallback-map">
         <div class="hf-map-grid"></div>
         <div class="hf-map-route"></div>
-        <div class="hf-map-fallback-labels">${chips.map(label => `<span>${html(label)}</span>`).join('')}</div>
+        ${labels.length ? `<div class="hf-map-fallback-labels">${labels.map(label => `<span>${html(label)}</span>`).join('')}</div>` : ''}
       </div>`;
 }
 
@@ -2299,8 +2422,11 @@ function buildVisualDiagnostics(graphics, dirs) {
         const type = resolveVisualType(mg, mg?._hfKind || 'graphic');
         const visual = mg?._hfVisual || resolveHyperframeVisual(mg, mg?._hfKind || 'graphic', type, {});
         const text = getMgText(mg);
-        const subtext = getMgSubtext(mg);
-        const items = itemsFromMg(mg, text, subtext);
+        // Same split as buildMgMarkup: parse structure out of the raw string,
+        // hand the composition spec the copy that will actually be on screen.
+        const rawSubtext = getMgSubtext(mg);
+        const items = itemsFromMg(mg, text, rawSubtext);
+        const subtext = visualNote(rawSubtext, text);
         const spec = getAgenticCompositionSpec(mg, {
             kind: mg?._hfKind || 'graphic',
             type,
@@ -2651,8 +2777,11 @@ function buildMgMarkup(mg, id, kind, dirs, mediaDir, assetCache, visual = null, 
     const type = resolveVisualType(mg, kind || 'graphic');
     const resolvedVisual = visual || mg?._hfVisual || resolveHyperframeVisual(mg, kind || 'graphic', type, {});
     const text = getMgText(mg);
-    const subtext = getMgSubtext(mg);
-    const items = itemsFromMg(mg, text, subtext);
+    // rawSubtext is the STRUCTURE (item lists and fallback labels get parsed out
+    // of it); subtext is the DISPLAY copy, which has to earn its place on screen.
+    const rawSubtext = getMgSubtext(mg);
+    const items = itemsFromMg(mg, text, rawSubtext);
+    const subtext = visualNote(rawSubtext, text);
     const variant = cleanName(resolvedVisual.variant || 'standard', 'standard');
     const variantClass = classToken(variant, 'standard');
     const styleClass = classToken(resolvedVisual.styleName || 'clean', 'clean');
@@ -2964,7 +3093,7 @@ function buildMgMarkup(mg, id, kind, dirs, mediaDir, assetCache, visual = null, 
     }
 
     if (type === 'bar-chart') {
-        const bars = items.length ? items : parseItemsFromText(subtext || text).slice(0, 6);
+        const bars = items.length ? items : prosaicItems(parseItemsFromText(rawSubtext || text), text).slice(0, 6);
         return `
     <div ${baseAttrs}>
       <div class="hf-data-stage">
@@ -2992,7 +3121,7 @@ function buildMgMarkup(mg, id, kind, dirs, mediaDir, assetCache, visual = null, 
     }
 
     if (type === 'ranking-list' || type === 'bullet-list' || type === 'timeline') {
-        const list = items.length ? items : parseItemsFromText(subtext || text).slice(0, 7);
+        const list = items.length ? items : prosaicItems(parseItemsFromText(rawSubtext || text), text).slice(0, 7);
         return `
     <div ${baseAttrs}>
       <div class="hf-list-stage hf-list-${type}">
@@ -3014,8 +3143,11 @@ function buildMgMarkup(mg, id, kind, dirs, mediaDir, assetCache, visual = null, 
     </div>`;
     }
 
-    if (type === 'comparison-card') {
-        const comparison = comparisonContent(mg, text, subtext, items);
+    // Same rule as the safe-layout path: a comparison needs two real sides.
+    // Without them this falls through to the plain copy shell at the bottom of
+    // this function, which states the headline and nothing else.
+    const comparison = type === 'comparison-card' ? comparisonContent(mg, text, subtext, items) : null;
+    if (comparison && comparison.ok) {
         return `
     <div ${baseAttrs}>
       <div class="hf-comparison-stage">
@@ -3030,7 +3162,7 @@ function buildMgMarkup(mg, id, kind, dirs, mediaDir, assetCache, visual = null, 
     }
 
     if (type === 'listicle-grid') {
-        const gridItems = items.length ? items : parseItemsFromText(subtext || text);
+        const gridItems = items.length ? items : prosaicItems(parseItemsFromText(rawSubtext || text), text);
         return `
     <div ${baseAttrs}>
       <div class="hf-grid-stage">
@@ -3044,7 +3176,7 @@ function buildMgMarkup(mg, id, kind, dirs, mediaDir, assetCache, visual = null, 
         return `
     ${renderAssetFill(asset, id, start, duration, track, { template: isTemplateKind, preRoll: isTemplateKind ? 0.12 : 0 })}
     <div ${baseAttrs}>
-      ${asset || transparentTemplateBg ? '' : renderTemplateFallbackBg(id, type, text || subtext)}
+      ${asset || transparentTemplateBg ? '' : renderTemplateFallbackBg(id, type, text || rawSubtext)}
       <div class="hf-template-shade"></div>
       <div class="hf-chapter-rule"></div>
       <div class="hf-chapter-copy hf-shell-target">${buildTitleBits(text, subtext, { kicker })}</div>
@@ -3055,7 +3187,7 @@ function buildMgMarkup(mg, id, kind, dirs, mediaDir, assetCache, visual = null, 
         const itemDrivenTemplate = ['image-showcase', 'split-screen', 'infographic', 'timeline-card', 'fact-card', 'stat-card'].includes(type);
         const list = items.length
             ? items
-            : (itemDrivenTemplate ? parseItemsFromText(subtext || text).slice(0, 6) : []);
+            : (itemDrivenTemplate ? prosaicItems(parseItemsFromText(rawSubtext || text), text).slice(0, 6) : []);
         const stage = type.replace(/-card$/, '').replace(/-/g, '-');
         const singleStatSummary = type === 'stat-card' && list.length === 1
             ? `${list[0].value || ''} ${list[0].label || ''} ${list[0].subtext || ''}`.trim()
@@ -3066,7 +3198,7 @@ function buildMgMarkup(mg, id, kind, dirs, mediaDir, assetCache, visual = null, 
         return `
     ${renderAssetFill(asset, id, start, duration, track, { template: isTemplateKind, preRoll: isTemplateKind ? 0.12 : 0 })}
     <div ${baseAttrs}>
-      ${asset || transparentTemplateBg ? '' : renderTemplateFallbackBg(id, type, text || subtext)}
+      ${asset || transparentTemplateBg ? '' : renderTemplateFallbackBg(id, type, text || rawSubtext)}
       <div class="hf-template-shade"></div>
       <div class="hf-template-stage hf-template-stage-${stage}">
         ${type === 'person-intro' && kicker ? `<div class="hf-person-label">${html(kicker)}</div>` : ''}
@@ -3111,9 +3243,26 @@ function buildMgMarkup(mg, id, kind, dirs, mediaDir, assetCache, visual = null, 
     </div>`;
     }
 
+    // Last resort: a plain statement card. It gets to exist only if there is
+    // something to state.
+    //
+    // The old `text || subtext || type` fallback meant a graphic that arrived
+    // with no copy at all still painted a full shell — gradient, blur, shadow —
+    // wrapped around its own machine name ("comparison-card"). Nobody wrote
+    // that string, nobody reviewed it, and it read as pure generated filler.
+    // With nothing to say the element still exists (so its timeline, its id and
+    // any transition targeting it stay intact) but `.hf-mg` carries no
+    // background of its own, so it paints exactly nothing and whatever sits
+    // underneath shows through unchanged.
+    const statement = text || subtext;
+    if (!statement) {
+        console.warn(`[HyperFrames] ${id} (${type}) arrived with no text, no subtext and no items — rendering nothing rather than a card labelled with its own type name`);
+        return `
+    <div ${baseAttrs} data-hf-empty="1"></div>`;
+    }
     return `
     <div ${baseAttrs}>
-      <div class="hf-copy-shell hf-shell-target">${buildTitleBits(text || subtext || type, text ? subtext : '')}</div>
+      <div class="hf-copy-shell hf-shell-target">${buildTitleBits(statement, text ? subtext : '')}</div>
     </div>`;
 }
 
@@ -4181,8 +4330,10 @@ function buildComposition({ plan, dirs, projectDir, options = {} }) {
         const timing = mg._hfTiming || getVisualTiming(mg, mg._hfKind, type);
         const visual = mg._hfVisual || resolveHyperframeVisual(mg, mg._hfKind, type, plan);
         const text = getMgText(mg);
-        const subtext = getMgSubtext(mg);
-        const resolvedItems = itemsFromMg(mg, text, subtext);
+        // Same split as buildMgMarkup, which renders this exact graphic below.
+        const rawSubtext = getMgSubtext(mg);
+        const resolvedItems = itemsFromMg(mg, text, rawSubtext);
+        const subtext = visualNote(rawSubtext, text);
         const hasAsset = hasResolvedMgAsset(mg, type, dirs);
         const spec = getAgenticCompositionSpec(mg, {
             kind: mg._hfKind,
@@ -4333,9 +4484,14 @@ function buildComposition({ plan, dirs, projectDir, options = {} }) {
             );
             const isRangeSlice = sourceOffset > 0.001 || sourceDuration > visibleDuration + 0.001;
             const sliceEnd = Math.min(sourceDuration, sourceOffset + visibleDuration);
+            // The authored code sees `tl` as a guarded facade (hfGuardTimeline)
+            // so a tween aimed at a pseudo-element or a blank selector is
+            // dropped instead of becoming a dead "GSAP target not found" tween.
+            // Priming and the hand-off to the master must use the REAL timeline
+            // — the facade is not a GSAP instance.
             const wrapped = isRangeSlice
-                ? `(function(__master){ var tl = gsap.timeline({paused:true});\n${g._hfAuthoredTimeline}\ntry { tl.progress(1, true).progress(0, true); } catch (e) {}\n__master.fromTo(tl,{time:${sourceOffset.toFixed(3)}},{time:${sliceEnd.toFixed(3)},duration:${visibleDuration.toFixed(3)},ease:"none"},${(Number(g._hfAuthoredOffset) || 0).toFixed(3)}); })(tl);`
-                : `(function(__master){ var tl = gsap.timeline();\n${g._hfAuthoredTimeline}\ntry { tl.progress(1, true).progress(0, true); } catch (e) {}\n__master.add(tl, ${(Number(g._hfAuthoredOffset) || 0).toFixed(3)}); })(tl);`;
+                ? `(function(__master, __hfGsap){ var __hfReal = __hfGsap.timeline({paused:true}); var tl = hfGuardTimeline(__hfReal); var gsap = hfGuardGsap(__hfGsap);\n${g._hfAuthoredTimeline}\ntry { __hfReal.progress(1, true).progress(0, true); } catch (e) {}\n__master.fromTo(__hfReal,{time:${sourceOffset.toFixed(3)}},{time:${sliceEnd.toFixed(3)},duration:${visibleDuration.toFixed(3)},ease:"none"},${(Number(g._hfAuthoredOffset) || 0).toFixed(3)}); })(tl, gsap);`
+                : `(function(__master, __hfGsap){ var __hfReal = __hfGsap.timeline(); var tl = hfGuardTimeline(__hfReal); var gsap = hfGuardGsap(__hfGsap);\n${g._hfAuthoredTimeline}\ntry { __hfReal.progress(1, true).progress(0, true); } catch (e) {}\n__master.add(__hfReal, ${(Number(g._hfAuthoredOffset) || 0).toFixed(3)}); })(tl, gsap);`;
             try {
                 new vm.Script(wrapped);
                 return wrapped;
@@ -5404,6 +5560,57 @@ ${audioTags.join('\n')}
     function hfSet(selector, vars, at) {
       if (hfHas(selector)) hfActiveTimeline.set(selector, vars, at);
     }
+    // GSAP cannot animate a CSS pseudo-element by selector string, and a blank
+    // target matches nothing — both make the tween a silent no-op that surfaces
+    // only as "GSAP target ... not found" console noise. Authored compositions
+    // ask for ::after accents often enough to produce dozens of these per
+    // render. Drop ONLY provably-dead targets: a selector that merely matches
+    // nothing right now is left alone, because authored markup may be built
+    // later and silently swallowing those would kill real animations.
+    function hfDeadTarget(target) {
+      if (typeof target !== 'string') return false;
+      if (!target.trim()) return true;
+      return /::|:(?:before|after|first-line|first-letter|selection|placeholder|backdrop|marker)\b/i.test(target);
+    }
+    function hfLiveTarget(target) {
+      if (Array.isArray(target)) {
+        var kept = target.filter(function(one) { return !hfDeadTarget(one); });
+        return kept.length ? kept : null;
+      }
+      return hfDeadTarget(target) ? null : target;
+    }
+    // Wraps an authored timeline so every tween target goes through
+    // hfLiveTarget. Prototype-delegates, so any other timeline method the
+    // authored code calls behaves exactly as it did before.
+    function hfGuardTimeline(realTimeline) {
+      var guard = Object.create(realTimeline);
+      ['to', 'from', 'fromTo', 'set'].forEach(function(method) {
+        guard[method] = function(target) {
+          var live = hfLiveTarget(target);
+          if (live === null) return guard;
+          var args = Array.prototype.slice.call(arguments);
+          args[0] = live;
+          realTimeline[method].apply(realTimeline, args);
+          return guard;
+        };
+      });
+      return guard;
+    }
+    // Same guard for the global gsap object the authored fragment sees — its
+    // whitelist allows bare gsap.set(), which reaches the same dead targets.
+    function hfGuardGsap(realGsap) {
+      var facade = Object.create(realGsap);
+      ['to', 'from', 'fromTo', 'set'].forEach(function(method) {
+        facade[method] = function(target) {
+          var live = hfLiveTarget(target);
+          if (live === null) return null;
+          var args = Array.prototype.slice.call(arguments);
+          args[0] = live;
+          return realGsap[method].apply(realGsap, args);
+        };
+      });
+      return facade;
+    }
 
     for (const sourceItem of timing.graphicAnims) {
       const visibleStart = Math.max(0, Number(sourceItem.start) || 0);
@@ -5892,8 +6099,13 @@ ${adaptiveLiveHookScript}
     // even though the block self-guards on ?preview. So strip the entire preview
     // runtime from the render build — HyperFrames drives the GSAP timeline itself,
     // frame-accurate and deterministic.
-    if (options && options.preview) return __hfHtml;
-    return __hfHtml.replace(/\/\*HF_PREVIEW_START\*\/[\s\S]*?\/\*HF_PREVIEW_END\*\//, '');
+    // Last stop before the HTML leaves the bridge: every font stack in it —
+    // theme token, authored composition, template or directive — is reduced to
+    // faces this render actually bundles an @font-face for. Anything else cannot
+    // resolve in the capture browser, and Motion QA blocks the render for it.
+    const __hfFonts = substituteRenderFonts(__hfHtml).html;
+    if (options && options.preview) return __hfFonts;
+    return __hfFonts.replace(/\/\*HF_PREVIEW_START\*\/[\s\S]*?\/\*HF_PREVIEW_END\*\//, '');
 }
 
 /**

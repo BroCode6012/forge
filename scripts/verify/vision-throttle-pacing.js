@@ -66,7 +66,11 @@ function check(label, condition, detail) {
     }
 }
 
-const src = fs.readFileSync(SRC_PATH, 'utf8');
+// Normalized to LF: the anchors below are bare newlines, which never match on a
+// CRLF working copy — the gate then reports its own subject as missing and the
+// `npm run verify` && chain aborts before every later check. Found 2026-08-28.
+const src = fs.readFileSync(SRC_PATH, 'utf8')
+    .split(String.fromCharCode(13)).join('');
 
 // ---------------------------------------------------------------------------
 // The shape of the code

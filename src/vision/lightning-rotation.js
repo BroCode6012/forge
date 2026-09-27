@@ -226,6 +226,48 @@ function removeAccount(id) {
     return { ok: true };
 }
 
+/**
+ * When, if ever, can this pool serve again?
+ *
+ * pickAccount() returning null used to be reported as a plain failure, so the caller
+ * retried it six times over ~4.8 minutes. That wait can only ever pay off for the 45s
+ * env-error cooldown: FAIL_COOLDOWN_MS is 15 minutes (never clears inside the window)
+ * and `exhausted` does not clear at all until the manual monthly reset. Every other
+ * case was guaranteed dead time in front of a build — the 2026-08-27 log spent five
+ * minutes here before falling back to Bedrock, having never had a chance.
+ *
+ * So report the soonest moment an account becomes viable. `soonestMs === null` means
+ * never (within this cycle), which the caller turns into an immediate fallback.
+ */
+function nextViableAt() {
+    const accounts = loadAccounts();
+    if (!accounts.length) return { soonestMs: null, allExhausted: true, detail: 'no accounts in the pool' };
+    const now = Date.now();
+    let soonest = null;
+    let exhausted = 0;
+    let unhealthy = 0;
+    let cooling = 0;
+    for (const a of accounts) {
+        const st = _s(a.id);
+        if (st.exhausted || (st.usedSeconds || 0) >= _budgetSeconds(a)) { exhausted++; continue; }
+        if (st.healthy === false) { unhealthy++; continue; }
+        const until = st.cooldownUntil || 0;
+        if (until <= now) return { soonestMs: 0, allExhausted: false, detail: 'an account is viable now' };
+        cooling++;
+        const wait = until - now;
+        if (soonest === null || wait < soonest) soonest = wait;
+    }
+    const parts = [];
+    if (exhausted) parts.push(`${exhausted} exhausted`);
+    if (unhealthy) parts.push(`${unhealthy} unhealthy`);
+    if (cooling) parts.push(`${cooling} cooling down`);
+    return {
+        soonestMs: soonest,
+        allExhausted: soonest === null,
+        detail: parts.join(', ') || 'no viable account',
+    };
+}
+
 /** Human-readable status of the pool (for logs). */
 function status() {
     return loadAccounts().map((a) => {
@@ -270,5 +312,5 @@ module.exports = {
     isEnabled, loadAccounts, pickAccount,
     beginSession, endSession, markFailure, markHealthy, markExhausted,
     resetCycle, addAccount, updateAccount, removeAccount, status, poolDetails,
-    getForcedAccount, setForcedAccount,
+    getForcedAccount, setForcedAccount, nextViableAt,
 };

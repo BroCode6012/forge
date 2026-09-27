@@ -26,7 +26,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { requestSafeBuffer } = require('../security/safe-download');
-const { callVisionAI } = require('../brain/ai-provider');
+const { callVisionAI: _callVisionAI } = require('../brain/ai-provider');
+const { withCostPurpose } = require('../brain/cost-tracker');
+
+// Every look this file takes is a pre-download glance at preview pictures —
+// labelled so the cost report can say how much of the vision bill it is.
+const callVisionAI = (...args) => withCostPurpose('thumbnail-grid', () => _callVisionAI(...args));
 const { normalizeUrlForDedup } = require('../util/url-utils');
 
 const _verdictCache = new Map(); // `${sceneKey}|${urlKey}` -> { keep, reason }
@@ -615,6 +620,10 @@ async function screenThumbnailGrid(results, contract, scene, opts = {}) {
         return {
             ranked: results,
             confirmed: [],
+            // Handed to the race, which defers what the screen declined behind
+            // everything else and probes it before downloading the rest — see
+            // candidate-race.js. The order returned here is still unchanged.
+            verdicts,
             saw, missed, unsure,
             screened: verdicts.size,
             log: verdicts.size
@@ -649,6 +658,7 @@ async function screenThumbnailGrid(results, contract, scene, opts = {}) {
     return {
         ranked,
         confirmed,
+        verdicts,
         saw, missed, unsure,
         screened: verdicts.size,
         log: `  👁️ [Thumbnail Screen] [${providerName}] looked at ${verdicts.size} preview(s) before downloading: ${saw} show "${_screenTarget(contract)}", ${missed} don't${unsure ? `, ${unsure} unclear` : ''} — racing "${topTitle.slice(0, 60)}" first`,

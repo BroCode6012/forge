@@ -48,6 +48,18 @@ function referenceBuildEnv(options, PROJECT_DIR) {
     if (options.buildStyleProfile && options.buildStyleProfile !== 'none') buildEnv.BUILD_STYLE_PROFILE = options.buildStyleProfile;
     const isSmartAI = options.smartAI !== false && options.smartAI !== 'false';
     buildEnv.SMART_AI = isSmartAI ? 'true' : 'false';
+    // AI provider. Deliberately NOT behavior-preserving: the schema marks aiProvider
+    // env:null, so it never reached the build child at all, and the one AI_PROVIDER value
+    // that is not a decoy ('azure-managed') could therefore never take effect. Written
+    // unconditionally — including the 'bedrock' default — because only keys in `own` reach
+    // YTA_ENV_LOCK, and an unlocked default is one a stale .env can overrule.
+    buildEnv.AI_PROVIDER = options.aiProvider || 'bedrock';
+    // Azure Managed is a whole-brain choice: it must carry the vision backend with it for
+    // entry points that never touch the UI dropdowns (the headless launcher, and any
+    // project saved before the Vision Backend control existed). An explicit choice wins.
+    if (!options.visionBackend && buildEnv.AI_PROVIDER === 'azure-managed') {
+        buildEnv.VISION_BACKEND = 'azure-managed';
+    }
     const clipAnalyzerOn = options.clipAnalyzer !== false && options.clipAnalyzer !== 'false';
     buildEnv.CLIP_ANALYZER_ENABLED = clipAnalyzerOn ? 'true' : 'false';
     buildEnv.BUILD_RESUME = 'false';
@@ -97,6 +109,10 @@ const COMBOS = [
     // in the child env contract.
     { visionBackend: 'bedrock' },
     { visionBackend: 'lightning', buildTheme: 'crime', smartAI: false },
+    // The 2026-08-29 gap: an azure-managed brain with NO vision choice saved.
+    { aiProvider: 'azure-managed' },
+    // ...and the same brain where the operator DID choose — the choice must win.
+    { aiProvider: 'azure-managed', visionBackend: 'lightning' },
 ];
 
 console.log('\n=== build-env.js === main.js reference (across ' + COMBOS.length + ' option combos) ===');
@@ -120,6 +136,7 @@ const OLD_FULL = [
     'KLING_AVATAR', 'KLING_RESOLUTION', 'KLING_AVATAR_PROMPT',
     'VEO_AI_VIDEO', 'VEO_SCOPE', 'VEO_RESOLUTION', 'VEO_BACKEND', 'VEO_MODEL',
     'AI_VIDEO_BACKEND', 'KLING_VIDEO_RESOLUTION', 'KLING_VIDEO_MODE', 'KLING_VIDEO_URL', 'SMART_AI',
+    'AI_PROVIDER',
     'LOW_BANDWIDTH_MODE', 'DATA_SAVER_MODE', 'NETWORK_PROFILE',
     'DOWNLOAD_CONCURRENCY', 'SCENE_DOWNLOAD_CONCURRENCY', 'MEDIA_SCENE_CONCURRENCY', 'SCENE_DOWNLOAD_TIMEOUT_MS',
     'STRICT_RAW_SCENE_TIMEOUT_MS', 'STRICT_RAW_BACKUP_TIMEOUT_MS',

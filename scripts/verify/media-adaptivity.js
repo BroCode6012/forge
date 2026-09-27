@@ -146,7 +146,11 @@ check('the ranking it reads is real data, not a table in this module', () => {
     // The whole point of "no hardcoding": the per-topic answer must come from
     // niches.js. Reordering a niche's footagePriority must change patience
     // without anyone touching download-patience.js.
-    const src = fs.readFileSync(path.join(ROOT, 'src', 'media', 'download-patience.js'), 'utf8');
+    // Normalized to LF: the anchors below are bare newlines, which never match on a
+    // CRLF working copy — the gate then reports its own subject as missing and the
+    // `npm run verify` && chain aborts before every later check. Found 2026-08-28.
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'media', 'download-patience.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     assert.ok(/getNiche\(nicheId\)\?\.footagePriority/.test(src),
         'patience must read the ranking from niches.js, not carry its own copy');
 
@@ -174,7 +178,8 @@ check('the ranking it reads is real data, not a table in this module', () => {
 
 check('no niche is hardcoded anywhere in either new module', () => {
     for (const f of ['download-patience.js', 'provider-scoreboard.js']) {
-        const src = fs.readFileSync(path.join(ROOT, 'src', 'media', f), 'utf8');
+        const src = fs.readFileSync(path.join(ROOT, 'src', 'media', f), 'utf8')
+            .split(String.fromCharCode(13)).join('');
         const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
         const offenders = code.match(/(nicheId|niche)\s*===\s*['"]/g) || [];
         assert.strictEqual(offenders.length, 0,
@@ -188,15 +193,45 @@ console.log('\n[2/9] Fix 1 — the scene-share clamp keeps the rescue ladder ali
 
 check('one candidate can never eat the whole scene budget', () => {
     freshState();
-    const remaining = 40_000;
-    const got = ms(resolve({
+    // THE AUG-5 CORRECTION. This check used to assert the share clamp flatly,
+    // with a hardcoded 40s. But reserving 45% of the clock for a rescue rung
+    // only protects the scene while that rung can itself finish. Below the
+    // measured one-candidate minimum the reservation protects nothing and the
+    // budget in front of it is a scheduled loss — that is how YouTube got 56s
+    // against a ~60s minimum on scene after scene and won nothing all build.
+    //
+    // So the rule has two halves, and both are checked here. The line between
+    // them is measured, not written down, so this test derives it instead of
+    // naming a number.
+    const minViable = resolve({
         mediaType: 'video', providerKey: 'youtube', nicheId: 'explainer.diy',
-        remainingSceneMs: remaining,
-    }));
-    assert.ok(got <= Math.ceil(remaining * patience.MAX_SCENE_SHARE),
-        `patience ${got}ms exceeds ${patience.MAX_SCENE_SHARE * 100}% of the ${remaining}ms left`);
-    assert.ok(remaining - got >= 15_000,
-        `only ${remaining - got}ms would be left for every retry/fallback rung behind this download`);
+    }).minViableMs;
+
+    // (i) While a share still buys a whole candidate, the share is the cap.
+    const roomy = Math.ceil((minViable / patience.MAX_SCENE_SHARE) * 1.5);
+    const shared = resolve({
+        mediaType: 'video', providerKey: 'youtube', nicheId: 'explainer.diy',
+        remainingSceneMs: roomy,
+    });
+    assert.ok(shared.ms <= Math.ceil(roomy * patience.MAX_SCENE_SHARE),
+        `patience ${shared.ms}ms exceeds ${patience.MAX_SCENE_SHARE * 100}% of the ${roomy}ms left`);
+    assert.ok(roomy - shared.ms >= minViable,
+        `only ${roomy - shared.ms}ms would be left, less than the ${minViable}ms a rescue rung needs to finish`);
+    assert.strictEqual(shared.lastChance, false, 'the share was still affordable — this is not a last chance');
+
+    // (ii) Once it does not, the scene has room for exactly one real attempt,
+    // and the honest move is to spend what is left on it rather than hand out a
+    // budget the module has already computed to be too short to reach a verdict.
+    const tight = Math.round(minViable * 1.2);
+    const last = resolve({
+        mediaType: 'video', providerKey: 'youtube', nicheId: 'explainer.diy',
+        remainingSceneMs: tight,
+    });
+    assert.strictEqual(last.lastChance, true,
+        'the scene-share clamp is back to cutting below the one-candidate minimum');
+    assert.ok(last.ms <= tight, `last-chance budget ${last.ms}ms exceeds the ${tight}ms the scene has left`);
+    assert.ok(last.ms >= Math.min(tight, minViable),
+        `last-chance budget ${last.ms}ms is under the ${minViable}ms needed to reach a verdict`);
 });
 
 check('the clamp only bites when the scene is actually short on time', () => {
@@ -255,7 +290,8 @@ check('a provider with a genuinely slow tail is not strangled', () => {
 
 check('failures are NOT sampled (a stall must not inflate patience forever)', () => {
     freshState();
-    const src = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8');
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     assert.ok(/_assertDownloadedFile[\s\S]{0,900}?downloadPatience\.recordDownload/.test(src),
         'recordDownload must be called only after the download is asserted good');
 });
@@ -346,7 +382,8 @@ check('no .env layer on this machine is forcing 0 (repo AND user-level)', () => 
     for (const layer of layers) {
         if (!fs.existsSync(layer.file)) continue;   // fresh clone / CI — nothing to check
         seen.push(layer.label);
-        const raw = fs.readFileSync(layer.file, 'utf8');
+        const raw = fs.readFileSync(layer.file, 'utf8')
+            .split(String.fromCharCode(13)).join('');
         for (const name of PATIENCE_ENV_KEYS) {
             const active = raw.split(/\r?\n/).filter(l => new RegExp(`^\\s*${name}\\s*=`).test(l));
             for (const line of active) {
@@ -368,7 +405,8 @@ check('this gate still covers every .env layer config.js loads', () => {
     // If someone adds a fourth layer, or makes the project .env able to carry
     // these keys, the check above silently goes back to being a false green.
     // Fail loudly instead of letting that happen quietly.
-    const cfg = fs.readFileSync(path.join(ROOT, 'src', 'settings', 'config.js'), 'utf8');
+    const cfg = fs.readFileSync(path.join(ROOT, 'src', 'settings', 'config.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     const head = cfg.slice(0, cfg.indexOf('const PROJECT_DIR'));
     const dotenvLoads = (head.match(/require\(['"]dotenv['"]\)\.config\(/g) || []).length;
     assert.strictEqual(dotenvLoads, 2,
@@ -424,7 +462,8 @@ check('but the topic still gets what it asked for, first', () => {
 });
 
 check('real bans still delete', () => {
-    const src = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8');
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     const body = src.slice(src.indexOf('function getSmartPriority'), src.indexOf('// ============ PROVIDER MANAGEMENT'));
     assert.ok(/excludeVideoProviders[\s\S]{0,300}?order\.filter\(p => !excluded\.has\(p\)\)/.test(body),
         'niche excludeVideoProviders must still remove providers outright');
@@ -433,7 +472,8 @@ check('real bans still delete', () => {
 });
 
 check('the hardcoded bing rescue is gone (it is no longer needed)', () => {
-    const src = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8');
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     assert.ok(!/allowedSet\.add\(\s*['"]bing['"]\s*\)/.test(src),
         'a per-provider hardcoded rescue is exactly the one-niche shape this fix removes');
 });
@@ -502,7 +542,8 @@ check('no provider is ever dropped — the result is always a permutation', () =
 });
 
 check('the scoreboard is per-run memory, not a persisted file', () => {
-    const src = fs.readFileSync(path.join(ROOT, 'src', 'media', 'provider-scoreboard.js'), 'utf8');
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'media', 'provider-scoreboard.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     assert.ok(!/require\(['"]fs['"]\)/.test(src),
         'evidence learned on one topic must not silently steer the next build');
 });
@@ -511,7 +552,8 @@ check('the scoreboard is per-run memory, not a persisted file', () => {
 console.log('\n[6/9] Both fixes are actually wired into the download path');
 // ─────────────────────────────────────────────────────────────────────────────
 
-const FM = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8');
+const FM = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
 
 check('footage-manager requires both new modules', () => {
     assert.ok(/require\(['"]\.\/provider-scoreboard['"]\)/.test(FM), 'provider-scoreboard not required');
@@ -521,8 +563,16 @@ check('footage-manager requires both new modules', () => {
 check('the race timeout comes from adaptive patience, not a constant', () => {
     assert.ok(/racePerCandidateTimeoutMs\s*=\s*patience\.ms/.test(FM),
         'the per-candidate race timeout must be resolved through download-patience');
-    assert.ok(/resolveCandidatePatienceMs\(\{[\s\S]{0,400}?remainingSceneMs:\s*remainingMs\(\)/.test(FM),
-        'the scene clamp only works if the live remaining scene time is passed in');
+    // The live clock must be an INPUT, not a constant. It may be floored by the
+    // in-flight grace (a race that has already started downloading gets its
+    // protected window counted as time it still has), but the reading itself has
+    // to come from remainingMs() or the clamp is measuring nothing.
+    const arg = (FM.match(/resolveCandidatePatienceMs\(\{[\s\S]{0,400}?\n\s*\}\)/) || [])[0] || '';
+    const line = (arg.match(/remainingSceneMs:[^\n]*/) || [])[0] || '';
+    assert.ok(/remainingMs\(\)/.test(line),
+        `the scene clamp only works if the live remaining scene time is passed in (got: ${line.trim() || 'nothing'})`);
+    assert.ok(!/remainingSceneMs:\s*\d/.test(line),
+        `the remaining scene time is a hardcoded number (${line.trim()})`);
     assert.ok(/resolveCandidatePatienceMs\(\{[\s\S]{0,400}?nicheId:\s*scriptContextRef\?\.nicheId/.test(FM),
         'the topic is what makes it per-niche — it must be passed in');
 });
@@ -557,7 +607,8 @@ console.log('\n[7/9] Fix 3 — a dud is never recorded as a win, and there is a 
 
 const coverage = require(path.join(ROOT, 'src', 'media', 'scene-coverage.js'));
 const rescue = require(path.join(ROOT, 'src', 'media', 'coverage-rescue.js'));
-const BV = fs.readFileSync(path.join(ROOT, 'src', 'pipeline', 'build-video.js'), 'utf8');
+const BV = fs.readFileSync(path.join(ROOT, 'src', 'pipeline', 'build-video.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
 
 const sc = (over = {}) => ({ index: 1, startTime: 10, endTime: 20, ...over });
 
@@ -626,7 +677,8 @@ check('the pipeline audit and the rescue read the SAME module', () => {
         'build-video must call the coverage rescue');
     assert.ok(/require\(['"]\.\.\/media\/scene-coverage['"]\)/.test(BV),
         'build-video must report coverage through the shared classifier');
-    const rescueSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'coverage-rescue.js'), 'utf8');
+    const rescueSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'coverage-rescue.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     assert.ok(/require\(['"]\.\/scene-coverage['"]\)/.test(rescueSrc),
         'the rescue must classify with the same module the audit reports from');
     assert.ok(!/!\s*scene\.mediaFile\s*&&\s*!scene\.isMGScene\s*&&\s*!scene\.fullscreenMG/.test(BV),
@@ -636,7 +688,8 @@ check('the pipeline audit and the rescue read the SAME module', () => {
 check('the give-up card never paints its engineering reason into the video', () => {
     // "scene download timed out after 15.2 min" was rendered on screen, in the
     // finished video, five times.
-    const fmSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8');
+    const fmSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     const start = fmSrc.indexOf('function createAgenticGraphicFallback');
     assert.ok(start > 0, 'createAgenticGraphicFallback not found');
     const body = fmSrc.slice(start, start + 6000);
@@ -647,7 +700,8 @@ check('the give-up card never paints its engineering reason into the video', () 
 });
 
 check('every fallback site records a placeholder, not an acceptance', () => {
-    const fmSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8');
+    const fmSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     // There are two — the exhausted-providers path and the scene-timeout path.
     // Both recorded 'accepted'; that is the bug that made the failure a win.
     const sites = [...fmSrc.matchAll(/key:\s*'agentic-visual-fallback'/g)];
@@ -662,7 +716,8 @@ check('every fallback site records a placeholder, not an acceptance', () => {
 });
 
 check('placeholders are excluded from the readiness count', () => {
-    const fmSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8');
+    const fmSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'footage-manager.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     const line = fmSrc.match(/const readyBeforeContinuity\s*=[\s\S]{0,400}?;/);
     assert.ok(line, 'readiness math not found');
     assert.ok(!/agenticGraphicFallback/.test(line[0]),
@@ -672,7 +727,8 @@ check('placeholders are excluded from the readiness count', () => {
 });
 
 check('the rescue budget is measured, not a constant', () => {
-    const rescueSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'coverage-rescue.js'), 'utf8');
+    const rescueSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'coverage-rescue.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     assert.ok(/resolveCandidatePatienceMs/.test(rescueSrc),
         'the rescue must take its time budget from the adaptive patience this run measured');
     // And it must actually MOVE when the run's measurements move. Same scene,
@@ -765,7 +821,8 @@ check('a successful rescue is reported as footage, by the same classifier', asyn
 });
 
 check('the rescue must not wipe the run dedup state, or two scenes get the same clip', () => {
-    const rescueSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'coverage-rescue.js'), 'utf8');
+    const rescueSrc = fs.readFileSync(path.join(ROOT, 'src', 'media', 'coverage-rescue.js'), 'utf8')
+        .split(String.fromCharCode(13)).join('');
     assert.ok(/preserveCache:\s*true/.test(rescueSrc),
         'without preserveCache the download clears the used-URL/hash sets and the rescue can hand a scene '
         + 'the exact clip another scene is already showing');
@@ -775,8 +832,15 @@ check('the sweep sees scenes that never joined the base track', () => {
     // fullscreenMG and download:'skip' scenes are filtered out BEFORE Step 5, so
     // they are absent from scenesWithMedia entirely. A sweep that only looked at
     // that array would be blind to the two biggest causes of a blank scene.
-    assert.ok(/const offTrack = \(scenesWithKeywords \|\| \[\]\)\.filter/.test(BV),
+    assert.ok(/partitionTrackMembership\(scenesWithMedia, scenesWithKeywords\)/.test(BV),
         'the sweep universe must include scenes excluded from the download set');
+    // Membership is by scene NUMBER. The MG and template carves rebuild the track
+    // out of `{ ...scene }` copies, so an identity test calls every live scene
+    // off-track and the merge below re-appends the whole track onto itself.
+    assert.ok(/const offTrack = \(candidateScenes \|\| \[\]\)\.filter/.test(BV),
+        'partitionTrackMembership must build the off-track list from the candidate scenes');
+    assert.ok(/onTrackNumbers\.has\(no\)/.test(BV),
+        'track membership must be resolved by scene number, not object identity');
     assert.ok(/rescueUncovered\(\{[\s\S]{0,400}?scenes:\s*sweepUniverse/.test(BV),
         'the rescue must be handed the full universe, not just the download set');
     // The merge itself is asserted structurally rather than by its log wording:
@@ -833,10 +897,14 @@ console.log('\n[8/9] Fix 4 — ask for the thing you actually want');
 
 const atoms = require(path.join(ROOT, 'src', 'media', 'phrase-atoms.js'));
 const kw = require(path.join(ROOT, 'src', 'media', 'search-keywords.js'));
-const PA_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'phrase-atoms.js'), 'utf8');
-const RESCUE_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'retrievability-rescue.js'), 'utf8');
-const VISION_SRC = fs.readFileSync(path.join(ROOT, 'src', 'vision', 'ai-vision.js'), 'utf8');
-const CLIP_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'clip-analyzer.js'), 'utf8');
+const PA_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'phrase-atoms.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
+const RESCUE_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'retrievability-rescue.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
+const VISION_SRC = fs.readFileSync(path.join(ROOT, 'src', 'vision', 'ai-vision.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
+const CLIP_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'clip-analyzer.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
 
 // Two independently-authored scenes that both talk about the same thing. No
 // niche, no theme, no word list — just a script.
@@ -1014,13 +1082,20 @@ console.log('\n[9/9] Fix 5 — read your own handwriting');
 
 const pkg = require(path.join(ROOT, 'src', 'media', 'packaging-intent.js'));
 const rules = require(path.join(ROOT, 'src', 'media', 'relevant-person-rules.js'));
-const PKG_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'packaging-intent.js'), 'utf8');
-const SEG_SRC = fs.readFileSync(path.join(ROOT, 'src', 'agents', 'smart-segment.js'), 'utf8');
-const HUNTER_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'media-hunter.js'), 'utf8');
-const SANITY_SRC = fs.readFileSync(path.join(ROOT, 'src', 'vision', 'vision-score-sanity.js'), 'utf8');
-const NICHES_SRC = fs.readFileSync(path.join(ROOT, 'src', 'data', 'niches.js'), 'utf8');
-const AIP_SRC = fs.readFileSync(path.join(ROOT, 'src', 'brain', 'ai-provider.js'), 'utf8');
-const KW_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'search-keywords.js'), 'utf8');
+const PKG_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'packaging-intent.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
+const SEG_SRC = fs.readFileSync(path.join(ROOT, 'src', 'agents', 'smart-segment.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
+const HUNTER_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'media-hunter.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
+const SANITY_SRC = fs.readFileSync(path.join(ROOT, 'src', 'vision', 'vision-score-sanity.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
+const NICHES_SRC = fs.readFileSync(path.join(ROOT, 'src', 'data', 'niches.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
+const AIP_SRC = fs.readFileSync(path.join(ROOT, 'src', 'brain', 'ai-provider.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
+const KW_SRC = fs.readFileSync(path.join(ROOT, 'src', 'media', 'search-keywords.js'), 'utf8')
+    .split(String.fromCharCode(13)).join('');
 
 // The scene that lost its footage, and a neighbour that never asked for a
 // diagram. Same niche, same script, same code path — only the brief differs.

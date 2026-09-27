@@ -1,6 +1,7 @@
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
+const { execFileSync } = require('child_process');
 const BaseProvider = require('./base-provider');
 const config = require('../../settings/config');
 const { createByteLimitTransform, requestSafeStream } = require('../../security/safe-download');
@@ -16,14 +17,16 @@ const {
 } = require('./ytdlp-utils');
 
 // ─── Reddit Video Provider ──────────────────────────────────────────
-// Uses Reddit's public JSON API (no keys needed).
-// Self-throttles to ~1 request per 4 seconds to stay under rate limits.
-// Strategy: UI-like media search first, then search.json fallback.
+// Keyless source: scrapes old.reddit.com's server-rendered search results.
+// One HTML response includes the post permalink, target URL, duration, score,
+// subreddit, and title, so discovery does not depend on Reddit's blocked JSON
+// endpoints or on one follow-up request per candidate.
 
 // Domains yt-dlp can download from (found in Reddit posts)
 const VIDEO_DOMAINS = new Set([
     'youtube.com', 'youtu.be', 'streamable.com', 'gfycat.com',
     'v.redd.it', 'clips.twitch.tv', 'vimeo.com', 'dailymotion.com',
+    'imgur.com', 'i.imgur.com', 'redgifs.com',
 ]);
 
 // Do not reject Reddit candidates by title/subreddit before vision. Reddit
@@ -56,18 +59,21 @@ class RedditVideoProvider extends BaseProvider {
         this._lastYtdlpCheckAt = 0;
         this._ytdlpCheckCooldownMs = 30000;
         this._scriptContext = null;
-        this._requestCount = 0;
-        // Strict rate limiting — 1 request per 4 seconds = 15/min (under Reddit's ~30/min limit)
+        this._userAgent = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+        // Reddit silently strips post results from otherwise-200 old.reddit
+        // responses when requests arrive in a burst. The promise tail makes the
+        // read/wait/write sequence atomic across parallel scene searches.
         this._lastRequestTime = 0;
-        this._minRequestGap = 4000;
+        this._minRequestGap = Math.max(
+            2000,
+            Math.min(30000, parseInt(process.env.REDDIT_REQUEST_GAP_MS || '4000', 10) || 4000)
+        );
+        this._requestTail = Promise.resolve();
         this._rateLimited = false;
         this._rateLimitUntil = 0;
         this._cookieJar = '';
         this._searchCache = new Map();
         this._lastCooldownLogAt = 0;
-        this._jsonBlockedUntil = 0;
-        this._jsonBlockedReason = '';
-        this._lastJsonBlockedLogAt = 0;
     }
 
     setContext(scriptContext) {
@@ -92,15 +98,25 @@ class RedditVideoProvider extends BaseProvider {
     // ─── Rate limiting ──────────────────────────────────────────────────
 
     async _throttle() {
-        if (this._cooldownRemainingMs() > 0) return false;
+        let release;
+        const previous = this._requestTail;
+        this._requestTail = new Promise(resolve => { release = resolve; });
 
-        // Enforce gap between requests
-        const elapsed = Date.now() - this._lastRequestTime;
-        if (elapsed < this._minRequestGap) {
-            await new Promise(r => setTimeout(r, this._minRequestGap - elapsed));
+        await previous.catch(() => {});
+        try {
+            if (this._cooldownRemainingMs() > 0) return false;
+
+            const elapsed = Date.now() - this._lastRequestTime;
+            if (elapsed < this._minRequestGap) {
+                await new Promise(r => setTimeout(r, this._minRequestGap - elapsed));
+            }
+            if (this._cooldownRemainingMs() > 0) return false;
+
+            this._lastRequestTime = Date.now();
+            return true;
+        } finally {
+            release();
         }
-        this._lastRequestTime = Date.now();
-        return true;
     }
 
     _cooldownRemainingMs() {
@@ -120,14 +136,6 @@ class RedditVideoProvider extends BaseProvider {
         if (now - this._lastCooldownLogAt < 5000) return;
         this._lastCooldownLogAt = now;
         console.log(`  [Reddit] Skipping ${context} — cooldown ${Math.ceil(remaining / 1000)}s left`);
-    }
-
-    _onJsonBlocked(status, message = '') {
-        const cooldownMs = Math.max(60_000, parseInt(process.env.REDDIT_JSON_BLOCK_COOLDOWN_MS || String(10 * 60_000), 10) || (10 * 60_000));
-        this._jsonBlockedUntil = Date.now() + cooldownMs;
-        this._jsonBlockedReason = `HTTP ${status}${message ? `: ${message}` : ''}`;
-        this._minRequestGap = Math.max(this._minRequestGap, 8000);
-        console.log(`  [Reddit] search.json blocked (${this._jsonBlockedReason}); cooling JSON fallback for ${Math.ceil(cooldownMs / 1000)}s`);
     }
 
     _cacheKey(keyword) {
@@ -160,20 +168,29 @@ class RedditVideoProvider extends BaseProvider {
         if (oldestKey) this._searchCache.delete(oldestKey);
     }
 
-    _onRateLimited() {
+    _onRateLimited(status = 429) {
         const configuredCooldown = parseInt(process.env.REDDIT_RATE_LIMIT_COOLDOWN_MS || '20000', 10);
-        const cooldownMs = Math.max(10_000, Number.isFinite(configuredCooldown) ? configuredCooldown : 20_000);
+        const baseCooldown = Number.isFinite(configuredCooldown) ? configuredCooldown : 20_000;
+        const cooldownMs = Math.max(status === 403 ? 60_000 : 10_000, baseCooldown);
         this._rateLimited = true;
         this._rateLimitUntil = Date.now() + cooldownMs;
         this._minRequestGap = Math.min(12000, this._minRequestGap + 2000);
-        console.log(`  [Reddit] 429 rate limited — ${Math.ceil(cooldownMs / 1000)}s cooldown, gap now ${this._minRequestGap / 1000}s`);
+        console.log(`  [Reddit] HTTP ${status} — ${Math.ceil(cooldownMs / 1000)}s cooldown, gap now ${this._minRequestGap / 1000}s`);
+    }
+
+    _onSilentRateLimited() {
+        const configured = parseInt(process.env.REDDIT_SILENT_RATE_LIMIT_COOLDOWN_MS || '20000', 10);
+        const cooldownMs = Math.max(10_000, Number.isFinite(configured) ? configured : 20_000);
+        this._rateLimited = true;
+        this._rateLimitUntil = Date.now() + cooldownMs;
+        this._minRequestGap = Math.max(this._minRequestGap, 6000);
+        console.log(`  [Reddit] old.reddit posts stayed stripped after a paced retry — ${Math.ceil(cooldownMs / 1000)}s cooldown`);
     }
 
     // ─── Search ─────────────────────────────────────────────────────────
 
     /**
-     * Global search, then a small relaxed-query ladder.
-     * Reddit's browser search is semantic/media-focused; search.json is literal.
+     * Global old.reddit search, then a small relaxed-query ladder.
      */
     async search(keyword) {
         const queries = this._buildSearchQueries(keyword);
@@ -189,21 +206,10 @@ class RedditVideoProvider extends BaseProvider {
                 continue;
             }
 
-            // Primary: imitate the new Reddit UI Media-tab search via HTML scrape.
             const htmlResults = await this._searchHtml(query);
             if (htmlResults && htmlResults.length > 0) {
                 this._setCachedSearch(query, htmlResults);
                 return this._cloneResults(htmlResults);
-            }
-            if (this._cooldownRemainingMs() > 0) {
-                this._logCooldownSkip('fallback search');
-                continue;
-            }
-            // Fallback: classic search.json — runs when HTML returns null/empty.
-            const results = await this._searchOnce(query);
-            if (results.length > 0) {
-                this._setCachedSearch(query, results);
-                return this._cloneResults(results);
             }
             if (this._cooldownRemainingMs() > 0) {
                 this._logCooldownSkip('relaxed searches');
@@ -213,162 +219,98 @@ class RedditVideoProvider extends BaseProvider {
         return [];
     }
 
-    // ─── UI-imitating HTML search ───────────────────────────────────────
-    // Mirrors what the user sees at reddit.com/search/?q=...&type=media.
-    // Returns null when the path was unusable (cooldown / blocked / 0 permalinks /
-    // too many resolve failures) so the caller falls through to search.json.
+    // ─── old.reddit HTML search ─────────────────────────────────────────
+    // The modern search page is a JavaScript shell. old.reddit still renders
+    // complete post cards on the server, including enough metadata to build
+    // candidates without touching the blocked *.json endpoints.
 
     async _searchHtml(keyword) {
-        const HTML_TIMEOUT_MS = 8000;
-        const POST_JSON_TIMEOUT_MS = 7000;
-        const PERMALINK_LIMIT = 5;
-        const TOTAL_BUDGET_MS = 25000;
-        const EARLY_STOP_AT = 5;
-        const RESOLVE_CONCURRENCY = 1;
-        const INTER_BATCH_DELAY_MS = 700;
+        const timeoutMs = Math.max(
+            5000,
+            Math.min(30000, parseInt(process.env.REDDIT_SEARCH_TIMEOUT_MS || '12000', 10) || 12000)
+        );
+        const startedAt = Date.now();
+        let pacedRetry = false;
 
-        const fail = (reason) => {
-            console.log(`  [Reddit] UI scrape → fallback (${reason})`);
-            return null;
-        };
-
-        const canProceed = await this._throttle();
-        if (!canProceed) {
-            this._logCooldownSkip('UI scrape');
-            return null;
-        }
-
-        const budgetStart = Date.now();
-        const overBudget = () => Date.now() - budgetStart > TOTAL_BUDGET_MS;
-        const ua = USER_AGENTS[this._requestCount++ % USER_AGENTS.length];
-
-        const baseParams = { q: keyword, type: 'media', sort: 'relevance', t: 'all' };
-        const htmlHeaders = (cookie = '') => ({
-            'User-Agent': ua,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            ...(cookie ? { Cookie: cookie } : {}),
-        });
-
-        let html;
-        try {
-            const response = await axios.get('https://www.reddit.com/search/', {
-                params: baseParams,
-                headers: htmlHeaders(this._cookieJar),
-                timeout: HTML_TIMEOUT_MS,
-                maxRedirects: 3,
-            });
-            this._mergeCookies(response.headers?.['set-cookie']);
-            html = typeof response.data === 'string' ? response.data : '';
-            const challenge = this._extractVerificationChallenge(html);
-            if (challenge && !overBudget()) {
-                console.log(`  [Reddit] UI verification challenge — solving once`);
-                const solved = await axios.get('https://www.reddit.com/search/', {
-                    params: {
-                        ...baseParams,
-                        solution: challenge.solution,
-                        js_challenge: '1',
-                        token: challenge.token,
-                        jsc_orig_r: '',
-                    },
-                    headers: htmlHeaders(this._cookieJar),
-                    timeout: HTML_TIMEOUT_MS,
-                    maxRedirects: 5,
-                });
-                this._mergeCookies(solved.headers?.['set-cookie']);
-                html = typeof solved.data === 'string' ? solved.data : '';
-                if (this._extractVerificationChallenge(html)) return fail('verification unsolved');
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const canProceed = await this._throttle();
+            if (!canProceed) {
+                this._logCooldownSkip('old.reddit scrape');
+                return null;
             }
-        } catch (e) {
-            if (e.response?.status === 429) this._onRateLimited();
-            return fail(`html ${e.message}`);
-        }
 
-        const permalinks = this._extractPermalinks(html);
-        if (permalinks.length === 0) return fail('no permalinks');
-        const limited = permalinks.slice(0, PERMALINK_LIMIT);
-
-        // Parallel resolve in small batches — we already paid one throttle for HTML;
-        // the resolve burst is short and bounded by PERMALINK_LIMIT.
-        const queue = [...limited];
-        const children = [];
-        let failures = 0;
-        let stopReason = '';
-
-        while (queue.length > 0) {
-            if (overBudget()) { stopReason = 'budget-25s'; break; }
-            const batch = queue.splice(0, RESOLVE_CONCURRENCY);
-            const settled = await Promise.allSettled(
-                batch.map(p => this._resolveRedditPermalink(p, POST_JSON_TIMEOUT_MS))
-            );
-            let hit429 = false;
-            for (const s of settled) {
-                if (s.status === 'fulfilled' && s.value) children.push(s.value);
-                else {
-                    failures++;
-                    if (s.reason?.response?.status === 429) hit429 = true;
-                }
-            }
-            if (hit429) { this._onRateLimited(); stopReason = '429'; break; }
-            // Early stop: enough usable video posts already?
-            const usableSoFar = this._parseResults(children).length;
-            if (usableSoFar >= EARLY_STOP_AT) { stopReason = `early@${usableSoFar}`; break; }
-            if (queue.length > 0 && !overBudget()) {
-                await new Promise(r => setTimeout(r, INTER_BATCH_DELAY_MS));
-            }
-        }
-
-        // Stamp shared throttle so subsequent outer Reddit calls wait correctly.
-        this._lastRequestTime = Date.now();
-
-        const attempted = children.length + failures;
-        if (attempted > 0 && children.length === 0 && failures === attempted) {
-            return fail(`${failures}/${attempted} resolves failed`);
-        } else if (attempted > 0 && failures > 0) {
-            console.log(`  [Reddit] UI scrape kept partial resolve success (${children.length}/${attempted})`);
-        }
-
-        const allResults = this._parseResults(children);
-        const nonVideoRejected = children.length - allResults.length;
-        const afterReject = allResults;
-        // Trust Reddit's Media-tab ranking — semantic, not literal-title.
-        const scored = this._scoreUiResults(afterReject, keyword);
-
-        const elapsed = ((Date.now() - budgetStart) / 1000).toFixed(1);
-        const stopNote = stopReason ? ` [${stopReason}]` : '';
-        console.log(`  [Reddit] UI scrape ${elapsed}s: ${permalinks.length} permalinks → ${children.length} resolved → ${allResults.length} videos → ${scored.length} kept (reject: ${nonVideoRejected} non-video)${stopNote}`);
-
-        if (scored.length === 0) return fail('0 final candidates');
-        return scored.slice(0, 10);
-    }
-
-    async _resolveRedditPermalink(permalink, timeoutMs) {
-        const hosts = ['www.reddit.com', 'old.reddit.com'];
-        let lastError = null;
-        let rateLimitError = null;
-        for (const host of hosts) {
-            const ua = USER_AGENTS[this._requestCount++ % USER_AGENTS.length];
+            const ua = this._userAgent;
+            let html = '';
             try {
-                const r = await axios.get(`https://${host}${permalink}.json`, {
+                const response = await axios.get('https://old.reddit.com/search', {
+                    params: {
+                        q: keyword,
+                        sort: 'relevance',
+                        t: 'all',
+                        type: 'link',
+                        include_over_18: 'off',
+                    },
                     headers: {
                         'User-Agent': ua,
-                        'Accept': 'application/json',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                         'Accept-Language': 'en-US,en;q=0.9',
+                        'Cache-Control': 'no-cache',
+                        'Referer': 'https://old.reddit.com/',
                         ...(this._cookieJar ? { Cookie: this._cookieJar } : {}),
                     },
                     timeout: timeoutMs,
-                    maxRedirects: 3,
-                    params: { raw_json: 1 },
+                    maxRedirects: 5,
+                    maxContentLength: 2 * 1024 * 1024,
                 });
-                this._mergeCookies(r.headers?.['set-cookie']);
-                const post = r.data?.[0]?.data?.children?.[0];
-                if (post?.data) return post;
-            } catch (err) {
-                lastError = err;
-                if (err.response?.status === 429) rateLimitError = err;
+                this._mergeCookies(response.headers?.['set-cookie']);
+                html = typeof response.data === 'string' ? response.data : '';
+            } catch (error) {
+                const status = Number(error.response?.status || 0);
+                if (status === 429 || status === 403) this._onRateLimited(status);
+                else console.log(`  [Reddit] old.reddit search error: ${error.message}`);
+                return null;
             }
+
+            const inspection = this._inspectOldRedditHtml(html);
+            if (!inspection.isSearchPage) {
+                if (/blocked|verification|whoa there|try again later/i.test(html)) {
+                    this._onRateLimited(403);
+                } else {
+                    console.log(`  [Reddit] old.reddit returned an unusable HTML page (${Buffer.byteLength(html)} bytes)`);
+                }
+                return null;
+            }
+
+            // Silent throttling is a 200 response with subreddit cards intact but
+            // the posts group emptied. Retry once through the serialized throttle;
+            // a legitimate no-results query simply remains empty after that retry.
+            if (inspection.looksStripped && attempt === 0) {
+                pacedRetry = true;
+                this._minRequestGap = Math.max(this._minRequestGap, 6000);
+                console.log(`  [Reddit] old.reddit returned an empty posts group with subreddit results — paced retry`);
+                continue;
+            }
+            if (inspection.looksStripped) {
+                this._onSilentRateLimited();
+                return null;
+            }
+
+            if (inspection.postBlocks.length === 0) {
+                const retryNote = pacedRetry ? ' after paced retry' : '';
+                console.log(`  [Reddit] No old.reddit posts for "${keyword}"${retryNote}`);
+                return [];
+            }
+
+            const parsed = this._parseOldRedditResults(inspection.postBlocks);
+            const scored = this._scoreUiResults(parsed, keyword);
+            const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+            const rejected = inspection.postBlocks.length - parsed.length;
+            const retryNote = pacedRetry ? ' [paced retry]' : '';
+            console.log(`  [Reddit] old.reddit ${elapsed}s: ${inspection.postBlocks.length} posts → ${parsed.length} videos → ${scored.length} kept (reject: ${rejected})${retryNote}`);
+            return scored.slice(0, 10);
         }
-        throw rateLimitError || lastError || new Error('reddit permalink resolve failed');
+
+        return [];
     }
 
     _scoreUiResults(results, keyword) {
@@ -399,46 +341,239 @@ class RedditVideoProvider extends BaseProvider {
         }).sort((a, b) => (b._relevance - a._relevance) || (a._uiIndex - b._uiIndex));
     }
 
-    _extractPermalinks(html) {
-        if (!html) return [];
-        const normalized = String(html)
-            .replace(/\\u002[fF]/g, '/')
-            .replace(/\\\//g, '/')
-            .replace(/&amp;/g, '&')
-            .replace(/&#x2F;/gi, '/')
-            .replace(/&quot;/g, '"')
-            .replace(/&#39;/g, "'");
-        // Match comment permalinks regardless of host prefix:
-        //   href="/r/sub/comments/abc123/slug/"
-        //   href="https://www.reddit.com/r/sub/comments/abc123/slug/"
-        // Preserve UI order; first occurrence wins.
-        const re = /(?:href=["'](?:https?:\/\/(?:www|old|new)\.reddit\.com)?|(https?:\/\/(?:www|old|new)\.reddit\.com)?)(\/r\/[A-Za-z0-9_]+\/comments\/[a-z0-9]+\/[^"'<>\s?#\\]+\/?)/gi;
-        const seen = new Set();
-        const out = [];
-        let m;
-        while ((m = re.exec(normalized)) !== null) {
-            let path = m[2];
-            if (!path.endsWith('/')) path += '/';
-            if (seen.has(path)) continue;
-            seen.add(path);
-            out.push(path);
-            if (out.length >= 50) break;
+    _inspectOldRedditHtml(html) {
+        const source = String(html || '');
+        const postStarts = [];
+        let subredditCount = 0;
+        const divRe = /<div\b([^>]*)>/gi;
+        let match;
+
+        while ((match = divRe.exec(source)) !== null) {
+            const attrs = match[1] || '';
+            const classes = new Set(this._classTokens(this._getHtmlAttribute(attrs, 'class')));
+            if (classes.has('search-result-subreddit')) subredditCount++;
+            if (!classes.has('search-result-link')) continue;
+
+            const fullname = this._getHtmlAttribute(attrs, 'data-fullname');
+            if (!/^t3_[a-z0-9]+$/i.test(fullname)) continue;
+            postStarts.push({
+                index: match.index,
+                openingTag: match[0],
+                fullname,
+            });
         }
-        return out;
+
+        const postBlocks = postStarts.map((start, index) => ({
+            openingTag: start.openingTag,
+            fullname: start.fullname,
+            html: source.slice(start.index, postStarts[index + 1]?.index || source.length),
+        }));
+        const hasPostsHeading = /class=["'][^"']*\bsearch-header-label\b[^"']*["'][^>]*>\s*posts\s*</i.test(source);
+        const emptyPostsGroup = /class=["'][^"']*\bsearch-header-label\b[^"']*["'][^>]*>\s*posts\s*<[\s\S]{0,7000}?<div\s+class=["']contents["']>\s*<\/div>/i.test(source);
+
+        return {
+            isSearchPage: /\bcombined-search-page\b/i.test(source)
+                && /\bsearch-result-listing\b/i.test(source),
+            postBlocks,
+            subredditCount,
+            looksStripped: postBlocks.length === 0
+                && subredditCount > 0
+                && hasPostsHeading
+                && emptyPostsGroup,
+        };
     }
 
-    _extractVerificationChallenge(html) {
-        if (!html || !/Please wait for verification|js_challenge|namedItem\(["']solution["']\)/i.test(html)) {
-            return null;
+    _parseOldRedditResults(postBlocks) {
+        const results = [];
+        const seen = new Set();
+
+        for (const post of postBlocks || []) {
+            const block = String(post?.html || '');
+            const fullname = String(post?.fullname || '');
+            const id = fullname.replace(/^t3_/i, '');
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+
+            if (/\b(?:over18|nsfw)\b/i.test(post.openingTag || '')
+                || /class=["'][^"']*\bnsfw-stamp\b/i.test(block)) {
+                continue;
+            }
+
+            const titleAnchor = this._findElementByClass(block, 'a', 'search-title');
+            const permalink = this._normalizeRedditPermalink(
+                this._getHtmlAttribute(titleAnchor?.attrs || '', 'href')
+            );
+            if (!permalink) continue;
+
+            const title = this._stripHtml(titleAnchor?.inner || '').substring(0, 200);
+            const targetAnchor = this._findElementByClass(block, 'a', 'search-link');
+            const targetUrl = this._decodeHtml(
+                this._getHtmlAttribute(targetAnchor?.attrs || '', 'href')
+            ).trim();
+            const durationElement = this._findElementByClass(block, 'div', 'duration-overlay');
+            const scoreElement = this._findElementByClass(block, 'span', 'search-score');
+            const subredditElement = this._findElementByClass(block, 'a', 'search-subreddit-link');
+            const duration = this._parseDuration(this._stripHtml(durationElement?.inner || ''));
+            const score = this._parseScore(this._stripHtml(scoreElement?.inner || ''));
+
+            if (score !== null && score < 3) continue;
+            if (duration > 0 && duration < 3) continue;
+
+            const targetHost = this._hostname(targetUrl);
+            const isRedditHosted = targetHost === 'v.redd.it';
+            const isExternalVideo = this._isSupportedVideoUrl(targetUrl);
+            if (!isRedditHosted && !isExternalVideo && duration <= 0) continue;
+
+            // A duration overlay means old.reddit rendered a playable video. If
+            // its target host is unfamiliar, let yt-dlp resolve the Reddit post
+            // instead of handing an unknown outbound URL to the downloader.
+            const usePermalink = isRedditHosted || (duration > 0 && !isExternalVideo);
+            const canonicalPermalink = `https://www.reddit.com${permalink}`;
+            const videoUrl = usePermalink ? canonicalPermalink : targetUrl;
+            if (!videoUrl) continue;
+
+            let subreddit = this._stripHtml(subredditElement?.inner || '').replace(/^r\//i, '');
+            if (!subreddit) subreddit = (permalink.match(/^\/r\/([^/]+)/i) || [])[1] || '';
+
+            const cachedMeta = duration > 0 ? {
+                duration,
+                width: 0,
+                height: 0,
+                title,
+                _redditVideoUrl: isRedditHosted ? targetUrl : null,
+            } : null;
+
+            results.push({
+                id: `reddit-${id}`,
+                url: videoUrl,
+                title,
+                width: 1920,
+                height: 1080,
+                duration,
+                _duration: duration,
+                _subreddit: subreddit,
+                _score: score || 0,
+                _isRedditHosted: isRedditHosted,
+                _permalink: permalink,
+                _redditVideoUrl: isRedditHosted ? targetUrl : null,
+                _fallbackUrl: null,
+                _cachedMeta: cachedMeta,
+            });
+
+            if (results.length >= 12) break;
         }
-        const seedMatch = html.match(/async\s+e\s*=>\s*e\s*\+\s*e\s*\)\(["']([^"']+)["']\)/i)
-            || html.match(/\)\(["']([a-f0-9]{8,})["']\)/i);
-        const tokenMatch = html.match(/name=["']token["']\s+value=["']([^"']+)["']/i);
-        if (!seedMatch?.[1] || !tokenMatch?.[1]) return null;
-        return {
-            solution: `${seedMatch[1]}${seedMatch[1]}`,
-            token: tokenMatch[1],
+
+        return results;
+    }
+
+    _findElementByClass(html, tagName, className) {
+        const escapedTag = String(tagName || '').replace(/[^a-z0-9]/gi, '');
+        if (!escapedTag) return null;
+        const source = String(html || '');
+        const re = new RegExp(`<${escapedTag}\\b([^>]*)>`, 'gi');
+        let match;
+        while ((match = re.exec(source)) !== null) {
+            const classes = this._classTokens(this._getHtmlAttribute(match[1], 'class'));
+            if (classes.includes(className)) {
+                const closeAt = source.indexOf(`</${escapedTag}>`, re.lastIndex);
+                return {
+                    attrs: match[1] || '',
+                    inner: closeAt >= 0 ? source.slice(re.lastIndex, closeAt) : '',
+                };
+            }
+        }
+        return null;
+    }
+
+    _getHtmlAttribute(attrs, name) {
+        const escaped = String(name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const match = String(attrs || '').match(new RegExp(`\\b${escaped}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, 'i'));
+        return match?.[2] || '';
+    }
+
+    _classTokens(value) {
+        return String(value || '').split(/\s+/).map(v => v.trim()).filter(Boolean);
+    }
+
+    _decodeHtml(value) {
+        const named = {
+            amp: '&', quot: '"', apos: "'", '#39': "'", nbsp: ' ',
+            lt: '<', gt: '>', ndash: '\u2013', mdash: '\u2014',
+            lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201c', rdquo: '\u201d',
+            hellip: '\u2026',
         };
+        return String(value || '')
+            .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+                const code = parseInt(hex, 16);
+                return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+            })
+            .replace(/&#(\d+);/g, (_, decimal) => {
+                const code = parseInt(decimal, 10);
+                return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+            })
+            .replace(/&([a-z]+|#39);/gi, (whole, key) => named[key.toLowerCase()] ?? whole);
+    }
+
+    _stripHtml(value) {
+        return this._decodeHtml(String(value || '').replace(/<[^>]*>/g, ' '))
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    _parseDuration(value) {
+        const parts = String(value || '').trim().split(':').map(Number);
+        if (parts.length < 2 || parts.length > 3 || parts.some(n => !Number.isFinite(n) || n < 0)) {
+            return 0;
+        }
+        if (parts.length === 2) return (parts[0] * 60) + parts[1];
+        return (parts[0] * 3600) + (parts[1] * 60) + parts[2];
+    }
+
+    _parseScore(value) {
+        const text = String(value || '').trim().toLowerCase();
+        if (!text || /hidden|unavailable/.test(text)) return null;
+        const match = text.replace(/,/g, '').match(/(\d+(?:\.\d+)?)\s*([km]?)/i);
+        if (!match) return null;
+        const multiplier = match[2].toLowerCase() === 'm' ? 1_000_000
+            : match[2].toLowerCase() === 'k' ? 1_000
+            : 1;
+        return Math.round(Number(match[1]) * multiplier);
+    }
+
+    _normalizeRedditPermalink(value) {
+        const href = this._decodeHtml(value).trim();
+        if (!href) return '';
+        try {
+            const parsed = new URL(href, 'https://old.reddit.com');
+            const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+            if (host !== 'reddit.com' && host !== 'old.reddit.com' && host !== 'new.reddit.com') return '';
+            const match = parsed.pathname.match(/^(\/r\/[^/]+\/comments\/[a-z0-9]+\/[^/?#]*\/?)/i);
+            if (!match) return '';
+            return match[1].endsWith('/') ? match[1] : `${match[1]}/`;
+        } catch (_) {
+            return '';
+        }
+    }
+
+    _hostname(value) {
+        try {
+            return new URL(String(value || '')).hostname.toLowerCase().replace(/^www\./, '');
+        } catch (_) {
+            return '';
+        }
+    }
+
+    _isSupportedVideoUrl(value) {
+        const url = String(value || '');
+        const host = this._hostname(url);
+        if (!host) return false;
+        if (host === 'imgur.com' || host === 'i.imgur.com') {
+            return /\.(?:gifv|mp4|webm)(?:$|[?#])/i.test(url);
+        }
+        if (Array.from(VIDEO_DOMAINS).some(domain => host === domain || host.endsWith(`.${domain}`))) {
+            return true;
+        }
+        return /\.(?:mp4|webm|mov|m3u8)(?:$|[?#])/i.test(url);
     }
 
     _mergeCookies(setCookie) {
@@ -523,198 +658,6 @@ class RedditVideoProvider extends BaseProvider {
         if (/\b(canal|strait|chokepoint|shipping|maritime|route|trade)\b/.test(value)) return 'cargo ship footage';
         if (/\b(ship|ships|vessel|vessels)\b/.test(value)) return 'ship footage';
         return '';
-    }
-
-    async _searchOnce(keyword) {
-        const jsonBlockedRemaining = this._jsonBlockedUntil - Date.now();
-        if (jsonBlockedRemaining > 0) {
-            const now = Date.now();
-            if (now - this._lastJsonBlockedLogAt > 10000) {
-                this._lastJsonBlockedLogAt = now;
-                console.log(`  [Reddit] Skipping search.json fallback (${this._jsonBlockedReason || 'blocked'}; ${Math.ceil(jsonBlockedRemaining / 1000)}s left)`);
-            }
-            return [];
-        }
-
-        const canProceed = await this._throttle();
-        if (!canProceed) {
-            console.log(`  [Reddit] Skipping search — in cooldown`);
-            return [];
-        }
-
-        const ua = USER_AGENTS[this._requestCount++ % USER_AGENTS.length];
-        const url = `https://www.reddit.com/search.json`;
-
-        let data;
-        try {
-            const response = await axios.get(url, {
-                params: {
-                    q: keyword,
-                    sort: 'relevance',
-                    t: 'all',
-                    type: 'link',
-                    limit: 100,  // max allowed — get as many as possible in 1 request
-                },
-                headers: {
-                    'User-Agent': ua,
-                    'Accept': 'application/json',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    ...(this._cookieJar ? { Cookie: this._cookieJar } : {}),
-                },
-                timeout: 12000,
-                maxRedirects: 3,
-            });
-            data = response.data;
-        } catch (e) {
-            const status = e.response?.status;
-            if (status === 429) {
-                this._onRateLimited();
-            } else if (status === 401 || status === 403) {
-                this._onJsonBlocked(status, e.message);
-            } else {
-                console.log(`  [Reddit] Search error: ${e.message}`);
-            }
-            return [];
-        }
-
-        const children = data?.data?.children || [];
-        if (children.length === 0) {
-            console.log(`  [Reddit] No posts for "${keyword}"`);
-            return [];
-        }
-
-        // Parse — extract videos from all posts
-        const allResults = this._parseResults(children);
-
-        // Keep content filtering permissive; vision handles the real verdict.
-        const afterReject = allResults;
-
-        // Relevance scoring
-        const filtered = this._scoreAndFilterByRelevance(afterReject, keyword);
-
-        if (filtered.length > 0) {
-            console.log(`  [Reddit] ${filtered.length} videos from ${children.length} posts for "${keyword}"`);
-        } else {
-            // Debug: show what posts we got but couldn't use
-            const videoCount = allResults.length;
-            const sample = children.slice(0, 3).map(c => {
-                const d = c.data;
-                return `[${d.is_video ? 'VIDEO' : d.post_hint || d.domain || 'text'}] "${(d.title || '').substring(0, 40)}"`;
-            });
-            console.log(`  [Reddit] ${children.length} posts, ${videoCount} videos, 0 relevant for "${keyword}" | ${sample.join(', ')}`);
-        }
-
-        return filtered.slice(0, 10);
-    }
-
-    // ─── Parse & filter ─────────────────────────────────────────────────
-
-    _parseResults(children) {
-        const results = [];
-        let verticalCount = 0;
-
-        for (const child of children) {
-            const d = child.data || child;
-            if (!d) continue;
-
-            // Detect video posts: Reddit-hosted, external video domains, or rich:video hint
-            const isRedditVideo = d.is_video && d.media?.reddit_video?.fallback_url;
-            const isExternalVideo = d.post_hint === 'rich:video'
-                || VIDEO_DOMAINS.has(d.domain)
-                || (d.url && d.url.includes('v.redd.it'));
-
-            if (!isRedditVideo && !isExternalVideo) continue;
-
-            // Skip NSFW
-            if (d.over_18) continue;
-
-            // Skip very low-engagement posts
-            if ((d.ups || 0) < 3) continue;
-
-            // Always prefer the Reddit permalink for Reddit-hosted videos —
-            // bare v.redd.it URLs return 403 to yt-dlp.
-            // For external videos (YouTube etc.), use the direct URL but fix HTML entities.
-            let videoUrl = d.url;
-            if (videoUrl) videoUrl = videoUrl.replace(/&amp;/g, '&');
-            let duration = 0;
-            let width = 0;
-            let height = 0;
-
-            if (isRedditVideo || (d.url && d.url.includes('v.redd.it'))) {
-                // Always use permalink for Reddit-hosted video — v.redd.it direct links get 403
-                videoUrl = `https://www.reddit.com${d.permalink}`;
-                const rv = d.media?.reddit_video || {};
-                duration = rv.duration || 0;
-                width = rv.width || 0;
-                height = rv.height || 0;
-
-                // Allow vertical videos — renderer can crop/zoom to fit
-                // Just track count for sorting preference (landscape first)
-                if (width && height && height > width) {
-                    verticalCount++;
-                }
-                // Skip very short clips
-                if (duration && duration < 3) continue;
-            }
-
-            // Store fallback_url for direct download when yt-dlp merge fails
-            const fallbackUrl = d.media?.reddit_video?.fallback_url || null;
-
-            results.push({
-                id: `reddit-${d.id}`,
-                url: videoUrl,
-                title: (d.title || '').substring(0, 200),
-                width: width || 1920,
-                height: height || 1080,
-                duration: duration || 0,
-                _duration: duration,
-                _subreddit: d.subreddit || '',
-                _score: d.ups || 0,
-                _isRedditHosted: isRedditVideo,
-                _permalink: d.permalink,
-                _fallbackUrl: fallbackUrl,
-                _cachedMeta: (width && height && duration) ? { duration, width, height, title: (d.title || ''), _fallbackUrl: fallbackUrl } : null,
-            });
-
-            if (results.length >= 12) break;
-        }
-
-        return results;
-    }
-
-    _scoreAndFilterByRelevance(results, keyword) {
-        const STOP_WORDS = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or', 'but', 'with', 'from', 'by', 'this', 'that', 'it', 'its', 'as', 'be', 'has', 'had', 'have', 'been', 'will', 'would', 'could', 'should', 'not', 'no', 'so', 'if', 'just', 'about', 'up', 'out', 'all', 'one', 'two', 'how', 'why', 'what', 'when', 'who', 'which', 'do', 'does', 'did', 'can', 'new']);
-
-        const extractWords = (text) => {
-            return (text || '').toLowerCase()
-                .replace(/[^a-z0-9\s]/g, ' ')
-                .split(/\s+/)
-                .filter(w => w.length > 2 && !STOP_WORDS.has(w));
-        };
-
-        const keywordWords = new Set(extractWords(keyword));
-        const topicWords = new Set(extractWords(this._scriptContext?.summary || ''));
-        const entityWords = new Set();
-        for (const entity of (this._scriptContext?.entities || [])) {
-            for (const w of extractWords(entity)) entityWords.add(w);
-        }
-
-        const scored = results.map(r => {
-            const titleWords = extractWords(r.title);
-            let relevance = 0;
-
-            for (const word of titleWords) {
-                if (keywordWords.has(word)) relevance += 3;
-                else if (entityWords.has(word)) relevance += 2;
-                else if (topicWords.has(word)) relevance += 1;
-            }
-
-            const engagementBonus = Math.min(2, Math.log10(Math.max(1, r._score || 0)));
-            return { ...r, _relevance: relevance + engagementBonus };
-        });
-
-        scored.sort((a, b) => (b._relevance - a._relevance) || (b._score - a._score));
-        return scored;
     }
 
     // ─── Download ───────────────────────────────────────────────────────

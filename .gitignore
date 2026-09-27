@@ -51,6 +51,8 @@ output/
 temp/
 logs/
 .env
+# Timestamped .env backups taken before routing/credential edits — same secrets as .env
+.env.bak-*
 *.mp4
 
 # Lightning multi-account rotation (secrets + live state)

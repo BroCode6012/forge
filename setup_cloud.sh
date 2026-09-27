@@ -6,7 +6,7 @@
 
 set -e
 
-echo "=== YTA EMPIRE WEBGL — Cloud Setup ==="
+echo "=== Forge — Cloud Setup ==="
 
 # 1. System packages
 echo "📦 Installing system dependencies..."

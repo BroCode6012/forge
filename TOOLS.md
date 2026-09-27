@@ -1,8 +1,8 @@
-# TOOLS.md - YTA EMPIRE WEBGL
+# TOOLS.md - Forge
 
 ## Workspace
 
-- App root: `D:\Youtube\YTA EMPIRE WEBGL`
+- App root: `D:\Youtube\Forge`
 - Stack: Electron, Node.js, WebGL2, HyperFrames, FFmpeg, Python helpers
 - Main process: `main.js`
 - Renderer bridge: `preload.js`

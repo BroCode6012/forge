@@ -1,5 +1,5 @@
 /**
- * YTA Empire WEBGL - UI Application
+ * Forge - UI Application
  * FIXED: Playhead - freely draggable, can go to 0, doesn't disappear when panning
  */
 
@@ -521,6 +521,7 @@ const state = {
     audioPath: null,
     scenes: [],
     isProcessing: false,
+    lastProgress: null, // {percent, message, at} — last step shown on the progress bar (also read by agent remote control)
     videoPlan: null,
     hasProjectFile: false, // True once a .fvp file exists (enables auto-save)
     projectRevision: 0,
@@ -1746,7 +1747,7 @@ async function init() {
     // Check if we're in capture mode (hidden window for Preview Capture renderer)
     if (_isCaptureMode) {
         initCaptureMode();
-        console.log('🎬 YTA Empire WEBGL Capture Window Ready');
+        console.log('🎬 Forge Capture Window Ready');
         return;
     }
 
@@ -1853,7 +1854,7 @@ async function init() {
     // Timeline scene right-click menu (retry footage / CEO editor)
     initSceneContextMenu();
 
-    console.log('🎬 YTA Empire WEBGL UI Ready');
+    console.log('🎬 Forge UI Ready');
 }
 
 function setupEventListeners() {
@@ -2298,6 +2299,7 @@ function setupEventListeners() {
         if (window.electronAPI?.setAiProvider) {
             window.electronAPI.setAiProvider(elements.aiProvider.value).catch(() => {});
         }
+        _syncVisionBackendToBrain(elements.aiProvider.value);
         saveSettings();
     });
     if (elements.videoTitle) {
@@ -2441,6 +2443,30 @@ function setupEventListeners() {
         });
     }
     setupLightningAccountsUI();
+}
+
+// "Azure Managed" is a WHOLE-brain option — one endpoint serving the reasoning model
+// AND the footage judge — so picking it has to move the Vision Backend too.
+//
+// It cannot be done in the main process. The Vision Backend is a schema-backed UI
+// setting, so applyOptionsToEnv() collects whatever this dropdown reads at build time
+// and publishes it in YTA_ENV_LOCK, which config.js restores LAST — above every .env
+// layer. A VISION_BACKEND written behind the UI's back is therefore overwritten by the
+// stale value still sitting in this <select> the moment a build starts. 2026-08-27:
+// exactly that shipped a build whose brain was Azure Managed while vision spent five
+// minutes on doomed Lightning wake-ups. So: change the control, then let its own
+// handler persist it.
+//
+// Only the pairing direction is automatic. Leaving Azure Managed does NOT drag vision
+// back — azure-managed vision has its own credentials and is a legitimate judge for any
+// brain, and silently re-pointing the footage judge is the failure mode above in reverse.
+function _syncVisionBackendToBrain(provider) {
+    const sel = elements.buildVisionBackend;
+    if (!sel || provider !== 'azure-managed') return;
+    if (![...sel.options].some(o => o.value === 'azure-managed')) return;
+    if (sel.value === 'azure-managed') return;
+    sel.value = 'azure-managed';
+    sel.dispatchEvent(new Event('change'));  // persists to .env + toasts through the real handler
 }
 
 // ── Lightning account pool manager (no-code) ──────────────────────────────────────────
@@ -7896,12 +7922,20 @@ async function handleFileSelect(file) {
         return;
     }
     const filePath = imported.path;
-    state.audioFile = { name: file.name, path: filePath };
-    state.audioPath = filePath || file.name;
-    elements.audioName.textContent = file.name;
+    showToast(`Audio loaded: ${file.name}`, 'success');
+    adoptImportedAudio(file.name, filePath);
+}
+
+// Narration that is already sitting in the project's input folder becomes the
+// editor's active audio. Shared by the drop zone and by an agent's
+// forge_import_narration (ui/js/remote-control.js), so both leave the exact
+// same state behind.
+function adoptImportedAudio(name, filePath) {
+    state.audioFile = { name, path: filePath };
+    state.audioPath = filePath || name;
+    elements.audioName.textContent = name;
     elements.audioInfo.classList.remove('hidden');
     elements.dropZone.style.display = 'none';
-    showToast(`Audio loaded: ${file.name}`, 'success');
     loadAudioFile(filePath);
     _syncProductionModeUI();
 }
@@ -8067,15 +8101,19 @@ async function _persistProjectSettingsBeforeBuild() {
     return result;
 }
 
+// Returns {success, cancelled?, error?, elapsed?} so a caller that cannot watch
+// the screen (agent remote control) learns the outcome. The button handlers
+// ignore the value.
 async function generateVideo(options = {}) {
-    if (state.isProcessing) return;
-    if (!state.hasProject) { _requireProject(); return; }
+    if (state.isProcessing) return { success: false, error: 'Already busy' };
+    if (!state.hasProject) { _requireProject(); return { success: false, error: 'No project is open' }; }
     if (!state.audioFile) {
         showToast('Import narration audio first', 'error');
-        return;
+        return { success: false, error: 'Import narration audio first' };
     }
     if (!state.audioFile.path) {
-        showToast('Audio file path is missing. Please re-import the audio file.', 'error'); return;
+        showToast('Audio file path is missing. Please re-import the audio file.', 'error');
+        return { success: false, error: 'Audio file path is missing' };
     }
     const repeatFromStep = options.repeatStep ? (elements.repeatFromStep?.value || 'visual-planner') : '';
     // Only meaningful when repeating from Media Download — re-download clips instead of
@@ -8135,15 +8173,20 @@ async function generateVideo(options = {}) {
             );
             elements.btnRender.disabled = false;
             if (state.scenes.length > 0) await jumpToScene(0);
+            return { success: true, elapsed: genTime, scenes: state.scenes.length };
         } else {
             const errorMsg = result.error || 'Build failed';
             if (errorMsg === 'Cancelled') {
                 stopTimer(); updateProgress(0, '⛔ Generation cancelled'); showToast('Generation cancelled', 'info'); showNotification('Generation Cancelled', `Stopped after ${getElapsedString()}`, 'cancel');
+                return { success: false, cancelled: true, error: 'Cancelled' };
             } else {
                 throw new Error(errorMsg);
             }
         }
-    } catch (error) { console.error('❌ Generation error:', error); stopTimer(); showToast(`Error: ${error.message}`, 'error'); }
+    } catch (error) {
+        console.error('❌ Generation error:', error); stopTimer(); showToast(`Error: ${error.message}`, 'error');
+        return { success: false, error: error.message };
+    }
     finally {
         state.isProcessing = false;
         _syncGenerateAvailability();
@@ -11887,8 +11930,12 @@ async function renderVideoHyperFrames() {
     });
 }
 
+// Returns {success, outputPath?, cancelled?, error?} for callers that cannot see
+// the screen (agent remote control). The Render button ignores the value.
 async function renderVideo() {
-    if (!state.videoPlan || state.isProcessing) return;
+    if (!state.videoPlan || state.isProcessing) {
+        return { success: false, error: state.isProcessing ? 'Already busy' : 'No video plan loaded' };
+    }
     state.isProcessing = true; elements.btnRender.disabled = true; showProgress(true); startTimer();
     let restoreHyperframesPreview = null;
     try {
@@ -11921,6 +11968,7 @@ async function renderVideo() {
                 );
             }
             if (result.outputPath) showFinalVideo(result.outputPath);
+            return { success: true, outputPath: result.outputPath || '', elapsed: renderTime };
         } else {
             stopTimer();
             const errorMsg = result.error || 'Render failed';
@@ -11928,6 +11976,7 @@ async function renderVideo() {
                 updateProgress(0, '⛔ Render cancelled');
                 showToast('Render cancelled', 'info');
                 showNotification('Render Cancelled', `Stopped after ${getElapsedString()}`, 'cancel');
+                return { success: false, cancelled: true, error: 'Cancelled' };
             } else {
                 const shortError = errorMsg.length > 100 ? errorMsg.substring(0, 100) + '...' : errorMsg;
                 updateProgress(0, `❌ ${errorMsg}`);
@@ -11935,6 +11984,7 @@ async function renderVideo() {
                 showNotification('Render Failed', shortError, 'error');
                 console.error('❌ Render error:', errorMsg);
             }
+            return { success: false, error: errorMsg };
         }
     } catch (e) {
         stopTimer();
@@ -11943,6 +11993,7 @@ async function renderVideo() {
         showToast(`Render error: ${errMsg}`, 'error');
         showNotification('Render Failed', errMsg, 'error');
         updateProgress(0, `❌ ${e.message}`);
+        return { success: false, error: e.message };
     } finally {
         if (restoreHyperframesPreview) {
             try {
@@ -12074,6 +12125,11 @@ const buildLog = {
 };
 
 function updateProgress(percent, message) {
+    // Remember the last real step for anyone who cannot see the screen — an agent
+    // polling forge_get_status reads exactly what the progress bar says.
+    if (typeof percent === 'number' && percent >= 0) {
+        state.lastProgress = { percent, message: message || state.lastProgress?.message || '', at: Date.now() };
+    }
     // percent < 0 is a sticky-alert signal (e.g. Qwen key exhausted) — don't
     // collapse the progress bar, just surface the message as a toast.
     if (typeof percent === 'number' && percent >= 0) {

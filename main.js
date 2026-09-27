@@ -1,5 +1,5 @@
 /**
- * YTA Empire WEBGL - Electron Main Process
+ * Forge - Electron Main Process
  * This file creates the desktop app window and bridges the UI to Node.js
  */
 
@@ -808,7 +808,7 @@ function createStartupWindow() {
             fullscreenable: false,
             autoHideMenuBar: true,
             backgroundColor: '#0a0a0a',
-            title: 'YTA Empire WEBGL — Start',
+            title: 'Forge — Start',
             webPreferences: {
                 nodeIntegration: false,
                 contextIsolation: true,
@@ -905,7 +905,7 @@ function createWindowsAppShortcuts() {
         throw new Error('Windows only');
     }
 
-    const shortcutName = 'YTA Empire WEBGL.lnk';
+    const shortcutName = 'Forge.lnk';
     const desktopShortcutPath = path.join(app.getPath('desktop'), shortcutName);
     const startMenuProgramsDir = path.join(
         app.getPath('appData'),
@@ -921,10 +921,10 @@ function createWindowsAppShortcuts() {
         target: process.execPath,
         args: app.isPackaged ? '' : '"' + APP_ROOT + '"',
         cwd: APP_ROOT,
-        description: 'YTA Empire WEBGL - AI Video Studio',
+        description: 'Forge - AI Video Studio',
         icon: getShortcutIconPath(),
         iconIndex: 0,
-        appUserModelId: 'YTA Empire WEBGL'
+        appUserModelId: 'Forge'
     };
 
     for (const shortcutPath of [desktopShortcutPath, startMenuShortcutPath]) {
@@ -934,10 +934,11 @@ function createWindowsAppShortcuts() {
         }
     }
 
-    const legacyShortcutPaths = [
-        path.join(app.getPath('desktop'), 'YTA Empire.lnk'),
-        path.join(startMenuProgramsDir, 'YTA Empire.lnk')
-    ];
+    const legacyShortcutNames = ['YTA Empire.lnk', 'YTA Empire WEBGL.lnk'];
+    const legacyShortcutPaths = legacyShortcutNames.flatMap((legacyName) => [
+        path.join(app.getPath('desktop'), legacyName),
+        path.join(startMenuProgramsDir, legacyName)
+    ]);
     for (const legacyShortcutPath of legacyShortcutPaths) {
         try {
             if (fs.existsSync(legacyShortcutPath)) fs.unlinkSync(legacyShortcutPath);
@@ -1100,7 +1101,7 @@ async function createWindow() {
 
     // Set window title with project name
     if (PROJECT_NAME) {
-        mainWindow.setTitle(`YTA Empire WEBGL — ${PROJECT_NAME}`);
+        mainWindow.setTitle(`Forge — ${PROJECT_NAME}`);
     }
 
     // Load the UI
@@ -1153,7 +1154,7 @@ async function createWindow() {
                             createWindowsAppShortcuts();
                             dialog.showMessageBox(mainWindow, {
                                 title: 'App Shortcuts Created',
-                                message: 'Desktop and Start menu shortcuts created. You can now find YTA Empire WEBGL in Windows Search.',
+                                message: 'Desktop and Start menu shortcuts created. You can now find Forge in Windows Search.',
                                 type: 'info'
                             });
                         } catch (e) {
@@ -1180,7 +1181,7 @@ async function createWindow() {
                     }
                 },
                 { type: 'separator' },
-                { label: 'About', click: () => dialog.showMessageBox(mainWindow, { title: 'YTA Empire WEBGL', message: 'AI-powered video generator', type: 'info' }) }
+                { label: 'About', click: () => dialog.showMessageBox(mainWindow, { title: 'Forge', message: 'AI-powered video generator', type: 'info' }) }
             ]
         }
     ]);
@@ -1230,7 +1231,7 @@ async function createWindow() {
         }
     });
 
-    console.log('🎬 YTA Empire WEBGL started');
+    console.log('🎬 Forge started');
 }
 
 // ========================================
@@ -1258,7 +1259,7 @@ if (_v2InProcessGpuEnabled) {
 // ========================================
 // App Lifecycle
 // ========================================
-app.setAppUserModelId('YTA Empire WEBGL');
+app.setAppUserModelId('Forge');
 
 // Register local-media schemes before app.whenReady. Neither scheme bypasses
 // CSP. hf-preview uses a distinct origin from the renderer so its sandboxed
@@ -1381,7 +1382,12 @@ app.whenReady().then(async () => {
         }
     }
 
+    // Which AI serves each job (Thinking / Everyday / Eyes), keys decrypted by
+    // the OS keychain — must follow app ready for safeStorage.
+    _applyAiConnections();
     await createWindow();
+    // Agent access, if the user left it on. Never blocks startup.
+    void _startRemoteControlServer().catch((error) => console.warn(`[Remote] start failed: ${error.message}`));
     await _consumePendingExternalProjectSelection();
     if (initialProjectOpenError) {
         await dialog.showMessageBox(mainWindow || null, {
@@ -1425,6 +1431,7 @@ app.on('before-quit', () => {
     console.warn(`[Lifecycle] before-quit (activeProcess=${activeProcessType || 'none'}).`);
     killLogTailWindows();
     releaseProjectLock();
+    void _stopRemoteControlServer();
 });
 
 app.on('child-process-gone', (_event, details = {}) => {
@@ -1451,8 +1458,11 @@ app.on('activate', () => {
 // IPC Handlers (Bridge between UI and Node.js)
 // ========================================
 
-// Copy audio file to input folder
-ipcMain.handle('import-audio-file', async (_event, sourcePath) => {
+// Copy an MP3/WAV into the active project's input/ folder. ONE implementation:
+// the drop zone (import-audio-file) and the agent remote control
+// (forge_import_narration) both land here, so neither can drift from the other's
+// validation, clearing rules, or stale-source recovery.
+async function _importNarrationFile(sourcePath) {
     try {
         if (!sourcePath || typeof sourcePath !== 'string') {
             return { success: false, error: 'Source path is missing or invalid' };
@@ -1479,7 +1489,7 @@ ipcMain.handle('import-audio-file', async (_event, sourcePath) => {
         // Skip copy if source is already in the destination folder
         if (path.resolve(resolvedSource) === path.resolve(destination)) {
             console.log(`✅ Audio already in ${destFolder}, skipping copy`);
-            return { success: true, path: destination };
+            return { success: true, path: destination, name: fileName, bytes: sourceStat.size };
         }
 
         // Validate the source BEFORE touching the destination. A stale source path (e.g.
@@ -1489,7 +1499,7 @@ ipcMain.handle('import-audio-file', async (_event, sourcePath) => {
         if (!fs.existsSync(resolvedSource)) {
             if (fs.existsSync(destination)) {
                 console.log(`⚠️ Source missing (${sourcePath}) but ${fileName} already in ${destFolder} — reusing existing copy`);
-                return { success: true, path: destination };
+                return { success: true, path: destination, name: fileName };
             }
             return { success: false, error: `Source audio not found: ${sourcePath}` };
         }
@@ -1506,12 +1516,14 @@ ipcMain.handle('import-audio-file', async (_event, sourcePath) => {
         fs.copyFileSync(resolvedSource, destination);
         console.log(`✅ Copied ${fileName} to ${destFolder}`);
 
-        return { success: true, path: destination };
+        return { success: true, path: destination, name: fileName, bytes: sourceStat.size };
     } catch (error) {
         console.error('❌ Copy failed:', error);
         return { success: false, error: error.message };
     }
-});
+}
+
+ipcMain.handle('import-audio-file', async (_event, sourcePath) => _importNarrationFile(sourcePath));
 
 // Copy a chosen presenter image into the ACTIVE project's assets/ folder (talking-head
 // mode). Unlike copy-file('input'), this never clears audio and always targets the
@@ -1625,6 +1637,16 @@ ipcMain.handle('run-build', async (event, options) => {
         // started just-in-time inside the pipeline (right before scoring), not here.
         try { await _prepareVisionForBuild(options); } catch (e) { console.warn('vision prep failed:', e.message); }
 
+        // Studio: if this build belongs to a video Quill has finished a voiceover
+        // for, take the narration from there instead of a hand-imported file.
+        // Audio already sitting in input/ always wins, so this can never swap
+        // out something the creator imported himself.
+        try {
+            const staged = require('./src/project/studio-link')
+                .prepareBuild({ projectDir: PROJECT_DIR, inputPath: INPUT_PATH });
+            if (staged && !options.audioFileName) options.audioFileName = staged.audioFileName;
+        } catch (e) { console.warn('Studio link skipped:', e.message); }
+
         sendProgress(8, '⚙️ Starting build pipeline...');
 
         // Run the build script
@@ -1634,6 +1656,13 @@ ipcMain.handle('run-build', async (event, options) => {
             // the old inline logic by scripts/verify-settings.js.
             const { applyOptionsToEnv } = require('./src/settings/build-env');
             const { env: buildEnv, isSmartAI } = applyOptionsToEnv(options, { projectDir: PROJECT_DIR });
+            // AI Connections reach the build through ITS environment only — never
+            // through process.env, so ffmpeg / yt-dlp / render children never see keys.
+            const _aiConnJson = _aiConnectionsRuntimeJson();
+            if (_aiConnJson) {
+                buildEnv.FORGE_AI_CONNECTIONS = _aiConnJson;
+                console.log(`   🔌 AI jobs: ${aiConnections.describeRuntime()}`);
+            }
             console.log(`   🧠 Smart AI: smartAI=${options.smartAI} (${typeof options.smartAI}) → SMART_AI=${buildEnv.SMART_AI}`);
             console.log(`   🎬 Clip Analyzer: ${buildEnv.CLIP_ANALYZER_ENABLED === 'true' ? 'ON' : 'OFF'}`);
             if (buildEnv.BUILD_REPEAT_FROM) console.log(`   🔁 Repeat From Step: ${buildEnv.BUILD_REPEAT_FROM}`);
@@ -2229,7 +2258,7 @@ async function _switchProjectInPlace(projectDir, options = {}) {
         _addRecentProject(targetDir);
 
         if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.setTitle(PROJECT_NAME ? `YTA Empire WEBGL — ${PROJECT_NAME}` : 'YTA Empire WEBGL');
+            mainWindow.setTitle(PROJECT_NAME ? `Forge — ${PROJECT_NAME}` : 'Forge');
             if (options.reloadRenderer) {
                 await mainWindow.loadFile(path.join(APP_ROOT, 'ui', 'index.html'));
             }
@@ -2990,12 +3019,14 @@ ipcMain.handle('vision-box-status', async () => {
 //   aws — self-hosted GPU box (auto-starts during a build)
 //   lightning — Lightning.ai vLLM (you start the Studio + tunnel manually)
 //   bedrock — AWS Bedrock vision (always on, no box)
+//   azure-managed — Azure Managed Compute deployment (always on, no box); the vision
+//     half of the "Azure Managed" AI Provider option, which the dropdown pairs for you
 ipcMain.handle('get-vision-backend', async () => {
     return String(process.env.VISION_BACKEND || 'aws').toLowerCase();
 });
 ipcMain.handle('set-vision-backend', async (event, backend) => {
     const b = String(backend || 'aws').toLowerCase();
-    const allowed = ['aws', 'lightning', 'bedrock', 'dashscope'];
+    const allowed = ['aws', 'lightning', 'bedrock', 'dashscope', 'azure-managed'];
     if (!allowed.includes(b)) return { ok: false, error: `unknown vision backend: ${b}` };
     try {
         updateEnvFile('VISION_BACKEND', b);          // persist so it survives restart
@@ -3008,6 +3039,9 @@ ipcMain.handle('set-vision-backend', async (event, backend) => {
             ? '🟨 Lightning — auto-starts the Studio when a build needs vision.'
             : '🟨 Lightning — manual: start the Studio + tunnel, paste the URL into .env (add LIGHTNING_API_KEY to auto-start).';
         else if (b === 'bedrock') note = '☁️ Bedrock — always on, no box to manage.';
+        else if (b === 'azure-managed') note = (process.env.AZURE_MANAGED_ENDPOINT && process.env.AZURE_MANAGED_API_KEY)
+            ? '🟪 Azure Managed Compute — always on, no box to manage.'
+            : '🟪 Azure Managed selected, but AZURE_MANAGED_ENDPOINT / AZURE_MANAGED_API_KEY are not set — vision will fall back to Bedrock.';
         console.log(`👁️  Vision backend switched to: ${b}`);
         return { ok: true, backend: b, note };
     } catch (e) {
@@ -3389,27 +3423,8 @@ ipcMain.handle('load-project-file', async () => {
     }
 });
 
-// Get recent projects list
-ipcMain.handle('get-recent-projects', async () => {
-    try {
-        if (fs.existsSync(RECENT_PROJECTS_FILE)) {
-            const recent = JSON.parse(fs.readFileSync(RECENT_PROJECTS_FILE, 'utf8'));
-            if (!Array.isArray(recent)) return [];
-            const validRecent = recent.filter((entry) => (
-                typeof entry?.path === 'string'
-                && !_pathsEqual(entry.path, DEFAULT_WORKSPACE_DIR)
-                && projectStore.inspectProjectDirectory({ projectDir: entry.path }).valid
-            ));
-            if (validRecent.length !== recent.length) {
-                projectStore.atomicWriteJson(RECENT_PROJECTS_FILE, validRecent);
-            }
-            return validRecent;
-        }
-        return [];
-    } catch (e) {
-        return [];
-    }
-});
+// Get recent projects list (same reader the agent remote control uses)
+ipcMain.handle('get-recent-projects', async () => _listRecentProjects());
 
 // Add to recent projects list
 ipcMain.handle('add-recent-project', async () => {
@@ -4283,6 +4298,19 @@ function runHyperframesCli(projectDir, outputFile, options = {}) {
         if (options.gpu !== false) args.push('--gpu');
         args.push(browserGpu ? '--browser-gpu' : '--no-browser-gpu');
         if (options.strict) args.push('--strict');
+        // HDR output policy. Our composition is an sRGB DOM (themes, text,
+        // graphics) with stock clips composited into it, bound for an SDR
+        // YouTube upload -- but the CLI's default `auto` mode promotes the
+        // ENTIRE render to HLG/BT.2020 the moment one downloaded clip carries
+        // HDR metadata. That flips the capture plan to `hdr_layered`, which
+        // hardcodes forceScreenshot:true and disables streaming encode: one
+        // CDP screenshot + a Node-side 16-bit layered composite per frame.
+        // Measured 2026-08-15 on a 270-scene / 16,888-frame project where 2 of
+        // 131 clips were HDR: 0.33 fps, ~13.7h ETA, then "Target closed".
+        // HF_HDR_OUTPUT=auto restores source-driven detection; =hdr forces it.
+        const hdrOutput = String(process.env.HF_HDR_OUTPUT || '').trim().toLowerCase();
+        if (hdrOutput === 'hdr') args.push('--hdr');
+        else if (hdrOutput !== 'auto') args.push('--sdr');
 
         // Explicit env wins: if the operator pinned a budget, never override it.
         const stallBudgetMs = Number(process.env.HF_DE_STALL_MS) > 0
@@ -4896,6 +4924,16 @@ ipcMain.handle('hyperframes-render', async (_event, payload = {}) => {
                 console.warn(`[HyperFrames] final review skipped (${e.message})`);
             }
         }
+
+        // Studio: a whole-timeline render is the deliverable and goes to the
+        // video's final/ folder; a partial one is a working copy for renders/.
+        try {
+            require('./src/project/studio-link').recordRender({
+                projectDir: PROJECT_DIR,
+                outputPath: rendered.outputPath,
+                partial: _isPartial,
+            });
+        } catch (e) { console.warn('[Studio] record skipped:', e.message); }
 
         sendRenderProgress(100, '[HyperFrames] Render complete');
         activeRenderCancelled = false;
@@ -7251,7 +7289,7 @@ function registerFvpFileAssociation() {
             '@="FacelessVideoProject"',
             '',
             '[HKEY_CURRENT_USER\\Software\\Classes\\FacelessVideoProject]',
-            '@="YTA Empire WEBGL Project"',
+            '@="Forge Project"',
             '',
             '[HKEY_CURRENT_USER\\Software\\Classes\\FacelessVideoProject\\DefaultIcon]',
             `@="${regEsc(iconValue)}"`,
@@ -7294,7 +7332,12 @@ function applyBrainProvider(value) {
     const aplinkBrain = value === 'bedrock-aplink';
     const azureBrain = value === 'bedrock-azure';
     const azureOpenAIBrain = value === 'bedrock-azure-grok' || value === 'bedrock-azure-openai';
-    const base = (ailinkBrain || aplinkBrain || azureBrain || azureOpenAIBrain) ? 'bedrock' : String(value || 'bedrock');
+    // The ONE option that runs both Azure surfaces at once (see azureThinkingTier below).
+    const azureSplitBrain = value === 'azure-split';
+    // Azure Managed Compute — replaces Bedrock entirely with a single endpoint + two models.
+    const azureManagedBrain = value === 'azure-managed';
+    const base = azureManagedBrain ? 'azure-managed'
+        : (ailinkBrain || aplinkBrain || azureBrain || azureOpenAIBrain || azureSplitBrain) ? 'bedrock' : String(value || 'bedrock');
 
     // An alt brain (AiLink GPT-5.5 / APlink Claude-Opus-4-6 / Azure Claude Sonnet / Azure Grok)
     // takes over EXACTLY the
@@ -7311,6 +7354,8 @@ function applyBrainProvider(value) {
     let aplinkModel = 'claude-opus-4-6';
     let azureModel = 'claude-sonnet-4-6';
     let azureOpenAIModel = 'grok-4.3';
+    let amBrainModel = 'deepreinforce-ai--ornith-10-397b';
+    let amDefaultModel = 'qwen--qwen38-27b';
     let hasAplinkKey = false;
     try {
         const cfg = require('./src/settings/config');
@@ -7325,28 +7370,57 @@ function applyBrainProvider(value) {
         hasAplinkKey = !!cfg?.aplink?.apiKey;
         if (cfg?.azure?.model) azureModel = cfg.azure.model;
         if (cfg?.azureOpenAI?.model) azureOpenAIModel = cfg.azureOpenAI.model;
+        if (cfg?.azureManaged?.brainModel) amBrainModel = cfg.azureManaged.brainModel;
+        if (cfg?.azureManaged?.defaultModel) amDefaultModel = cfg.azureManaged.defaultModel;
     } catch (_) {}
+
+    // A gate already widened to `all` means the operator put the WHOLE text surface on
+    // that brain (Bedrock unavailable), so re-picking it in the dropdown must not narrow
+    // it back to the Sonnet tier and drop the other 6 task types onto Bedrock.
+    const tierFor = (cur) => (/^(all|\*)$/i.test(String(cur || '').trim()) ? 'all' : sonnetTier);
+
+    // The split brain is the exception to "only ONE alt brain at a time": it runs BOTH
+    // Azure surfaces simultaneously, cut by cost rather than by tier. The reasoning tasks
+    // go to the Claude deployment (AZURE_CLAUDE_MODEL, an Opus) and the cheap high-volume
+    // ones to the OpenAI-compatible deployment (AZURE_OPENAI_MODEL). Both gates therefore
+    // have to be written together — clearing one, as every other option does, would strand
+    // its half of the surface on Bedrock.
+    const azureThinkingTier = 'brain,planner-outline,planner-large,planner-small,planner-source-audit,review';
+    const azureRestTier = 'classifier,general,motion-graphics,template,utility';
+    const azureGate = azureSplitBrain ? azureThinkingTier
+        : azureBrain ? tierFor(process.env.AZURE_TASK_TYPES)
+        : '';
+    const azureOpenAIGate = azureSplitBrain ? azureRestTier
+        : azureOpenAIBrain ? tierFor(process.env.AZURE_OPENAI_TASK_TYPES)
+        : '';
 
     updateEnvFile('AI_PROVIDER', base);
     // Set the chosen alt brain's task gate; clear the other so only one is active.
-    updateEnvFile('AILINK_TASK_TYPES', ailinkBrain ? sonnetTier : '');
-    updateEnvFile('APLINK_TASK_TYPES', aplinkBrain ? sonnetTier : '');
-    updateEnvFile('AZURE_TASK_TYPES', azureBrain ? sonnetTier : '');
-    updateEnvFile('AZURE_OPENAI_TASK_TYPES', azureOpenAIBrain ? sonnetTier : '');
+    updateEnvFile('AILINK_TASK_TYPES', ailinkBrain ? tierFor(process.env.AILINK_TASK_TYPES) : '');
+    updateEnvFile('APLINK_TASK_TYPES', aplinkBrain ? tierFor(process.env.APLINK_TASK_TYPES) : '');
+    updateEnvFile('AZURE_TASK_TYPES', azureGate);
+    updateEnvFile('AZURE_OPENAI_TASK_TYPES', azureOpenAIGate);
+    // Azure Managed replaces Bedrock entirely — clear all hybrid gates.
+    updateEnvFile('AILINK_TASK_TYPES', azureManagedBrain ? '' : (ailinkBrain ? tierFor(process.env.AILINK_TASK_TYPES) : ''));
+    updateEnvFile('APLINK_TASK_TYPES', azureManagedBrain ? '' : (aplinkBrain ? tierFor(process.env.APLINK_TASK_TYPES) : ''));
+    updateEnvFile('AZURE_TASK_TYPES', azureManagedBrain ? '' : azureGate);
+    updateEnvFile('AZURE_OPENAI_TASK_TYPES', azureManagedBrain ? '' : azureOpenAIGate);
     process.env.AI_PROVIDER = base;
-    process.env.AILINK_TASK_TYPES = ailinkBrain ? sonnetTier : '';
-    process.env.APLINK_TASK_TYPES = aplinkBrain ? sonnetTier : '';
-    process.env.AZURE_TASK_TYPES = azureBrain ? sonnetTier : '';
-    process.env.AZURE_OPENAI_TASK_TYPES = azureOpenAIBrain ? sonnetTier : '';
+    process.env.AILINK_TASK_TYPES = azureManagedBrain ? '' : (ailinkBrain ? tierFor(process.env.AILINK_TASK_TYPES) : '');
+    process.env.APLINK_TASK_TYPES = azureManagedBrain ? '' : (aplinkBrain ? tierFor(process.env.APLINK_TASK_TYPES) : '');
+    process.env.AZURE_TASK_TYPES = azureManagedBrain ? '' : azureGate;
+    process.env.AZURE_OPENAI_TASK_TYPES = azureManagedBrain ? '' : azureOpenAIGate;
 
-    const sonnetOwner = ailinkBrain ? `ailink:${ailinkModel}`
+    const sonnetOwner = azureManagedBrain ? `azure-managed:${amBrainModel}(brain) + ${amDefaultModel}(default/vision)`
+        : ailinkBrain ? `ailink:${ailinkModel}`
         : aplinkBrain ? `aplink:${aplinkModel}`
+        : azureSplitBrain ? `azure-claude:${azureModel} (thinking) + azure-openai:${azureOpenAIModel} (rest)`
         : azureBrain ? `azure-claude:${azureModel}`
         : azureOpenAIBrain ? `azure-openai:${azureOpenAIModel}`
         : plannerTier;
-    console.log(`[Brain Router] dropdown=${value || 'bedrock'} base=${base} sonnetTier=${sonnetOwner} tasks=[${sonnetTier}]`);
-    console.log(`[Brain Router] default=${defaultTier}; utility=${utilityTier}; fallback=${fallbackTier}; AILINK=${ailinkBrain ? sonnetTier : '(off)'}; APLINK=${aplinkBrain ? sonnetTier : '(off)'}; AZURE_CLAUDE=${azureBrain ? sonnetTier : '(off)'}; AZURE_OPENAI=${azureOpenAIBrain ? sonnetTier : '(off)'}`);
-    if ((azureBrain || azureOpenAIBrain) && hasAplinkKey && !/^(0|false|off|no)$/i.test(String(process.env.AZURE_LARGE_PROMPT_APLINK || 'on').trim())) {
+    console.log(`[Brain Router] dropdown=${value || 'bedrock'} base=${base} sonnetTier=${sonnetOwner} tasks=[${azureSplitBrain ? azureThinkingTier : (azureManagedBrain ? 'azure-managed(all)' : sonnetTier)}]`);
+    console.log(`[Brain Router] default=${defaultTier}; utility=${utilityTier}; fallback=${fallbackTier}; AILINK=${ailinkBrain ? sonnetTier : '(off)'}; APLINK=${aplinkBrain ? sonnetTier : '(off)'}; AZURE_CLAUDE=${azureGate || '(off)'}; AZURE_OPENAI=${azureOpenAIGate || '(off)'}; AZURE_MANAGED=${azureManagedBrain ? `${amBrainModel}+${amDefaultModel}` : '(off)'}`);
+    if ((azureBrain || azureOpenAIBrain || azureSplitBrain) && hasAplinkKey && !/^(0|false|off|no)$/i.test(String(process.env.AZURE_LARGE_PROMPT_APLINK || 'on').trim())) {
         console.log(`[Brain Router] azure-large-detour=aplink:${aplinkModel} tasks=[${process.env.AZURE_LARGE_PROMPT_APLINK_TASKS || 'planner-large'}] fallback=${plannerTier}`);
     }
 }
@@ -7491,6 +7565,440 @@ ipcMain.handle('open-style-studio', async () => {
     hardenRendererWindow(styleStudioWindow, 'style-studio');
     styleStudioWindow.loadFile(htmlFile);
     styleStudioWindow.on('closed', () => { styleStudioWindow = null; });
+});
+
+// ========================================
+// AI Connections (where each AI job runs)
+// ========================================
+// The data-driven replacement for hand-wiring providers: a connection is an
+// address + key + model name on any OpenAI-compatible server (a vLLM on Modal,
+// DigitalOcean, AWS…, Azure AI Foundry, OpenRouter, Meta, Ollama), and each job
+// — Thinking, Everyday, Eyes — points at one, or at the built-in setup.
+// Stored in <userData>/ai-connections.json with keys encrypted by the OS; the
+// renderer only ever learns "has a key: yes/no". See src/brain/connections.js.
+const aiConnections = require('./src/brain/connections');
+const connectionTransport = require('./src/brain/connection-transport');
+const { createAiConnectionsStore } = require('./src/settings/ai-connections-store');
+
+let _aiConnectionsStore = null;
+
+function _aiConnStore() {
+    if (!_aiConnectionsStore) {
+        const { safeStorage } = require('electron');
+        _aiConnectionsStore = createAiConnectionsStore({
+            userDataDir: USER_DATA_DIR,
+            crypto: {
+                available: () => {
+                    try { return app.isReady() && safeStorage.isEncryptionAvailable(); } catch (_) { return false; }
+                },
+                encrypt: (text) => safeStorage.encryptString(String(text)).toString('base64'),
+                decrypt: (data) => safeStorage.decryptString(Buffer.from(String(data), 'base64')),
+            },
+        });
+    }
+    return _aiConnectionsStore;
+}
+
+// Push the current setup into this process's own AI calls (editor agent, QA,
+// scene actions…). Builds get the same object through their environment.
+function _applyAiConnections() {
+    try {
+        aiConnections.setRuntime(_aiConnStore().resolved());
+        console.log(`🔌 AI jobs — ${aiConnections.describeRuntime()}`);
+    } catch (error) {
+        console.warn(`[AI Connections] could not load: ${error.message}`);
+    }
+}
+
+function _aiConnectionsRuntimeJson() {
+    try {
+        return JSON.stringify(_aiConnStore().resolved());
+    } catch (_) {
+        return '';
+    }
+}
+
+ipcMain.handle('ai-connections-get', async () => _aiConnStore().publicView());
+
+ipcMain.handle('ai-connections-save', async (_event, payload = {}) => {
+    const safe = _boundedPlainObject(payload, 64 * 1024);
+    const store = _aiConnStore();
+    let result;
+    if (safe.action === 'delete') {
+        result = store.deleteConnection(String(safe.id || ''));
+        connectionTransport.forgetDialect(String(safe.id || ''));
+    } else if (safe.action === 'jobs') {
+        result = store.setJobs(safe.jobs || {});
+    } else {
+        result = store.saveConnection(safe.connection || {});
+        if (result.ok) connectionTransport.forgetDialect(result.id);
+    }
+    if (result.ok) _applyAiConnections();
+    return { ...result, view: store.publicView() };
+});
+
+ipcMain.handle('ai-connections-test', async (_event, payload = {}) => {
+    const safe = _boundedPlainObject(payload, 64 * 1024);
+    const store = _aiConnStore();
+    const { conn, problems, existingId } = store.draftForTest(safe.connection || {});
+    if (problems.length) return { ok: false, problems, view: store.publicView() };
+    const result = await connectionTransport.testConnection(conn);
+    // Only a test of what is actually saved may update what is saved.
+    const saved = existingId ? store.load().connections.find((c) => c.id === existingId) : null;
+    if (saved && saved.baseUrl === conn.baseUrl && saved.textModel === conn.textModel && saved.visionModel === conn.visionModel) {
+        store.recordTest(existingId, result);
+        _applyAiConnections();
+    }
+    return { ok: true, result, view: store.publicView() };
+});
+
+// ========================================
+// Agent Remote Control (MCP + REST)
+// ========================================
+// Lets an outside agent — Claude Code, Meta Muse, ChatGPT, n8n, a shell script —
+// drive THIS app: open a project, import narration, change settings, build,
+// render, read the log, fetch the finished file. OFF until the user turns it on
+// (AI settings > Agent access) and every call needs the generated access key.
+//
+// Anything a human would click is forwarded to the window (ui/js/remote-control.js)
+// and runs through the same functions as the buttons, so there is no agent-only
+// build path to keep in sync. The transport lives in src/remote/.
+const remoteAccessConfig = require('./src/remote/access-config');
+const { createControlService } = require('./src/remote/control-service');
+const { createRemoteServer } = require('./src/remote/server');
+const { SERVER_INSTRUCTIONS: REMOTE_INSTRUCTIONS } = require('./src/remote/tools');
+
+const REMOTE_DOWNLOAD_TYPES = Object.freeze({
+    '.mp4': 'video/mp4',
+    '.mov': 'video/quicktime',
+    '.webm': 'video/webm',
+    '.mp3': 'audio/mpeg',
+    '.wav': 'audio/wav',
+    '.srt': 'application/x-subrip',
+});
+
+let _remoteConfig = null;
+let _remoteServer = null;
+let _remoteStartError = '';
+let _remoteRequestSeq = 0;
+const _remoteRendererCalls = new Map();
+
+function _remoteAccess() {
+    if (!_remoteConfig) _remoteConfig = remoteAccessConfig.load(USER_DATA_DIR);
+    return _remoteConfig;
+}
+
+// Ask the main window to do something and wait for its answer. The window owns
+// the build/render/settings surface, so this is how every user-facing action is
+// reached without duplicating it in the main process.
+function _askRendererCommand(command, args = {}, { timeoutMs = 10000 } = {}) {
+    return new Promise((resolve, reject) => {
+        if (!mainWindow || mainWindow.isDestroyed()) {
+            reject(new Error('the Forge window is closed'));
+            return;
+        }
+        const requestId = `rc-${Date.now().toString(36)}-${++_remoteRequestSeq}`;
+        const timer = setTimeout(() => {
+            _remoteRendererCalls.delete(requestId);
+            reject(new Error(`no answer within ${Math.round(timeoutMs / 1000)}s`));
+        }, timeoutMs);
+        _remoteRendererCalls.set(requestId, { resolve, reject, timer });
+        try {
+            mainWindow.webContents.send('remote-command', { requestId, command, args });
+        } catch (error) {
+            clearTimeout(timer);
+            _remoteRendererCalls.delete(requestId);
+            reject(error);
+        }
+    });
+}
+
+ipcMain.handle('remote-command-result', async (event, payload = {}) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender.id !== mainWindow.webContents.id) {
+        return { success: false };
+    }
+    const pending = _remoteRendererCalls.get(String(payload.requestId || ''));
+    if (!pending) return { success: false };
+    _remoteRendererCalls.delete(String(payload.requestId));
+    clearTimeout(pending.timer);
+    if (payload.error) {
+        pending.reject(new Error(String(payload.error).slice(0, 500)));
+    } else {
+        try {
+            pending.resolve(_boundedPlainObject(payload.result ?? {}, 2 * 1024 * 1024));
+        } catch (error) {
+            pending.reject(error);
+        }
+    }
+    return { success: true };
+});
+
+function _listRecentProjects() {
+    try {
+        if (!fs.existsSync(RECENT_PROJECTS_FILE)) return [];
+        const recent = JSON.parse(fs.readFileSync(RECENT_PROJECTS_FILE, 'utf8'));
+        if (!Array.isArray(recent)) return [];
+        const validRecent = recent.filter((entry) => (
+            typeof entry?.path === 'string'
+            && !_pathsEqual(entry.path, DEFAULT_WORKSPACE_DIR)
+            && projectStore.inspectProjectDirectory({ projectDir: entry.path }).valid
+        ));
+        if (validRecent.length !== recent.length) {
+            projectStore.atomicWriteJson(RECENT_PROJECTS_FILE, validRecent);
+        }
+        return validRecent;
+    } catch (_) {
+        return [];
+    }
+}
+
+function _remoteDefaultProjectParent() {
+    const recent = _listRecentProjects();
+    for (const entry of recent) {
+        const parent = path.dirname(entry.path);
+        if (parent && fs.existsSync(parent) && fs.statSync(parent).isDirectory()) return parent;
+    }
+    return app.getPath('documents');
+}
+
+async function _remoteCreateProject({ name, parentFolder }) {
+    const parent = parentFolder ? path.resolve(parentFolder) : _remoteDefaultProjectParent();
+    if (!fs.existsSync(parent) || !fs.statSync(parent).isDirectory()) {
+        return { success: false, error: `Folder not found: ${parent}` };
+    }
+    const prepared = _prepareNewProjectTarget({
+        location: parent,
+        projectName: name,
+        locationMode: 'create-subfolder',
+    });
+    if (!prepared.success) return prepared;
+    const opened = await _switchProjectInPlace(prepared.projectDir, {
+        projectFile: prepared.projectFile,
+        reloadRenderer: true,
+    });
+    if (!opened.success) return opened;
+    return { ...opened, projectName: prepared.projectName || name };
+}
+
+function _remoteReadBuildLog(lines) {
+    try {
+        const logsDir = getLogsDir(PROJECT_DIR);
+        if (!fs.existsSync(logsDir)) return null;
+        const candidates = fs.readdirSync(logsDir)
+            .filter((file) => /^build-summary-.*\.log$/i.test(file))
+            .map((file) => {
+                const full = path.join(logsDir, file);
+                return { full, mtime: fs.statSync(full).mtimeMs };
+            })
+            .sort((a, b) => b.mtime - a.mtime);
+        if (!candidates.length) return null;
+        const newest = candidates[0];
+        const size = fs.statSync(newest.full).size;
+        const readFrom = Math.max(0, size - 512 * 1024);
+        const handle = fs.openSync(newest.full, 'r');
+        const buffer = Buffer.alloc(size - readFrom);
+        try {
+            fs.readSync(handle, buffer, 0, buffer.length, readFrom);
+        } finally {
+            fs.closeSync(handle);
+        }
+        const all = buffer.toString('utf8').split(/\r?\n/).filter((line) => line.length);
+        return {
+            file: newest.full,
+            updatedAt: new Date(newest.mtime).toISOString(),
+            lines: all.slice(-Math.max(1, Math.min(500, Number(lines) || 80))),
+        };
+    } catch (_) {
+        return null;
+    }
+}
+
+function _remoteListVideos() {
+    try {
+        if (!fs.existsSync(OUTPUT_PATH)) return [];
+        return fs.readdirSync(OUTPUT_PATH)
+            .filter((file) => Object.prototype.hasOwnProperty.call(REMOTE_DOWNLOAD_TYPES, path.extname(file).toLowerCase()))
+            .map((file) => {
+                const full = path.join(OUTPUT_PATH, file);
+                const stat = fs.statSync(full);
+                return {
+                    name: file,
+                    bytes: stat.size,
+                    megabytes: Math.round((stat.size / (1024 * 1024)) * 10) / 10,
+                    modifiedAt: new Date(stat.mtimeMs).toISOString(),
+                    path: full,
+                    downloadPath: `/files/${encodeURIComponent(file)}`,
+                    _mtime: stat.mtimeMs,
+                };
+            })
+            .sort((a, b) => b._mtime - a._mtime)
+            .map(({ _mtime, ...video }) => video);
+    } catch (_) {
+        return [];
+    }
+}
+
+// Downloads are confined to the active project's output/ folder, by real path,
+// with a fixed media allowlist — the same posture as the asset:// protocol.
+function _remoteResolveDownload(name) {
+    const safeName = path.basename(String(name || ''));
+    if (!safeName || safeName !== String(name || '')) return null;
+    const contentType = REMOTE_DOWNLOAD_TYPES[path.extname(safeName).toLowerCase()];
+    if (!contentType) return null;
+    const resolved = _resolveExistingFileWithin([OUTPUT_PATH], path.join(OUTPUT_PATH, safeName));
+    if (!resolved) return null;
+    return { filePath: resolved, fileName: safeName, size: fs.statSync(resolved).size, contentType };
+}
+
+async function _remoteImportNarrationFromUrl(rawUrl) {
+    const { requestSafeStream, writeSafeStreamToFile } = require('./src/security/safe-download');
+    let tempFile = null;
+    try {
+        const response = await requestSafeStream(
+            rawUrl,
+            { timeout: 120000, headers: { 'User-Agent': 'Forge/1.0 (+narration import)' } },
+            { maxBytes: 1024 * 1024 * 1024 }
+        );
+        const contentType = String(response.headers['content-type'] || '').toLowerCase();
+        const urlExt = path.extname(new URL(response.safeDownload.finalUrl).pathname).toLowerCase();
+        let ext = ['.mp3', '.wav'].includes(urlExt) ? urlExt : '';
+        if (!ext && /audio\/(mpeg|mp3)/.test(contentType)) ext = '.mp3';
+        if (!ext && /audio\/(wav|x-wav|wave|vnd\.wave)/.test(contentType)) ext = '.wav';
+        if (!ext) {
+            response.data.destroy();
+            return { success: false, error: 'That link is not an MP3 or WAV file.' };
+        }
+        const tempDir = path.join(PROJECT_DIR, 'temp');
+        fs.mkdirSync(tempDir, { recursive: true });
+        tempFile = path.join(tempDir, `narration-download-${Date.now()}${ext}`);
+        await writeSafeStreamToFile(response, tempFile, { maxBytes: 1024 * 1024 * 1024 });
+        const imported = await _importNarrationFile(tempFile);
+        if (!imported.success) return imported;
+        // input/ keeps the downloaded name; the temp copy is no longer needed.
+        return { ...imported, name: path.basename(imported.path) };
+    } catch (error) {
+        return { success: false, error: `Download failed: ${error.message}` };
+    } finally {
+        if (tempFile) { try { fs.unlinkSync(tempFile); } catch (_) { } }
+    }
+}
+
+function _remoteServiceDeps() {
+    return {
+        getProject: () => ({
+            dir: PROJECT_DIR,
+            name: PROJECT_NAME,
+            projectFile: getProjectFilePath(),
+            isDefaultWorkspace: _pathsEqual(PROJECT_DIR, DEFAULT_WORKSPACE_DIR),
+        }),
+        getBusy: () => {
+            if (activeProcess) return activeProcessType || 'job';
+            if (_webglExport) return 'render';
+            return null;
+        },
+        askRenderer: (command, args, options) => _askRendererCommand(command, args, options),
+        listRecentProjects: async () => _listRecentProjects(),
+        openProject: async (projectDir) => _switchProjectInPlace(projectDir, { reloadRenderer: true }),
+        createProject: async (options) => _remoteCreateProject(options),
+        importNarrationFromPath: async (sourcePath) => _importNarrationFile(sourcePath),
+        importNarrationFromUrl: async (url) => _remoteImportNarrationFromUrl(url),
+        readBuildLog: async (lines) => _remoteReadBuildLog(lines),
+        listVideos: async () => _remoteListVideos(),
+        getServerInfo: () => ({
+            host: _remoteServer ? _remoteServer.host : _remoteAccess().host,
+            port: _remoteServer ? _remoteServer.port : _remoteAccess().port,
+            enabled: !!_remoteAccess().enabled,
+        }),
+    };
+}
+
+async function _startRemoteControlServer() {
+    const config = _remoteAccess();
+    _remoteStartError = '';
+    if (!config.enabled) return { running: false };
+    if (_remoteServer) return { running: true, port: _remoteServer.port };
+    if (_isProjectChildInstance) {
+        _remoteStartError = 'Agent access runs in the first Forge window only.';
+        return { running: false, error: _remoteStartError };
+    }
+    const service = createControlService(_remoteServiceDeps());
+    const server = createRemoteServer({
+        host: config.host,
+        port: config.port,
+        token: config.token,
+        callTool: service.callTool,
+        resolveDownload: (name) => _remoteResolveDownload(name),
+        serverInfo: { name: 'forge', version: app.getVersion() },
+        instructions: REMOTE_INSTRUCTIONS,
+        log: (line) => console.log(line),
+    });
+    try {
+        const info = await server.start();
+        _remoteServer = server;
+        console.log(`🔌 Agent access listening on http://${info.host}:${info.port} (MCP: /mcp, API: /api/tools)`);
+        return { running: true, port: info.port };
+    } catch (error) {
+        _remoteStartError = error.code === 'EADDRINUSE'
+            ? `Port ${config.port} is already in use — pick another port.`
+            : error.message;
+        console.warn(`[Remote] could not start agent access: ${_remoteStartError}`);
+        return { running: false, error: _remoteStartError };
+    }
+}
+
+async function _stopRemoteControlServer() {
+    if (!_remoteServer) return;
+    const server = _remoteServer;
+    _remoteServer = null;
+    try {
+        await server.stop();
+        console.log('🔌 Agent access stopped');
+    } catch (_) { /* shutting down anyway */ }
+    for (const [, pending] of _remoteRendererCalls) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('agent access stopped'));
+    }
+    _remoteRendererCalls.clear();
+}
+
+function _remoteAccessStatus() {
+    const config = _remoteAccess();
+    const port = _remoteServer ? _remoteServer.port : config.port;
+    const baseUrl = `http://${config.host}:${port}`;
+    return {
+        enabled: !!config.enabled,
+        running: !!_remoteServer,
+        host: config.host,
+        port,
+        token: config.token,
+        baseUrl,
+        mcpUrl: `${baseUrl}/mcp`,
+        apiUrl: `${baseUrl}/api/tools`,
+        openApiUrl: `${baseUrl}/openapi.json`,
+        forcedByEnv: !!config.forcedByEnv,
+        error: _remoteStartError || '',
+    };
+}
+
+ipcMain.handle('remote-access-status', async () => _remoteAccessStatus());
+
+ipcMain.handle('remote-access-set', async (_event, payload = {}) => {
+    const config = _remoteAccess();
+    if (typeof payload.enabled === 'boolean') config.enabled = payload.enabled;
+    if (payload.rotateToken === true) config.token = remoteAccessConfig.generateToken();
+    if (payload.port !== undefined) {
+        const port = Number(payload.port);
+        if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+            return { success: false, error: 'Choose a port between 1024 and 65535.', status: _remoteAccessStatus() };
+        }
+        config.port = port;
+    }
+    remoteAccessConfig.save(USER_DATA_DIR, config);
+    await _stopRemoteControlServer();
+    if (config.enabled) await _startRemoteControlServer();
+    else _remoteStartError = '';
+    const status = _remoteAccessStatus();
+    return { success: !status.error, error: status.error || '', status };
 });
 
 // ========================================
